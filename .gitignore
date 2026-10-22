@@ -1,0 +1,25 @@
+# Ignore heavy package folders
+node_modules/
+.npm-cache/
+
+# Ignore local compiled static web directories
+dist/
+
+# Ignore binary container image packages and snapshots
+*.tar
+*.tar.gz
+
+# Ignore local editor swap notes and compiler footprints
+*~
+.*~
+.DS_Store
+.vite/
+
+# Ignore dependency installation log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Ignore local system execution logs
+*.log
+

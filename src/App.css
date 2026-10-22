@@ -1,0 +1,74 @@
+/* Clean full-bleed viewport canvas rules matching OpenShift tools */
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  width: 100vw;
+  background-color: #f0f2f5 !important;
+  font-family: "RedHatText", "Overpass", sans-serif;
+  overflow: hidden;
+}
+
+/* Stretch the core wizard deployment engine across the full container width */
+.openshift-architect-wizard {
+  height: 100% !important;
+  width: 100% !important;
+}
+
+/* RED THEME INJECTION: Override PatternFly default blues with corporate red */
+:root {
+  --pf-v5-global--primary-color--100: #ee0000 !important;
+  --pf-v5-global--active-color--100: #ba0000 !important;
+}
+
+/* Highlight the current active wizard navigation link in Red Hat red */
+.pf-v5-c-wizard__nav-link[aria-current="step"]::before {
+  background-color: #ee0000 !important;
+}
+
+/* Dense card styling featuring Red Hat's distinct top accent line */
+.openshift-node-card {
+  border-top: 4px solid #ee0000 !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1) !important;
+}
+
+/* Internal card layout grouping constraints */
+.pf-v5-c-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+/* Clean spacing inside the vertical step navigation text link tabs */
+.pf-v5-c-wizard__nav-item {
+  margin-bottom: 8px !important;
+}
+
+.pf-v5-c-wizard__nav-link {
+  padding: 8px 16px !important;
+  font-size: 0.95rem !important;
+  font-weight: 500 !important;
+}
+
+/* Force the vertical wizard navigation container to operate as a full-height flex column */
+.pf-v5-c-wizard__outer-wrap {
+  height: 100% !important;
+}
+
+.pf-v5-c-wizard__nav {
+  display: flex !important;
+  flex-direction: column !important;
+  height: 100% !important;
+  justify-content: space-between !important;
+}
+
+/* Ensure the step buttons stay at the top and the status widget sticks to the absolute bottom */
+.pf-v5-c-wizard__nav-list {
+  flex-grow: 0 !important;
+}
+
+div[style*="marginTop: 'auto'"] {
+  margin-top: auto !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+}
+
