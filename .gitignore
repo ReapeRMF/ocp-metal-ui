@@ -4,6 +4,20 @@ node_modules/
 
 # Ignore local compiled static web directories
 dist/
+__pycache__/
+*.py[cod]
+data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-*
+
+# Local Ansible workspace contents generated during development/deployment
+/ansible-workspace/
 
 # Ignore binary container image packages and snapshots
 *.tar
@@ -22,4 +36,3 @@ yarn-error.log*
 
 # Ignore local system execution logs
 *.log
-

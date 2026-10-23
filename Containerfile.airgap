@@ -1,4 +1,22 @@
-FROM docker.io/library/nginx:alpine
-COPY dist/ /usr/share/nginx/html/
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
+FROM docker.io/library/python:3.13-alpine
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DATABASE_PATH=/data/ocp-metal-ui.sqlite3 \
+    PORT=8080
+
+WORKDIR /app
+
+RUN addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app \
+    && mkdir -p /data /ansible \
+    && chown 10001:10001 /data /ansible
+
+COPY --chown=10001:10001 server.py /app/server.py
+COPY --chown=10001:10001 dist/ /app/dist/
+
+VOLUME ["/data", "/ansible"]
+EXPOSE 8080
+USER 10001:10001
+
+CMD ["python3", "/app/server.py"]

@@ -4,24 +4,12 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ironic-ui</title>
+    <meta name="description" content="Discover bare-metal hardware, configure OpenShift installations, and generate Ansible-ready inventory." />
+    <meta name="theme-color" content="#151515" />
+    <title>OpenShift Bare-Metal Builder</title>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
-    <style>
-      /* Absolute fallback override to force Red Hat's palette color wheel */
-      :root {
-        --pf-v5-global--primary-color--100: #ee0000 !important;
-        --pf-v5-global--active-color--100: #ba0000 !important;
-      }
-      .pf-v5-c-wizard__nav-link[aria-current="step"]::before {
-        background-color: #ee0000 !important;
-      }
-      .openshift-node-card {
-        border-top: 4px solid #ee0000 !important;
-      }
-    </style>
   </body>
 </html>
-

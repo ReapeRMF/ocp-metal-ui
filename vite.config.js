@@ -6,10 +6,12 @@ export default defineConfig({
   server: {
     host: true, // Exposes the server on the local network automatically
     port: 5173,
+    proxy: {
+      '/api': 'http://localhost:8080'
+    },
     fs: { strict: false }
   },
   optimizeDeps: {
     include: ['@patternfly/react-core', '@patternfly/react-table', '@patternfly/react-icons']
   }
 })
-
