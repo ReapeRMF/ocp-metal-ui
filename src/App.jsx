@@ -156,6 +156,17 @@ function routeHash(route) {
   return route.type === 'landing' ? '#/' : `#/${route.strategy}/${route.stage}`;
 }
 
+const DEFAULT_BLUEPRINT = {
+  clusterName: 'ocp-baremetal',
+  baseDomain: 'example.com',
+  controlPlaneTopology: 'HighlyAvailable',
+  mirrorRegistries: ['registry.airgap.internal:5000'],
+  caCertBundle: '',
+  machineNetworkCidr: '',
+  dnsServers: [],
+  ntpServers: []
+};
+
 export default function App() {
   const [nodes, setNodes] = useState([]);
   const [nodeConfigs, setNodeConfigs] = useState({});
@@ -168,7 +179,7 @@ export default function App() {
   const [newNodeName, setNewNodeName] = useState('');
   const [discoveryAssignments, setDiscoveryAssignments] = useState({});
 
-  const [blueprint, setBlueprint] = useState({});
+  const [blueprint, setBlueprint] = useState(DEFAULT_BLUEPRINT);
   const [redfishEndpoints, setRedfishEndpoints] = useState([]);
   const [httpsEnabled, setHttpsEnabled] = useState(false);
   const [isSavingConfiguration, setIsSavingConfiguration] = useState(false);

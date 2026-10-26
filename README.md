@@ -80,8 +80,13 @@ accepted:
 }
 ```
 
+For report clients on another host, copy the server certificate there (or use a
+certificate issued by a CA already trusted by the client). The DNS name in the
+URL must match `TLS_HOSTNAME`.
+
 ```sh
-curl -X POST http://ui-host:8080/api/v1/inspections \
+curl --cacert /etc/ipa/ocp-metal-ui.crt \
+  -X POST https://ui-host.example.internal:8080/api/v1/inspections \
   -H 'Content-Type: application/json' \
   --data-binary @inspection-report.json
 ```
@@ -217,12 +222,31 @@ To use a different host port, set `HOST_PORT` when running the deploy script:
 HOST_PORT=18080 ./airgap-deploy-bundle.sh
 ```
 
-### Enable HTTPS for Redfish retrieval
+### HTTPS and certificates
 
-Create or provision a server certificate and private key on the disconnected
-host before deployment. The certificate should be trusted by operator
-browsers and match the host name used in the browser. Mount both files read-only
-by setting their paths when running the deploy script:
+The deployment script always enables HTTPS. If no certificate is supplied, it
+creates a self-signed certificate and private key in
+`~/.config/ocp-metal-ui/tls/` (or `$TLS_CERT_DIR`), with `localhost` and the
+host's fully-qualified name in the certificate. The certificate is reused on
+subsequent deployments and is valid for 365 days. OpenSSL 1.1.1 or later is
+required on the deployment host. To rotate an expired certificate or change
+`TLS_HOSTNAME`, use a new `TLS_CERT_DIR`. Set `TLS_HOSTNAME` when operators use
+a different hostname, and ensure that name resolves to the container host:
+
+```sh
+TLS_HOSTNAME=ui.example.internal ./airgap-deploy-bundle.sh
+```
+
+When browsing on the container host itself, use
+`https://127.0.0.1:8080` rather than `https://localhost:8080`. The default
+container port publish is IPv4; some systems resolve `localhost` to IPv6 first.
+The deploy script prints the loopback URL when the certificate covers it.
+
+Browsers will warn about a self-signed certificate until it is trusted. For
+regular use, distribute and trust the generated certificate on operator
+workstations, or provision a certificate from your organization's CA. Do not
+disable browser certificate checks. You can instead supply a trusted server
+certificate and private key:
 
 ```sh
 TLS_CERT_HOST_FILE=/etc/ocp-metal-ui/ui.crt \
@@ -230,11 +254,63 @@ TLS_KEY_HOST_FILE=/etc/ocp-metal-ui/ui.key \
 ./airgap-deploy-bundle.sh
 ```
 
-The app then serves HTTPS on the configured host port (8080 by default).
-Deployment performs no internet access or certificate download. Keep the
-private key protected on the host. Without both files, the application serves
-HTTP and Redfish retrieval is disabled; the IPA inventory workflow remains
-available on the trusted management network.
+For a supplied certificate, set `TLS_HOSTNAME` to a DNS name present in its
+subject alternative names. The deploy script checks the certificate's
+validity, hostname, and match with the unencrypted private key before stopping
+an existing container.
+
+The app serves HTTPS on the configured host port (8080 by default). Deployment
+performs no internet access or certificate download. Keep the private key
+protected on the host. Redfish BMC certificates are a separate trust decision:
+they are verified by default, and an operator can explicitly accept an
+untrusted BMC certificate for an individual retrieval.
+
+### Reliable browser testing
+
+For a self-signed local test certificate, use the IPv4 loopback URL
+`https://127.0.0.1:8080`; some systems resolve `localhost` to IPv6 even though
+the container port is published on IPv4. To make Chrome trust only this exact
+test certificate, import it as a trusted peer in the local NSS certificate
+database (do not use CA trust flags):
+
+```sh
+certutil -A \
+  -d sql:"$HOME/.pki/nssdb" \
+  -n "ocp-metal-ui-local-test" \
+  -t "P,," \
+  -i "$HOME/.config/ocp-metal-ui-test/tls/tls.crt"
+```
+
+Restart Chrome after importing the certificate, then open
+`https://127.0.0.1:8080`. For a certificate rotated or replaced later, remove
+the prior peer entry before importing the new certificate:
+
+```sh
+certutil -D \
+  -d sql:"$HOME/.pki/nssdb" \
+  -n "ocp-metal-ui-local-test"
+```
+
+This avoids turning off TLS validation or trusting the test certificate as a
+general certificate authority.
+
+Run the repeatable API, asset, and browser-render smoke test from the project
+directory:
+
+```sh
+TLS_CA_FILE="$HOME/.config/ocp-metal-ui-test/tls/tls.crt" \
+  ./airgap-smoke-test.sh
+```
+
+The script verifies TLS normally, checks health/config/inventory APIs, fetches
+the page's JavaScript and CSS bundles, and uses headless Chrome to confirm the
+React landing page and discovered-node inventory rendered. When `TLS_CA_FILE`
+is supplied, it pins that exact certificate in the temporary headless Chrome
+profile; no persistent browser or system trust changes are made. Without
+`TLS_CA_FILE`, Chrome must already trust the server certificate. Set `BASE_URL`
+for another HTTPS address, `CHROME_BIN` for a different Chrome/Chromium
+executable, or `BROWSER_TIMEOUT` to adjust the headless browser timeout. The
+smoke test does not skip certificate checks.
 
 ## Local development and checks
 
@@ -247,7 +323,9 @@ python3 server.py
 npm run dev
 ```
 
-Vite proxies `/api` requests to the local API on port 8080. Run checks with:
+This development-only setup uses HTTP on localhost; the container deployment
+above always uses HTTPS. Vite proxies `/api` requests to the local API on port
+8080. Run checks with:
 
 ```sh
 npm run lint
@@ -274,11 +352,9 @@ npm run test:backend
 | `PUT` | `/api/v1/configuration` | Batch-save the blueprint, workspace destination, and node preferences to SQLite |
 | `POST` | `/api/v1/ansible-files` | Commit reviewed preferences and generated inventory/vars into workspace |
 
-The API has no application-level authentication. Without TLS certificates it
-uses plain HTTP and Redfish retrieval is disabled. Do not expose it to
-untrusted networks; protect access with network segmentation/firewall policy.
-When TLS is configured, HTTPS protects Redfish credentials in transit but
-does not add user authentication.
+The API has no application-level authentication. HTTPS protects Redfish
+credentials in transit but does not add user authentication. Do not expose it
+to untrusted networks; protect access with network segmentation/firewall policy.
 
 The initial cluster blueprint defaults are seeded in SQLite when the database
 is first initialized. Blueprint and node preference changes can be saved to SQLite before review.
