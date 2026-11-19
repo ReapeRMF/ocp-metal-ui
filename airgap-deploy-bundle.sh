@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Remove a checkout vault.password only when it is the old staged copy
+# (uid 10001, mode 0400) and it is not the configured password source.
+checkout_vault_copy_should_be_removed() {
+  local target="$1"
+  local source="${2:-}"
+  local target_real source_real uid mode
+  if [ ! -f "$target" ]; then
+    return 1
+  fi
+  if [ -n "$source" ] && [ -e "$source" ]; then
+    target_real="$(readlink -f "$target")"
+    source_real="$(readlink -f "$source")"
+    if [ "$target_real" = "$source_real" ]; then
+      return 1
+    fi
+  fi
+  uid="$(stat -c '%u' "$target")"
+  mode="$(stat -c '%a' "$target")"
+  [ "$uid" = "10001" ] && [ "$mode" = "400" ]
+}
+
+if [ "${1:-}" = "--vault-cleanup-decision" ]; then
+  if checkout_vault_copy_should_be_removed "$2" "${3:-}"; then
+    exit 0
+  fi
+  exit 1
+fi
+
 echo "========================================================="
 echo "🔴 Disconnected Phase: Deploying the airgap UI"
 echo "========================================================="
@@ -304,6 +332,7 @@ else
 fi
 
 VAULT_PASSWORD_HOST_FILE="${VAULT_PASSWORD_FILE:-/root/.vault_pass}"
+VAULT_PASSWORD_SOURCE="$VAULT_PASSWORD_HOST_FILE"
 VAULT_ARGS=()
 VAULT_STAGE=""
 remove_secret_file() {
@@ -322,8 +351,10 @@ cleanup_vault_material() {
     remove_secret_file "$VAULT_STAGE"
     VAULT_STAGE=""
   fi
-  # Older versions of this script left a copy in the checkout.
-  if [ -n "${SCRIPT_DIR:-}" ]; then
+  # Only the old staged copy (uid 10001, mode 0400) is removed, and never
+  # when that path is the configured vault password.
+  if [ -n "${SCRIPT_DIR:-}" ] && checkout_vault_copy_should_be_removed \
+    "$SCRIPT_DIR/vault.password" "${VAULT_PASSWORD_SOURCE:-}"; then
     remove_secret_file "$SCRIPT_DIR/vault.password"
   fi
 }
