@@ -17,6 +17,15 @@ import server
 NODE_UUID = "8a4f91c2-38d1-4bda-912c-bbfa47821001"
 
 
+def playbook_root():
+    """Optional checkout of ocp-ansible-playbooks/playbooks."""
+    configured = os.environ.get("OCP_ANSIBLE_PLAYBOOKS", "").strip()
+    if not configured:
+        return None
+    path = Path(configured)
+    return path if path.is_dir() else None
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -30,6 +39,10 @@ class ApiTests(unittest.TestCase):
         server.initialize_database()
         with server.connect_database() as connection:
             connection.execute("TRUNCATE TABLE nodes, app_settings")
+        self.api_token = "test-api-token"
+        self._api_token_env = patch.dict(os.environ, {"API_TOKEN": self.api_token})
+        self._api_token_env.start()
+        self.addCleanup(self._api_token_env.stop)
         server.initialize_database()
         self.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.ApiHandler)
         self.thread = threading.Thread(target=self.httpd.serve_forever)
@@ -52,10 +65,14 @@ class ApiTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return path
 
-    def request(self, method, path, payload=None):
+    def request(self, method, path, payload=None, token="__default__"):
         connection = http.client.HTTPConnection(*self.httpd.server_address)
         body = json.dumps(payload) if payload is not None else None
         headers = {"Content-Type": "application/json"} if body is not None else {}
+        if token == "__default__":
+            token = self.api_token
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
         connection.request(method, path, body=body, headers=headers)
         response = connection.getresponse()
         result = response.read()
@@ -1184,11 +1201,13 @@ class ApiTests(unittest.TestCase):
 
         import yaml
 
-        playbooks = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks"
-        )
-        sys.path.insert(0, str(playbooks / "tests"))
-        from test_agent_install import agent_hosts, render_templates
+        from agent_install import agent_hosts
+
+        render_templates = None
+        playbooks = playbook_root()
+        if playbooks is not None and (playbooks / "tests").is_dir():
+            sys.path.insert(0, str(playbooks / "tests"))
+            from test_agent_install import render_templates
 
         specs = [
             {
@@ -1319,8 +1338,6 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(
             (server.ANSIBLE_WORKING_DIR / "cluster-install" / "agent-config.yaml").exists()
         )
-        self.assertNotIn("a8c2744b", published_preview["installConfig"] + published_preview["agentConfig"])
-        self.assertNotIn("e9bd34f4", published_preview["installConfig"] + published_preview["agentConfig"])
         output_root = server.ANSIBLE_WORKING_DIR / "ocp-metal-ui"
         published = "\n".join(
             path.read_text() for path in sorted(output_root.rglob("*")) if path.is_file()
@@ -1390,6 +1407,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result["rendezvous_ip"], "205.28.113.11")
         self.assertEqual(result["api_vips"], ["205.28.113.2"])
         self.assertEqual(result["ingress_vips"], ["205.28.113.3"])
+        if render_templates is None:
+            return
         rendered = render_templates(result)
         install_config = yaml.safe_load(rendered["install-config.yaml"])
         agent_config = yaml.safe_load(rendered["agent-config.yaml"])
@@ -1478,14 +1497,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(blueprint["ingressVip"], "")
 
     def test_partial_inventory_publishes_and_the_install_filter_requires_three_masters(self):
-        import sys
-
         import yaml
 
-        playbooks = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks"
-        )
-        sys.path.insert(0, str(playbooks / "filter_plugins"))
         from agent_install import agent_hosts
 
         self._post_inspection(
@@ -1651,16 +1664,24 @@ class ApiTests(unittest.TestCase):
         self.assertIn("rendezvous host must be a master", json.loads(body)["error"])
 
     def test_bundled_install_filter_matches_the_playbook_filter(self):
+        playbooks = playbook_root()
+        if playbooks is None:
+            self.skipTest(
+                "Set OCP_ANSIBLE_PLAYBOOKS to an ocp-ansible-playbooks/playbooks "
+                "checkout to compare the bundled filter."
+            )
         bundled = Path(server.__file__).resolve().parent / "agent_install.py"
-        playbook = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks/filter_plugins/agent_install.py"
-        )
+        playbook = playbooks / "filter_plugins" / "agent_install.py"
         self.assertEqual(bundled.read_bytes(), playbook.read_bytes())
 
     def test_render_play_can_read_saved_install_secret_files(self):
-        playbook = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks/render_agent_install.yml"
-        ).read_text()
+        playbooks = playbook_root()
+        if playbooks is None:
+            self.skipTest(
+                "Set OCP_ANSIBLE_PLAYBOOKS to an ocp-ansible-playbooks/playbooks "
+                "checkout to read render_agent_install.yml."
+            )
+        playbook = (playbooks / "render_agent_install.yml").read_text()
         self.assertIn("ocp_install_pull_secret_file", playbook)
         self.assertIn("ocp_install_ssh_public_key_file", playbook)
         self.assertIn("ocp_pre_install_pull_secret_contents | default('') | length == 0", playbook)
@@ -2058,6 +2079,64 @@ class ApiTests(unittest.TestCase):
             ),
             secret,
         )
+
+
+    def test_pull_secret_rejection_compares_fragment_digests(self):
+        digest = hashlib.sha256(b"testmark").hexdigest()
+        rejected = '{"auths":{"example.com":{"auth":"xxxtestmark"}}}'
+        accepted = '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
+        with patch.object(server, "_REJECTED_FRAGMENT_DIGESTS", frozenset({digest})):
+            with self.assertRaises(ValueError) as caught:
+                server.normalize_pull_secret(rejected)
+            self.assertIn("not accepted", str(caught.exception))
+            self.assertEqual(
+                json.loads(server.normalize_pull_secret(accepted))["auths"]["example.com"]["auth"],
+                "dGVzdA==",
+            )
+
+    def test_writes_and_install_secrets_require_a_bearer_token(self):
+        status, body, _ = self.request("GET", "/api/v1/health", token=None)
+        self.assertEqual(status, 200, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes", token=None)
+        self.assertEqual(status, 200, body)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections",
+            {"uuid": NODE_UUID, "inventory": {}},
+            token=None,
+        )
+        self.assertEqual(status, 401, body)
+        self.assertNotIn(self.api_token.encode(), body)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections",
+            {"uuid": NODE_UUID, "inventory": {}},
+            token="wrong-token",
+        )
+        self.assertEqual(status, 401, body)
+        status, body, _ = self.request(
+            "GET",
+            "/api/v1/install-secrets/ssh-private-key?outputDirectory="
+            + quote(str(server.ANSIBLE_WORKING_DIR)),
+            token=None,
+        )
+        self.assertEqual(status, 401, body)
+        status, body, _ = self.request(
+            "PUT",
+            "/api/v1/configuration",
+            {"blueprint": {}, "outputDirectory": str(server.ANSIBLE_WORKING_DIR), "preferences": {}},
+            token=None,
+        )
+        self.assertEqual(status, 401, body)
+        with patch.dict(os.environ, {"API_TOKEN": ""}, clear=False):
+            status, body, _ = self.request(
+                "DELETE",
+                f"/api/v1/nodes/{NODE_UUID}",
+                token=None,
+            )
+        self.assertEqual(status, 503, body)
+        status, _, _ = self.request("POST", "/api/v1/nodes", {"ansibleHost": "control-01"})
+        self.assertEqual(status, 201)
 
 
 class RedfishClientTests(unittest.TestCase):

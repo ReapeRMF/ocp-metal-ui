@@ -183,8 +183,8 @@ start_ui_database() {
     chmod 600 "$credentials"
     unset app_password admin_password
   fi
-  # shellcheck disable=SC1090
   set -a
+  # shellcheck disable=SC1090
   . "$credentials"
   set +a
   if [ -z "${UI_DB_PASSWORD:-}" ] || [ -z "${POSTGRES_PASSWORD:-}" ]; then
@@ -285,7 +285,7 @@ esac
 chmod g+rwx,g+s "$ANSIBLE_HOST_DIR"
 ANSIBLE_HOST_GID="$(stat -c '%g' "$ANSIBLE_HOST_DIR")"
 if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -ne 0 ]; then
-  USER_NAMESPACE_ARGS=(--userns=keep-id:uid=10001,gid=10001)
+  USER_NAMESPACE_ARGS=("--userns=keep-id:uid=10001,gid=10001")
   GROUP_ARGS=()
 elif [ "$ENGINE" = "podman" ]; then
   # A root systemd service cannot use keep-id. Container create then
@@ -324,6 +324,17 @@ fi
 
 # 3. Start the application. The image still declares /data; the database
 # is the PostgreSQL container, so that mount stays empty.
+API_TOKEN_FILE="${API_TOKEN_FILE:-/var/lib/ocp-metal-ui/api.token}"
+install -d -o root -g root -m 755 "$(dirname "$API_TOKEN_FILE")"
+if [ ! -s "$API_TOKEN_FILE" ]; then
+  umask 077
+  openssl rand -hex 32 > "$API_TOKEN_FILE"
+fi
+chmod 600 "$API_TOKEN_FILE"
+if [ "$(id -u)" -eq 0 ]; then
+  chown 10001:10001 "$API_TOKEN_FILE"
+  chmod 0400 "$API_TOKEN_FILE"
+fi
 install -d -o 10001 -g 10001 -m 755 "$(dirname "$UI_DATABASE_ENV_FILE")/empty"
 echo "🚀 Starting the offline UI..."
 $ENGINE run -d \
@@ -333,8 +344,10 @@ $ENGINE run -d \
   --restart unless-stopped \
   --network host \
   --env-file "$UI_DATABASE_ENV_FILE" \
-  -e "HOST=${BIND_ADDRESS:-0.0.0.0}" \
+  -e "HOST=${BIND_ADDRESS:-127.0.0.1}" \
   -e "PORT=${HOST_PORT:-3003}" \
+  -e API_TOKEN_FILE=/run/secrets/api-token \
+  -v "${API_TOKEN_FILE}:/run/secrets/api-token:ro,Z" \
   -v "$(dirname "$UI_DATABASE_ENV_FILE")/empty:/data:Z" \
   -v "$ANSIBLE_HOST_DIR:/ansible:Z" \
   -e ANSIBLE_WORKING_DIR=/ansible \
@@ -345,8 +358,8 @@ $ENGINE run -d \
 echo "========================================================="
 echo "✅ Operational Success! The wizard is live completely offline."
 echo "👉 Point your browser to: https://${TLS_HOSTNAME}:${HOST_PORT:-3003}"
-echo "👉 Listening on ${BIND_ADDRESS:-0.0.0.0}:${HOST_PORT:-3003}."
-case "${BIND_ADDRESS:-0.0.0.0}" in
+echo "👉 Listening on ${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-3003}."
+case "${BIND_ADDRESS:-127.0.0.1}" in
   127.0.0.1|0.0.0.0)
     if openssl x509 -in "$TLS_CERT_HOST_FILE" -noout -checkip 127.0.0.1 >/dev/null 2>&1; then
       echo "👉 On the container host, use: https://127.0.0.1:${HOST_PORT:-3003}"
@@ -357,8 +370,12 @@ echo "   HTTPS is enabled. A self-signed certificate requires browser trust/acce
 echo "💾 PostgreSQL data directory: ${UI_DB_DATA_DIR}"
 echo "   Database ocp_metal_ui listens on ${UI_DB_PUBLISH_ADDRESS}."
 echo "   Credentials: ${UI_DB_CREDENTIALS_FILE}"
+echo "🔑 API token file: ${API_TOKEN_FILE}"
+echo "   Paste that token into the UI. Read it with: sudo cat ${API_TOKEN_FILE}"
+echo "   The file stays outside the git checkout. Delete it before the next deploy to rotate it."
 echo "📂 Ansible workspace is mounted from: $ANSIBLE_HOST_DIR"
 echo "   Set ANSIBLE_HOST_DIR before deployment to use another host directory."
 echo "   Ensure the container user (UID 10001) can write to that directory."
-echo "⚠️  Restrict access to a trusted management network; the API has no authentication."
+echo "⚠️  The default bind is 127.0.0.1. Set BIND_ADDRESS only for a network you trust."
+echo "   Writes and /api/v1/install-secrets require the API token. Inventory reads do not."
 echo "========================================================="

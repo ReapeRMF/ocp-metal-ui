@@ -1133,7 +1133,15 @@ _MAX_PRIVATE_KEY_BYTES = 65536
 _SSH_PUBLIC_KEY = re.compile(
     r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/]+={0,3}(?: .*)?$"
 )
-_REJECTED_SECRET_MARKERS = ("a8c2744b", "e9bd34f4")
+# sha256 of 8-character fragments that must not appear in a pull secret.
+# The fragments themselves are not stored here.
+_FRAGMENT_LENGTH = 8
+_REJECTED_FRAGMENT_DIGESTS = frozenset(
+    {
+        "43c90a8e5f2a970183b1c98416ee17bdb0eecf92b7604a6e63285975fab72b12",
+        "eb73ea1898542f23b4a6b72591ca5c66c8d90bc459f06fdd3a007aa74ecaec24",
+    }
+)
 _INSTALL_SECRET_POSTS = {
     "/api/v1/install-secrets/pull-secret",
     "/api/v1/install-secrets/ssh-key",
@@ -1171,9 +1179,48 @@ def normalize_pull_secret(text):
         if not isinstance(name, str) or not name.strip() or not isinstance(entry, dict):
             raise ValueError("Each auths entry must be an object keyed by a registry name.")
     normalized = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
-    if any(marker in normalized for marker in _REJECTED_SECRET_MARKERS):
+    if pull_secret_contains_rejected_fragment(normalized):
         raise ValueError("That pull secret is not accepted.")
     return normalized
+
+
+def pull_secret_contains_rejected_fragment(text):
+    if not isinstance(text, str) or len(text) < _FRAGMENT_LENGTH:
+        return False
+    rejected = _REJECTED_FRAGMENT_DIGESTS
+    for index in range(len(text) - _FRAGMENT_LENGTH + 1):
+        window = text[index:index + _FRAGMENT_LENGTH]
+        if len(window.encode("utf-8")) != _FRAGMENT_LENGTH:
+            continue
+        if hashlib.sha256(window.encode("utf-8")).hexdigest() in rejected:
+            return True
+    return False
+
+
+def configured_api_token():
+    file_name = os.environ.get("API_TOKEN_FILE", "").strip()
+    if file_name:
+        try:
+            return Path(file_name).read_bytes().strip()
+        except OSError:
+            return b""
+    return os.environ.get("API_TOKEN", "").encode("utf-8").strip()
+
+
+def bearer_matches(header_value, expected):
+    presented = b""
+    if isinstance(header_value, str) and header_value.startswith("Bearer "):
+        presented = header_value[len("Bearer "):].encode("utf-8")
+    return hmac.compare_digest(
+        hashlib.sha256(presented).digest(),
+        hashlib.sha256(expected).digest(),
+    )
+
+
+def endpoint_requires_token(method, path):
+    if path == "/api/v1/install-secrets" or path.startswith("/api/v1/install-secrets/"):
+        return True
+    return method in {"POST", "PUT", "DELETE", "PATCH"}
 
 
 def normalize_ssh_public_key(text):
@@ -1816,6 +1863,23 @@ class ApiHandler(BaseHTTPRequestHandler):
         if 0 < length <= MAX_REQUEST_BYTES:
             self.rfile.read(length)
 
+    def enforce_token(self, method, path):
+        if not endpoint_requires_token(method, path):
+            return True
+        expected = configured_api_token()
+        authorized = bool(expected) and bearer_matches(
+            self.headers.get("Authorization", ""), expected
+        )
+        if not authorized and method in {"POST", "PUT", "PATCH"}:
+            self.discard_body()
+        if not expected:
+            self.send_json(503, {"error": "The API token is not configured."})
+            return False
+        if not authorized:
+            self.send_json(401, {"error": "Authentication is required."})
+            return False
+        return True
+
     def query_value(self, name):
         values = parse_qs(urlparse(self.path).query).get(name) or []
         if len(values) != 1 or not isinstance(values[0], str) or not values[0]:
@@ -1869,6 +1933,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/api/v1/install-secrets" or path.startswith("/api/v1/install-secrets/"):
+            if not self.enforce_token("GET", path):
+                return
         if path == "/api/v1/install-secrets":
             try:
                 self.send_json(200, install_secret_status(self.query_value("outputDirectory")))
@@ -1918,6 +1985,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if not self.enforce_token("POST", path):
+            return
         if path == "/api/v1/redfish/retrieve" and not isinstance(
             self.connection, ssl.SSLSocket
         ):
@@ -1986,6 +2055,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         path = urlparse(self.path).path
+        if not self.enforce_token("PUT", path):
+            return
         if path == "/api/v1/configuration":
             try:
                 self.save_configuration(self.read_json())
@@ -2057,6 +2128,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path
+        if not self.enforce_token("DELETE", path):
+            return
         match = re.fullmatch(r"/api/v1/nodes/([^/]+)", path)
         if not match:
             self.send_json(404, {"error": "Not found."})
@@ -2944,7 +3017,7 @@ if __name__ == "__main__":
     os.umask(0o002)
     initialize_database()
     port = int(os.environ.get("PORT", "3003"))
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
     if bool(TLS_CERT_FILE) != bool(TLS_KEY_FILE):
         raise RuntimeError("TLS_CERT_FILE and TLS_KEY_FILE must be configured together.")
     httpd = ThreadingHTTPServer((host, port), ApiHandler)

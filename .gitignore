@@ -27,6 +27,10 @@ data/
 # which is committed. The vault password is not in this repository.
 pull-secret.json
 
+# API bearer token if one is created inside the checkout. The deploy writes
+# /var/lib/ocp-metal-ui/api.token instead.
+api.token
+
 # Ignore local editor swap notes and compiler footprints
 *~
 .*~

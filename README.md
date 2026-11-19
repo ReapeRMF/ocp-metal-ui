@@ -15,10 +15,10 @@ Port 3003 is the UI on the installed host. Semaphore on that host uses port 3000
 
 The workstation container is a separate process. Open it at `https://edge.ocp.internal:18080`. The certificate name is `edge.ocp.internal`.
 
-`./airgap-deploy-bundle.sh` defaults to the installed host: bind `205.28.113.35`, port `3003`. For the workstation:
+`./airgap-deploy-bundle.sh` listens on `BIND_ADDRESS` (default `127.0.0.1`) and port `3003`. Set `BIND_ADDRESS` to publish another address, for example the genesis address. For the workstation, change only the port:
 
 ```sh
-BIND_ADDRESS=127.0.0.1 HOST_PORT=18080 ./airgap-deploy-bundle.sh
+HOST_PORT=18080 ./airgap-deploy-bundle.sh
 ```
 
 ## Data flow
@@ -81,11 +81,12 @@ On the installed host, post the report to port 3003. The DNS name in the URL mus
 ```sh
 curl --cacert /etc/ipa/ocp-metal-ui.crt \
   -X POST https://edge.ocp.internal:3003/api/v1/inspections \
+  -H "Authorization: Bearer $(sudo cat /var/lib/ocp-metal-ui/api.token)" \
   -H 'Content-Type: application/json' \
   --data-binary @inspection-report.json
 ```
 
-The API stores the report. It does not configure IPA or replace an Ironic conductor. Point the existing inspection workflow at this URL.
+The API stores the report. It does not configure IPA or replace an Ironic conductor. Point the existing inspection workflow at this URL. Inspection posts are write requests, so the client must send the API token.
 
 ## Generated files
 
@@ -199,7 +200,11 @@ The script loads the UI image. It also loads `postgresql:latest` from `/var/www/
 
 Replacing the UI container does not delete `/var/lib/ocp-metal-ui/postgres` or `db.env`. Back those up together. A newer major version of `postgresql.tar` has to match the `PG_VERSION` file in that directory. Keep the tar that initialized it. The host directory `ansible-workspace` is mounted at `/ansible`. The operator can keep that directory or choose another absolute path inside the mount.
 
-The database holds nodes, placeholders, preferences, blueprint settings, and Redfish profile names. It does not hold BMC passwords. No sample BMC profiles are loaded. The UI listens on the address in `BIND_ADDRESS` (default `0.0.0.0`) and port `3003`.
+The database holds nodes, placeholders, preferences, blueprint settings, and Redfish profile names. It does not hold BMC passwords. No sample BMC profiles are loaded. The UI listens on `BIND_ADDRESS` (default `127.0.0.1`) and port `3003`.
+
+The first deploy writes `/var/lib/ocp-metal-ui/api.token`, mode 0400, owned by uid 10001. That file is outside the git checkout. The container reads it from `/run/secrets/api-token`. Paste the token into the API token field in the UI and choose **Use token**. The browser keeps it in `sessionStorage` for the tab and sends `Authorization: Bearer` on API requests. It is not stored in PostgreSQL. Read the file with `sudo cat /var/lib/ocp-metal-ui/api.token`. Delete the file before the next deploy to rotate it. Set `API_TOKEN_FILE` to use a different path.
+
+Writes (`POST`, `PUT`, `DELETE`) and every `/api/v1/install-secrets` request require that token. `GET /api/v1/health`, `GET /api/v1/config`, and `GET /api/v1/nodes` do not. Leave the bind on `127.0.0.1` unless exposing those reads is acceptable. `BIND_ADDRESS=0.0.0.0` still overrides the default.
 
 To mount a different workspace directory:
 
@@ -281,11 +286,12 @@ Start the API and the UI in two terminals:
 ```sh
 DATABASE_URL='postgresql://ocp_metal_ui:PASSWORD@127.0.0.1:5433/ocp_metal_ui?sslmode=disable' \
 ANSIBLE_WORKING_DIR=./ansible-workspace \
+API_TOKEN='local-dev-token' \
 python3 server.py
 npm run dev
 ```
 
-`python3 server.py` listens on port 3003 unless `PORT` is set. This process uses HTTP unless TLS certificate files are configured. The container deployment uses HTTPS. Vite proxies `/api` to `http://localhost:3003`.
+`python3 server.py` listens on `127.0.0.1` and port 3003 unless `HOST` or `PORT` is set. Set `API_TOKEN`, or `API_TOKEN_FILE` to a mode 0600 file outside the checkout. Paste that token into the UI. Without a token, write requests return 503. This process uses HTTP unless TLS certificate files are configured. The container deployment uses HTTPS. Vite proxies `/api` to `http://localhost:3003`.
 
 ```sh
 npm run lint
@@ -312,6 +318,6 @@ npm run test:backend
 | `PUT` | `/api/v1/configuration` | Save the blueprint, workspace destination, and node preferences |
 | `POST` | `/api/v1/ansible-files` | Write the reviewed inventory and variables into the workspace |
 
-The API has no application login. HTTPS protects Redfish credentials in transit. It does not authenticate the operator. Keep the service on a network you control.
+Writes and `/api/v1/install-secrets` require the bearer token from the deploy. HTTPS protects Redfish credentials and that token in transit. Inventory reads do not require the token. Keep the service on a network you control.
 
 Generated host vars contain hardware inventory. Handle that data under your organization's policy. Keep secrets in Ansible Vault. Redfish credentials are not written to disk.

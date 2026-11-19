@@ -29,6 +29,74 @@ import {
 import { CheckCircleIcon, InfrastructureIcon, NetworkIcon, ClusterIcon, AddCircleOIcon, TrashIcon, AutomationIcon, KeyIcon, RedhatIcon } from '@patternfly/react-icons';
 import { highlightYamlTokens } from './highlightYaml.js';
 
+const API_TOKEN_STORAGE_KEY = 'ocpMetalUiApiToken';
+let apiTokenValue = '';
+
+function readStoredApiToken() {
+  try {
+    return sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function storeApiToken(value) {
+  const token = value.trim();
+  apiTokenValue = token;
+  try {
+    if (token) sessionStorage.setItem(API_TOKEN_STORAGE_KEY, token);
+    else sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+  } catch {
+    /* The token still applies to requests in this page load. */
+  }
+}
+
+apiTokenValue = readStoredApiToken();
+
+function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (apiTokenValue && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${apiTokenValue}`);
+  }
+  return fetch(url, { ...options, headers });
+}
+
+function ApiTokenField() {
+  const [token, setToken] = useState(apiTokenValue);
+  const [saved, setSaved] = useState(Boolean(apiTokenValue));
+  return (
+    <FormGroup label="API token" fieldId="api-token">
+      <TextInput
+        id="api-token"
+        type="password"
+        autoComplete="off"
+        value={token}
+        onChange={(_event, value) => {
+          setToken(value);
+          setSaved(false);
+        }}
+      />
+      <Button
+        variant="secondary"
+        className="pf-v6-u-mt-sm"
+        onClick={() => {
+          storeApiToken(token);
+          setSaved(true);
+        }}
+      >
+        Use token
+      </Button>
+      <HelperText>
+        <HelperTextItem>
+          {saved
+            ? 'Token kept for this browser tab. It is not sent to the database.'
+            : 'Paste the token from the deploy host, then choose Use token.'}
+        </HelperTextItem>
+      </HelperText>
+    </FormGroup>
+  );
+}
+
 // Core stylesheets required for official compilation layout rules
 import '@patternfly/react-core/dist/styles/base.css';
 import '@patternfly/react-styles/css/components/Wizard/wizard.css';
@@ -231,7 +299,9 @@ export default function App() {
 
   const [blueprint, setBlueprint] = useState(DEFAULT_BLUEPRINT);
   const blueprintRef = useRef(blueprint);
-  blueprintRef.current = blueprint;
+  useEffect(() => {
+    blueprintRef.current = blueprint;
+  }, [blueprint]);
   const [redfishEndpoints, setRedfishEndpoints] = useState([]);
   const [httpsEnabled, setHttpsEnabled] = useState(false);
   const [isSavingConfiguration, setIsSavingConfiguration] = useState(false);
@@ -283,7 +353,7 @@ export default function App() {
     setInventoryStatus('Saving configuration to SQLite...');
     setIsSavingConfiguration(true);
     try {
-      const response = await fetch('/api/v1/configuration', {
+      const response = await apiFetch('/api/v1/configuration', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ preferences: nodeConfigs, blueprint, outputDirectory })
@@ -300,7 +370,7 @@ export default function App() {
   };
 
   const loadInventory = useCallback(async () => {
-    const response = await fetch('/api/v1/nodes');
+    const response = await apiFetch('/api/v1/nodes');
     if (!response.ok) throw new Error(`Inventory API returned HTTP ${response.status}.`);
     const loadedNodes = (await response.json()).map(normalizeNode);
     setNodes(loadedNodes);
@@ -355,7 +425,7 @@ export default function App() {
     let cancelled = false;
     const initialize = async () => {
       try {
-        const configResponse = await fetch('/api/v1/config');
+        const configResponse = await apiFetch('/api/v1/config');
         if (!configResponse.ok) throw new Error(`Configuration API returned HTTP ${configResponse.status}.`);
         const config = await configResponse.json();
         if (cancelled) return;
@@ -437,7 +507,7 @@ export default function App() {
   };
 
   const saveRedfishEndpoints = async () => {
-    const response = await fetch('/api/v1/redfish/endpoints', {
+    const response = await apiFetch('/api/v1/redfish/endpoints', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ endpoints: redfishEndpoints })
@@ -449,7 +519,7 @@ export default function App() {
 
   const retrieveRedfishInventory = async (endpointId, username, password, allowUntrustedTls) => {
     await saveRedfishEndpoints();
-    const response = await fetch('/api/v1/redfish/retrieve', {
+    const response = await apiFetch('/api/v1/redfish/retrieve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ endpointId, username, password, allowUntrustedTls })
@@ -463,7 +533,7 @@ export default function App() {
   const addNamedNode = async () => {
     setInventoryError('');
     try {
-      const response = await fetch('/api/v1/nodes', {
+      const response = await apiFetch('/api/v1/nodes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ansibleHost: newNodeName })
@@ -520,7 +590,7 @@ export default function App() {
     setInventoryError('');
     setInventoryStatus('Updating inventory assignments...');
     try {
-      const response = await fetch('/api/v1/nodes/assignments', {
+      const response = await apiFetch('/api/v1/nodes/assignments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ assignments })
@@ -541,7 +611,7 @@ export default function App() {
     if (!globalThis.confirm(`Delete ${node.is_placeholder ? 'inventory item' : 'discovered node'} "${nodeName}"?`)) return;
     setInventoryError('');
     try {
-      const response = await fetch(`/api/v1/nodes/${encodeURIComponent(node.uuid)}`, { method: 'DELETE' });
+      const response = await apiFetch(`/api/v1/nodes/${encodeURIComponent(node.uuid)}`, { method: 'DELETE' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || `Could not delete node (HTTP ${response.status}).`);
       await loadInventory();
@@ -574,7 +644,7 @@ export default function App() {
     setYamlView('');
     setInventoryStatus('Committing reviewed inventory and preferences...');
     try {
-      const saveResponse = await fetch('/api/v1/ansible-files', {
+      const saveResponse = await apiFetch('/api/v1/ansible-files', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ preferences: nodeConfigs, blueprint, outputDirectory })
@@ -791,6 +861,9 @@ function WorkflowSidebar({ activeStage, onNavigate }) {
           );
         })}
       </nav>
+      <div className="pf-v6-u-mt-md">
+        <ApiTokenField />
+      </div>
     </aside>
   );
 }
@@ -824,6 +897,7 @@ function StrategyLandingScreen({ onStart, onOpenBmc }) {
             <p className="splash-note">
               Built for disconnected environments. Your hardware data aligned with automation.
             </p>
+            <ApiTokenField />
           </div>
           <div className="splash-workflow" aria-label="Workflow overview">
             <div className="splash-workflow-heading">A clear path to deployment</div>
@@ -867,17 +941,18 @@ function StrategyLandingScreen({ onStart, onOpenBmc }) {
     </PageSection>
   );
 }
+const EMPTY_SECRET_STATUS = {
+  pullSecretStored: false,
+  pullSecretBuiltIn: false,
+  pullSecretReady: false,
+  vaultPasswordAvailable: false,
+  privateKeyStored: false,
+  sshPublicKey: ''
+};
+
 function InstallSecrets({ outputDirectory, httpsEnabled }) {
   const fileInputRef = useRef(null);
-  const emptySecretStatus = {
-    pullSecretStored: false,
-    pullSecretBuiltIn: false,
-    pullSecretReady: false,
-    vaultPasswordAvailable: false,
-    privateKeyStored: false,
-    sshPublicKey: ''
-  };
-  const [status, setStatus] = useState(emptySecretStatus);
+  const [status, setStatus] = useState(EMPTY_SECRET_STATUS);
   const [pullSecretText, setPullSecretText] = useState('');
   const [publicKeyText, setPublicKeyText] = useState('');
   const [message, setMessage] = useState('');
@@ -889,11 +964,11 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     let cancelled = false;
     const load = async () => {
       if (!outputDirectory) {
-        setStatus(emptySecretStatus);
+        setStatus(EMPTY_SECRET_STATUS);
         return;
       }
       try {
-        const response = await fetch(
+        const response = await apiFetch(
           `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
         );
         const result = await response.json();
@@ -936,7 +1011,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     setError('');
     setMessage('');
     try {
-      const response = await fetch(path, {
+      const response = await apiFetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -1048,7 +1123,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     setError('');
     setMessage('');
     try {
-      const response = await fetch(
+      const response = await apiFetch(
         `/api/v1/install-secrets/ssh-private-key?outputDirectory=${encodeURIComponent(outputDirectory)}`
       );
       if (!response.ok) {
