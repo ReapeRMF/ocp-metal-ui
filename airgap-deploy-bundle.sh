@@ -183,8 +183,8 @@ start_ui_database() {
     chmod 600 "$credentials"
     unset app_password admin_password
   fi
-  # shellcheck disable=SC1090
   set -a
+  # shellcheck disable=SC1090
   . "$credentials"
   set +a
   if [ -z "${UI_DB_PASSWORD:-}" ] || [ -z "${POSTGRES_PASSWORD:-}" ]; then
@@ -285,7 +285,7 @@ esac
 chmod g+rwx,g+s "$ANSIBLE_HOST_DIR"
 ANSIBLE_HOST_GID="$(stat -c '%g' "$ANSIBLE_HOST_DIR")"
 if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -ne 0 ]; then
-  USER_NAMESPACE_ARGS=(--userns=keep-id:uid=10001,gid=10001)
+  USER_NAMESPACE_ARGS=("--userns=keep-id:uid=10001,gid=10001")
   GROUP_ARGS=()
 elif [ "$ENGINE" = "podman" ]; then
   # A root systemd service cannot use keep-id. Container create then

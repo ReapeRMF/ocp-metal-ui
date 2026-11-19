@@ -200,16 +200,16 @@ const DEFAULT_BLUEPRINT = {
   controlPlaneTopology: 'Compact',
   mirrorRegistries: ['registry.airgap.internal:5000'],
   caCertBundle: '',
-  machineNetworkCidr: '205.28.113.0/24',
-  dnsServers: ['205.28.113.35'],
+  machineNetworkCidr: '192.0.2.0/24',
+  dnsServers: ['192.0.2.35'],
   ntpServers: [],
   genesisHostname: 'edge',
-  genesisIp: '205.28.113.35',
+  genesisIp: '192.0.2.35',
   genesisNic: 'eno5',
   genesisNics: ['eno5'],
   genesisDisks: [],
-  networkGateway: '205.28.113.1',
-  mgmtNetworkCidr: '205.28.114.0/24',
+  networkGateway: '192.0.2.1',
+  mgmtNetworkCidr: '198.51.100.0/24',
   mgmtVlan: '280',
   mgmtDc01Octet: '6',
   mgmtDc02Octet: '7',
@@ -231,7 +231,9 @@ export default function App() {
 
   const [blueprint, setBlueprint] = useState(DEFAULT_BLUEPRINT);
   const blueprintRef = useRef(blueprint);
-  blueprintRef.current = blueprint;
+  useEffect(() => {
+    blueprintRef.current = blueprint;
+  }, [blueprint]);
   const [redfishEndpoints, setRedfishEndpoints] = useState([]);
   const [httpsEnabled, setHttpsEnabled] = useState(false);
   const [isSavingConfiguration, setIsSavingConfiguration] = useState(false);
@@ -867,17 +869,18 @@ function StrategyLandingScreen({ onStart, onOpenBmc }) {
     </PageSection>
   );
 }
+const EMPTY_SECRET_STATUS = {
+  pullSecretStored: false,
+  pullSecretBuiltIn: false,
+  pullSecretReady: false,
+  vaultPasswordAvailable: false,
+  privateKeyStored: false,
+  sshPublicKey: ''
+};
+
 function InstallSecrets({ outputDirectory, httpsEnabled }) {
   const fileInputRef = useRef(null);
-  const emptySecretStatus = {
-    pullSecretStored: false,
-    pullSecretBuiltIn: false,
-    pullSecretReady: false,
-    vaultPasswordAvailable: false,
-    privateKeyStored: false,
-    sshPublicKey: ''
-  };
-  const [status, setStatus] = useState(emptySecretStatus);
+  const [status, setStatus] = useState(EMPTY_SECRET_STATUS);
   const [pullSecretText, setPullSecretText] = useState('');
   const [publicKeyText, setPublicKeyText] = useState('');
   const [message, setMessage] = useState('');
@@ -889,7 +892,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     let cancelled = false;
     const load = async () => {
       if (!outputDirectory) {
-        setStatus(emptySecretStatus);
+        setStatus(EMPTY_SECRET_STATUS);
         return;
       }
       try {
@@ -1215,25 +1218,25 @@ function BlueprintStep({ blueprint, onChangeField, onChangeListField, onAddRegis
               <FormGroup
                 label="Machine network CIDR"
                 fieldId="bp-machine-network-cidr"
-                labelHelp={<span>Subnet where the OpenShift hosts are connected, for example 205.28.113.0/24.</span>}
+                labelHelp={<span>Subnet where the OpenShift hosts are connected, for example 192.0.2.0/24.</span>}
               >
                 <TextInput
                   id="bp-machine-network-cidr"
                   value={blueprint.machineNetworkCidr || ''}
                   onChange={(_event, value) => onChangeField('machineNetworkCidr', value)}
-                  placeholder="205.28.113.0/24"
+                  placeholder="192.0.2.0/24"
                 />
               </FormGroup>
               <FormGroup label="Network gateway" fieldId="bp-network-gateway" className="pf-v6-u-mt-md">
-                <TextInput id="bp-network-gateway" value={blueprint.networkGateway || ''} onChange={(_event, value) => onChangeField('networkGateway', value)} placeholder="205.28.113.1" />
+                <TextInput id="bp-network-gateway" value={blueprint.networkGateway || ''} onChange={(_event, value) => onChangeField('networkGateway', value)} placeholder="192.0.2.1" />
                 <HelperText><HelperTextItem>Written as networkGateway. The DHCP pool is not stored here.</HelperTextItem></HelperText>
               </FormGroup>
               <FormGroup label="API VIP" fieldId="bp-api-vip" className="pf-v6-u-mt-md">
-                <TextInput id="bp-api-vip" value={blueprint.apiVip || ''} onChange={(_event, value) => onChangeField('apiVip', value)} placeholder="205.28.113.2" />
+                <TextInput id="bp-api-vip" value={blueprint.apiVip || ''} onChange={(_event, value) => onChangeField('apiVip', value)} placeholder="192.0.2.2" />
                 <HelperText><HelperTextItem>Written as apiVip. Compact and Highly Available need this address. Single node leaves it blank.</HelperTextItem></HelperText>
               </FormGroup>
               <FormGroup label="Ingress VIP" fieldId="bp-ingress-vip" className="pf-v6-u-mt-md">
-                <TextInput id="bp-ingress-vip" value={blueprint.ingressVip || ''} onChange={(_event, value) => onChangeField('ingressVip', value)} placeholder="205.28.113.3" />
+                <TextInput id="bp-ingress-vip" value={blueprint.ingressVip || ''} onChange={(_event, value) => onChangeField('ingressVip', value)} placeholder="192.0.2.3" />
                 <HelperText><HelperTextItem>Written as ingressVip. Use a different machine-network address from the API VIP and from every node.</HelperTextItem></HelperText>
               </FormGroup>
               <FormGroup label="DNS servers" fieldId="bp-dns-servers">
@@ -1241,7 +1244,7 @@ function BlueprintStep({ blueprint, onChangeField, onChangeListField, onAddRegis
                   id="bp-dns-servers"
                   value={(blueprint.dnsServers || []).join('\n')}
                   onChange={(_event, value) => onChangeListField('dnsServers', value)}
-                  placeholder={'205.28.113.35'}
+                  placeholder={'192.0.2.35'}
                   rows={3}
                 />
                 <HelperText><HelperTextItem>Enter one IP address or hostname per line.</HelperTextItem></HelperText>
@@ -1465,7 +1468,7 @@ function RedfishEndpointCard({ endpoint, index, httpsEnabled, onChange, onRemove
 }
 function DiscoveredNodesPage({ nodes, assignments, onAssignmentChange, inventoryItems, onDeleteNode, onAddInventoryItem, newNodeName, onNewNodeNameChange, onRefresh, onUpdateInventory, onBack, isRefreshing, status, error }) {
   const discoveredNodes = nodes.filter((node) => !node.is_placeholder);
-  const unlinkedInventoryItems = inventoryItems;
+  const availableInventoryItems = inventoryItems;
   const selectedInventoryItems = Object.entries(assignments)
     .filter(([, assignment]) => assignment.placeholderUuid)
     .map(([nodeUuid, assignment]) => ({ nodeUuid, uuid: assignment.placeholderUuid }));
@@ -1509,7 +1512,7 @@ function DiscoveredNodesPage({ nodes, assignments, onAssignmentChange, inventory
           <div className="discovery-summary">
             <strong aria-live="polite">{discoveredNodes.length} discovered</strong>
             <span>{unlinkedNodeCount} unlinked</span>
-            <span>{unlinkedInventoryItems.length} inventory names available</span>
+            <span>{availableInventoryItems.length} inventory names available</span>
             <Button variant="secondary" onClick={onRefresh} isDisabled={isRefreshing}>
               {isRefreshing ? 'Refreshing...' : 'Refresh inventory'}
             </Button>
@@ -1532,7 +1535,7 @@ function DiscoveredNodesPage({ nodes, assignments, onAssignmentChange, inventory
           </p>
         )}
 
-        {discoveredNodes.length || unlinkedInventoryItems.length ? (
+        {discoveredNodes.length || availableInventoryItems.length ? (
           <div style={{ overflowX: 'auto', backgroundColor: '#fff', border: '1px solid #d2d2d2', borderRadius: '4px' }}>
             <table className="workflow-discovery-table">
               <thead>
@@ -1615,7 +1618,7 @@ function DiscoveredNodesPage({ nodes, assignments, onAssignmentChange, inventory
                     </tr>
                   );
                 })}
-                {unlinkedInventoryItems.map((item) => {
+                {availableInventoryItems.map((item) => {
                   const linkedNode = selectedInventoryItems.find(({ uuid }) => uuid === item.uuid);
                   const availableNodes = discoveredNodes.filter((node) => {
                     const nodeAssignment = assignments[node.uuid];

@@ -53,11 +53,11 @@ def _last_octet(value):
 def _parse_cidr(cidr):
     text = _text(cidr)
     if "/" not in text:
-        raise ValueError("machineNetworkCidr must look like 205.28.113.0/24.")
+        raise ValueError("machineNetworkCidr must look like 192.0.2.0/24.")
     address, prefix_text = text.split("/", 1)
     address = _ipv4(address)
     if not prefix_text.isdigit():
-        raise ValueError("machineNetworkCidr must look like 205.28.113.0/24.")
+        raise ValueError("machineNetworkCidr must look like 192.0.2.0/24.")
     prefix = int(prefix_text)
     if not address or prefix < 1 or prefix > 32:
         raise ValueError("machineNetworkCidr must be an IPv4 prefix from /1 to /32.")

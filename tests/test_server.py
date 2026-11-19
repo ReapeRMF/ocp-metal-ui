@@ -17,6 +17,19 @@ import server
 NODE_UUID = "8a4f91c2-38d1-4bda-912c-bbfa47821001"
 
 
+def playbook_root():
+    """Optional checkout of ocp-ansible-playbooks/playbooks.
+
+    Comparisons against that tree run only when OCP_ANSIBLE_PLAYBOOKS
+    points at a playbooks directory. CI does not have that checkout.
+    """
+    configured = os.environ.get("OCP_ANSIBLE_PLAYBOOKS", "").strip()
+    if not configured:
+        return None
+    path = Path(configured)
+    return path if path.is_dir() else None
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -66,7 +79,7 @@ class ApiTests(unittest.TestCase):
     def report(self, **overrides):
         payload = {
             "uuid": NODE_UUID,
-            "bmc_address": "10.10.50.21",
+            "bmc_address": "192.0.2.21",
             "inventory": {
                 "cpu": {"count": 32, "model_name": "Example CPU"},
                 "memory": {"physical_mb": 65536},
@@ -103,13 +116,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {"saved": 1})
 
-        updated_report = self.report(bmc_address="10.10.50.99")
+        updated_report = self.report(bmc_address="192.0.2.99")
         status, _, _ = self.request("POST", f"/api/v1/inspections/{NODE_UUID}", updated_report)
         self.assertEqual(status, 202)
         status, body, _ = self.request("GET", "/api/v1/nodes")
         self.assertEqual(status, 200)
         node = json.loads(body)[0]
-        self.assertEqual(node["bmc_address"], "10.10.50.99")
+        self.assertEqual(node["bmc_address"], "192.0.2.99")
         self.assertEqual(node["serial_number"], "NODE-SERIAL-01")
         self.assertEqual(node["inventory"]["cpu"]["model_name"], "Example CPU")
         self.assertEqual(node["inventory"]["interfaces"][0]["state"], "up")
@@ -565,12 +578,12 @@ class ApiTests(unittest.TestCase):
         self.assertIn('"bondVlanId": "281"', host_vars)
         self.assertNotIn("cluster_blueprint", group_vars)
         self.assertIn('"clusterName": "new-cluster"', group_vars)
-        self.assertIn('"machineNetworkCidr": "205.28.113.0/24"', group_vars)
+        self.assertIn('"machineNetworkCidr": "192.0.2.0/24"', group_vars)
         self.assertIn('"genesisHostname": "edge"', group_vars)
-        self.assertIn('"genesisIp": "205.28.113.35"', group_vars)
+        self.assertIn('"genesisIp": "192.0.2.35"', group_vars)
         self.assertIn('"genesisNic": "eno5"', group_vars)
-        self.assertIn('"networkGateway": "205.28.113.1"', group_vars)
-        self.assertIn('"mgmtNetworkCidr": "205.28.114.0/24"', group_vars)
+        self.assertIn('"networkGateway": "192.0.2.1"', group_vars)
+        self.assertIn('"mgmtNetworkCidr": "198.51.100.0/24"', group_vars)
         self.assertIn('"mgmtVlan": "280"', group_vars)
         self.assertNotIn("mgmtDc01", group_vars)
         self.assertNotIn("mgmtDc02", group_vars)
@@ -578,7 +591,7 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("isc_dhcpd_start_ip", group_vars)
         self.assertNotIn("bastionHostname", group_vars)
         self.assertNotIn("bastionIp", group_vars)
-        self.assertIn('"dnsServers":\n  - "205.28.113.35"', group_vars)
+        self.assertIn('"dnsServers":\n  - "192.0.2.35"', group_vars)
 
     def test_retired_bastion_blueprint_keys_move_to_genesis_keys(self):
         with server.connect_database() as connection:
@@ -589,7 +602,7 @@ class ApiTests(unittest.TestCase):
                         {
                             "clusterName": "kept-cluster",
                             "bastionHostname": "edge-genesis",
-                            "bastionIp": "205.28.113.36",
+                            "bastionIp": "192.0.2.36",
                         }
                     ),
                 ),
@@ -599,7 +612,7 @@ class ApiTests(unittest.TestCase):
         blueprint = json.loads(body)["blueprint"]
         self.assertEqual(blueprint["clusterName"], "kept-cluster")
         self.assertEqual(blueprint["genesisHostname"], "edge-genesis")
-        self.assertEqual(blueprint["genesisIp"], "205.28.113.36")
+        self.assertEqual(blueprint["genesisIp"], "192.0.2.36")
         self.assertNotIn("bastionHostname", blueprint)
         self.assertNotIn("bastionIp", blueprint)
 
@@ -632,7 +645,7 @@ class ApiTests(unittest.TestCase):
                 ).fetchone()["value_json"]
             )
         self.assertEqual(stored["genesisHostname"], "edge-genesis")
-        self.assertEqual(stored["genesisIp"], "205.28.113.36")
+        self.assertEqual(stored["genesisIp"], "192.0.2.36")
         self.assertNotIn("bastionHostname", stored)
         self.assertNotIn("bastionIp", stored)
 
@@ -651,7 +664,7 @@ class ApiTests(unittest.TestCase):
                 "preferences": {placeholder_uuid: {"ansibleHost": "control-01"}},
                 "blueprint": {
                     "bastionHostname": "edge-genesis",
-                    "bastionIp": "205.28.113.36",
+                    "bastionIp": "192.0.2.36",
                 },
             },
         )
@@ -660,7 +673,7 @@ class ApiTests(unittest.TestCase):
             server.ANSIBLE_WORKING_DIR / "ocp-metal-ui" / "group_vars" / "ocp.yml"
         ).read_text()
         self.assertIn('"genesisHostname": "edge-genesis"', group_vars)
-        self.assertIn('"genesisIp": "205.28.113.36"', group_vars)
+        self.assertIn('"genesisIp": "192.0.2.36"', group_vars)
         self.assertNotIn("bastionHostname", group_vars)
         self.assertNotIn("bastionIp", group_vars)
 
@@ -745,8 +758,8 @@ class ApiTests(unittest.TestCase):
                     json.dumps(
                         {
                             "clusterName": "kept-cluster",
-                            "mgmtDc01Ip": "205.28.114.16",
-                            "mgmtDc02Ip": "205.28.114.17",
+                            "mgmtDc01Ip": "198.51.100.16",
+                            "mgmtDc02Ip": "198.51.100.17",
                         }
                     ),
                 ),
@@ -1184,11 +1197,13 @@ class ApiTests(unittest.TestCase):
 
         import yaml
 
-        playbooks = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks"
-        )
-        sys.path.insert(0, str(playbooks / "tests"))
-        from test_agent_install import agent_hosts, render_templates
+        from agent_install import agent_hosts
+
+        render_templates = None
+        playbooks = playbook_root()
+        if playbooks is not None and (playbooks / "tests").is_dir():
+            sys.path.insert(0, str(playbooks / "tests"))
+            from test_agent_install import render_templates
 
         specs = [
             {
@@ -1197,7 +1212,7 @@ class ApiTests(unittest.TestCase):
                 "role": "master",
                 "rendezvous": True,
                 "ipv4LastOctet": "011",
-                "current_ip": "205.28.113.99",
+                "current_ip": "192.0.2.99",
                 "serial": "NODE-SERIAL-01",
                 "rootDisk": "NVME-C1",
                 "nics": [("eno5", "52:54:00:AA:00:05"), ("eno6", "52:54:00:11:00:06")],
@@ -1291,12 +1306,12 @@ class ApiTests(unittest.TestCase):
                     "clusterName": "ocp-baremetal",
                     "baseDomain": "ocp.internal",
                     "controlPlaneTopology": "HighlyAvailable",
-                    "machineNetworkCidr": "205.28.113.0/24",
-                    "networkGateway": "205.28.113.1",
-                    "dnsServers": ["205.28.113.35"],
-                    "ntpServers": ["205.28.113.35"],
-                    "apiVip": "205.28.113.2",
-                    "ingressVip": "205.28.113.3",
+                    "machineNetworkCidr": "192.0.2.0/24",
+                    "networkGateway": "192.0.2.1",
+                    "dnsServers": ["192.0.2.35"],
+                    "ntpServers": ["192.0.2.35"],
+                    "apiVip": "192.0.2.2",
+                    "ingressVip": "192.0.2.3",
                     "caCertBundle": "TEST-CA",
                     "pullSecret": "must-not-export",
                     "vaultPassword": "must-not-export",
@@ -1330,8 +1345,8 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("vaultPassword", published)
 
         group = yaml.safe_load((output_root / "group_vars" / "ocp.yml").read_text())
-        self.assertEqual(group["apiVip"], "205.28.113.2")
-        self.assertEqual(group["ingressVip"], "205.28.113.3")
+        self.assertEqual(group["apiVip"], "192.0.2.2")
+        self.assertEqual(group["ingressVip"], "192.0.2.3")
         self.assertEqual(group["clusterName"], "ocp-baremetal")
         self.assertNotIn("mgmtDc01Octet", group)
 
@@ -1357,13 +1372,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(by_file["control-01"]["role"], "master")
         self.assertIs(by_file["control-01"]["rendezvous"], True)
         self.assertEqual(by_file["control-01"]["ipv4LastOctet"], "11")
-        self.assertEqual(by_file["control-01"]["ipv4_ip"], "205.28.113.11")
+        self.assertEqual(by_file["control-01"]["ipv4_ip"], "192.0.2.11")
         self.assertEqual(by_file["control-01"]["ipa_inventory"]["interfaces"][0]["mac_address"], "52:54:00:AA:00:05")
         self.assertEqual(by_file["control-02"]["node_preferences"]["bondNics"], ["eno5", "eno6"])
         self.assertIs(by_file["control-02"]["node_preferences"]["bondVlanEnabled"], False)
         self.assertIs(by_file["control-03"]["node_preferences"]["singleVlanEnabled"], False)
         self.assertEqual(by_file["worker-01"]["role"], "worker")
-        self.assertEqual(by_file["worker-01"]["ipv4_ip"], "205.28.113.14")
+        self.assertEqual(by_file["worker-01"]["ipv4_ip"], "192.0.2.14")
         self.assertEqual(
             yaml.safe_load((output_root / "host_vars" / "dc01.yml").read_text()),
             {"ipv4LastOctet": "6"},
@@ -1372,8 +1387,8 @@ class ApiTests(unittest.TestCase):
         status, body, _ = self.request("GET", "/api/v1/config")
         self.assertEqual(status, 200, body)
         stored_blueprint = json.loads(body)["blueprint"]
-        self.assertEqual(stored_blueprint["apiVip"], "205.28.113.2")
-        self.assertEqual(stored_blueprint["ingressVip"], "205.28.113.3")
+        self.assertEqual(stored_blueprint["apiVip"], "192.0.2.2")
+        self.assertEqual(stored_blueprint["ingressVip"], "192.0.2.3")
         status, body, _ = self.request("GET", "/api/v1/nodes")
         self.assertEqual(status, 200, body)
         stored = {node["uuid"]: node for node in json.loads(body)}
@@ -1387,19 +1402,23 @@ class ApiTests(unittest.TestCase):
         result = agent_hosts({"blueprint": group, "hosts": loaded_hosts})
         self.assertTrue(result["ok"], result["error"])
         self.assertEqual(result["platform"], "baremetal")
-        self.assertEqual(result["rendezvous_ip"], "205.28.113.11")
-        self.assertEqual(result["api_vips"], ["205.28.113.2"])
-        self.assertEqual(result["ingress_vips"], ["205.28.113.3"])
+        self.assertEqual(result["rendezvous_ip"], "192.0.2.11")
+        self.assertEqual(result["api_vips"], ["192.0.2.2"])
+        self.assertEqual(result["ingress_vips"], ["192.0.2.3"])
+        # The Jinja comparison needs the playbook checkout named by
+        # OCP_ANSIBLE_PLAYBOOKS. The assertions above use this repo only.
+        if render_templates is None:
+            return
         rendered = render_templates(result)
         install_config = yaml.safe_load(rendered["install-config.yaml"])
         agent_config = yaml.safe_load(rendered["agent-config.yaml"])
-        self.assertEqual(install_config["platform"]["baremetal"]["apiVIPs"], ["205.28.113.2"])
-        self.assertEqual(install_config["platform"]["baremetal"]["ingressVIPs"], ["205.28.113.3"])
+        self.assertEqual(install_config["platform"]["baremetal"]["apiVIPs"], ["192.0.2.2"])
+        self.assertEqual(install_config["platform"]["baremetal"]["ingressVIPs"], ["192.0.2.3"])
         self.assertEqual(install_config["controlPlane"]["replicas"], 3)
         self.assertEqual(install_config["compute"][0]["replicas"], 1)
         self.assertIn("TEST-CA", rendered["install-config.yaml"])
         self.assertIn('{"auths":{}}', rendered["install-config.yaml"])
-        self.assertEqual(agent_config["rendezvousIP"], "205.28.113.11")
+        self.assertEqual(agent_config["rendezvousIP"], "192.0.2.11")
         recovered = {item["hostname"]: item for item in agent_config["hosts"]}
         self.assertEqual(recovered["control-01"]["role"], "master")
         self.assertEqual(recovered["control-01"]["rootDeviceHints"]["serialNumber"], "NVME-C1")
@@ -1407,7 +1426,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(recovered["control-01"]["networkConfig"]["interfaces"][1]["name"], "eno5.281")
         self.assertEqual(
             recovered["control-01"]["networkConfig"]["interfaces"][1]["ipv4"]["address"][0]["ip"],
-            "205.28.113.11",
+            "192.0.2.11",
         )
         self.assertEqual(recovered["control-02"]["networkConfig"]["interfaces"][2]["name"], "bond0")
         self.assertEqual(
@@ -1478,14 +1497,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(blueprint["ingressVip"], "")
 
     def test_partial_inventory_publishes_and_the_install_filter_requires_three_masters(self):
-        import sys
-
         import yaml
 
-        playbooks = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks"
-        )
-        sys.path.insert(0, str(playbooks / "filter_plugins"))
         from agent_install import agent_hosts
 
         self._post_inspection(
@@ -1513,8 +1526,8 @@ class ApiTests(unittest.TestCase):
                 },
                 "blueprint": {
                     "controlPlaneTopology": "HighlyAvailable",
-                    "apiVip": "205.28.113.2",
-                    "ingressVip": "205.28.113.3",
+                    "apiVip": "192.0.2.2",
+                    "ingressVip": "192.0.2.3",
                 },
             },
         )
@@ -1651,16 +1664,24 @@ class ApiTests(unittest.TestCase):
         self.assertIn("rendezvous host must be a master", json.loads(body)["error"])
 
     def test_bundled_install_filter_matches_the_playbook_filter(self):
+        playbooks = playbook_root()
+        if playbooks is None:
+            self.skipTest(
+                "Set OCP_ANSIBLE_PLAYBOOKS to an ocp-ansible-playbooks/playbooks "
+                "checkout to compare the bundled filter."
+            )
         bundled = Path(server.__file__).resolve().parent / "agent_install.py"
-        playbook = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks/filter_plugins/agent_install.py"
-        )
+        playbook = playbooks / "filter_plugins" / "agent_install.py"
         self.assertEqual(bundled.read_bytes(), playbook.read_bytes())
 
     def test_render_play_can_read_saved_install_secret_files(self):
-        playbook = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks/render_agent_install.yml"
-        ).read_text()
+        playbooks = playbook_root()
+        if playbooks is None:
+            self.skipTest(
+                "Set OCP_ANSIBLE_PLAYBOOKS to an ocp-ansible-playbooks/playbooks "
+                "checkout to read render_agent_install.yml."
+            )
+        playbook = (playbooks / "render_agent_install.yml").read_text()
         self.assertIn("ocp_install_pull_secret_file", playbook)
         self.assertIn("ocp_install_ssh_public_key_file", playbook)
         self.assertIn("ocp_pre_install_pull_secret_contents | default('') | length == 0", playbook)
@@ -1799,8 +1820,8 @@ class ApiTests(unittest.TestCase):
                     "clusterName": "ocp-baremetal",
                     "baseDomain": "ocp.internal",
                     "controlPlaneTopology": "SingleNode",
-                    "machineNetworkCidr": "205.28.113.0/24",
-                    "networkGateway": "205.28.113.1",
+                    "machineNetworkCidr": "192.0.2.0/24",
+                    "networkGateway": "192.0.2.1",
                     "pullSecret": "must-not-export",
                     "vaultPassword": "must-not-export",
                 },
@@ -1833,7 +1854,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(written_install["fips"], True)
         self.assertIn("edge.ocp.internal", written_install["imageDigestSources"][0]["mirrors"][0])
         self.assertEqual(written_agent["kind"], "AgentConfig")
-        self.assertEqual(written_agent["rendezvousIP"], "205.28.113.11")
+        self.assertEqual(written_agent["rendezvousIP"], "192.0.2.11")
         self.assertEqual(written_agent["hosts"][0]["hostname"], "control-01")
         self.assertEqual(written_agent["hosts"][0]["role"], "master")
         self.assertEqual(
@@ -1959,8 +1980,8 @@ class ApiTests(unittest.TestCase):
                 "clusterName": "ocp-baremetal",
                 "baseDomain": "ocp.internal",
                 "controlPlaneTopology": "SingleNode",
-                "machineNetworkCidr": "205.28.113.0/24",
-                "networkGateway": "205.28.113.1",
+                "machineNetworkCidr": "192.0.2.0/24",
+                "networkGateway": "192.0.2.1",
             },
         }
         with patch.object(server, "BUNDLED_PULL_SECRET_FILE", bundled_path):
