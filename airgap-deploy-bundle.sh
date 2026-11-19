@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Remove a checkout vault.password only when it is the old staged copy
+# (uid 10001, mode 0400) and it is not the configured password source.
+checkout_vault_copy_should_be_removed() {
+  local target="$1"
+  local source="${2:-}"
+  local target_real source_real uid mode
+  if [ ! -f "$target" ]; then
+    return 1
+  fi
+  if [ -n "$source" ] && [ -e "$source" ]; then
+    target_real="$(readlink -f "$target")"
+    source_real="$(readlink -f "$source")"
+    if [ "$target_real" = "$source_real" ]; then
+      return 1
+    fi
+  fi
+  uid="$(stat -c '%u' "$target")"
+  mode="$(stat -c '%a' "$target")"
+  [ "$uid" = "10001" ] && [ "$mode" = "400" ]
+}
+
+if [ "${1:-}" = "--vault-cleanup-decision" ]; then
+  if checkout_vault_copy_should_be_removed "$2" "${3:-}"; then
+    exit 0
+  fi
+  exit 1
+fi
+
 echo "========================================================="
 echo "🔴 Disconnected Phase: Deploying the airgap UI"
 echo "========================================================="
@@ -304,13 +332,47 @@ else
 fi
 
 VAULT_PASSWORD_HOST_FILE="${VAULT_PASSWORD_FILE:-/root/.vault_pass}"
+VAULT_PASSWORD_SOURCE="$VAULT_PASSWORD_HOST_FILE"
 VAULT_ARGS=()
+VAULT_STAGE=""
+remove_secret_file() {
+  local target="$1"
+  if [ ! -e "$target" ]; then
+    return 0
+  fi
+  if command -v shred >/dev/null 2>&1; then
+    shred -u -- "$target" 2>/dev/null || rm -f -- "$target"
+  else
+    rm -f -- "$target"
+  fi
+}
+cleanup_vault_material() {
+  if [ -n "${VAULT_STAGE:-}" ]; then
+    remove_secret_file "$VAULT_STAGE"
+    VAULT_STAGE=""
+  fi
+  # Only the old staged copy (uid 10001, mode 0400) is removed, and never
+  # when that path is the configured vault password.
+  if [ -n "${SCRIPT_DIR:-}" ] && checkout_vault_copy_should_be_removed \
+    "$SCRIPT_DIR/vault.password" "${VAULT_PASSWORD_SOURCE:-}"; then
+    remove_secret_file "$SCRIPT_DIR/vault.password"
+  fi
+}
+trap cleanup_vault_material EXIT
 if [ -f "$VAULT_PASSWORD_HOST_FILE" ]; then
   VAULT_PASSWORD_HOST_FILE="$(cd "$(dirname "$VAULT_PASSWORD_HOST_FILE")" && pwd -P)/$(basename "$VAULT_PASSWORD_HOST_FILE")"
   vault_mount_opts=ro
   if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -eq 0 ]; then
-    install -o 10001 -g 10001 -m 0400 "$VAULT_PASSWORD_HOST_FILE" "$SCRIPT_DIR/vault.password"
-    VAULT_PASSWORD_HOST_FILE="$SCRIPT_DIR/vault.password"
+    # The running container bind-mounts this file, so it stays under
+    # /var/lib and is not removed when the script exits.
+    install -d -o root -g root -m 755 /var/lib/ocp-metal-ui
+    VAULT_STAGE="$(mktemp /var/lib/ocp-metal-ui/vault.password.XXXXXX)"
+    install -o 10001 -g 10001 -m 0400 "$VAULT_PASSWORD_HOST_FILE" "$VAULT_STAGE"
+    mv -f -- "$VAULT_STAGE" /var/lib/ocp-metal-ui/vault.password
+    VAULT_STAGE=""
+    chown 10001:10001 /var/lib/ocp-metal-ui/vault.password
+    chmod 0400 /var/lib/ocp-metal-ui/vault.password
+    VAULT_PASSWORD_HOST_FILE="/var/lib/ocp-metal-ui/vault.password"
     vault_mount_opts=ro,Z
   fi
   VAULT_ARGS=(
@@ -325,15 +387,42 @@ fi
 # 3. Start the application. The image still declares /data; the database
 # is the PostgreSQL container, so that mount stays empty.
 API_TOKEN_FILE="${API_TOKEN_FILE:-/var/lib/ocp-metal-ui/api.token}"
-install -d -o root -g root -m 755 "$(dirname "$API_TOKEN_FILE")"
-if [ ! -s "$API_TOKEN_FILE" ]; then
+INSPECTION_TOKEN_FILE="${INSPECTION_TOKEN_FILE:-/var/lib/ocp-metal-ui/inspection.token}"
+INSPECTION_CURL_CONFIG="${INSPECTION_CURL_CONFIG:-/var/lib/ocp-metal-ui/inspection.curl}"
+install -d -o root -g root -m 755 "$(dirname "$API_TOKEN_FILE")" "$(dirname "$INSPECTION_TOKEN_FILE")"
+write_private_token() {
+  local path="$1"
+  local previous_umask
+  previous_umask="$(umask)"
   umask 077
-  openssl rand -hex 32 > "$API_TOKEN_FILE"
-fi
-chmod 600 "$API_TOKEN_FILE"
+  if [ ! -s "$path" ]; then
+    openssl rand -hex 32 > "$path"
+  fi
+  chmod 600 "$path"
+  umask "$previous_umask"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown 10001:10001 "$path"
+    chmod 0400 "$path"
+  fi
+}
+write_private_token "$API_TOKEN_FILE"
+write_private_token "$INSPECTION_TOKEN_FILE"
+previous_umask="$(umask)"
+umask 077
+python3 - "$INSPECTION_TOKEN_FILE" "$INSPECTION_CURL_CONFIG" << 'PY'
+import sys
+from pathlib import Path
+token = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+Path(sys.argv[2]).write_text(
+    'header = "Authorization: Bearer %s"\n' % token,
+    encoding="utf-8",
+)
+PY
+chmod 600 "$INSPECTION_CURL_CONFIG"
+umask "$previous_umask"
 if [ "$(id -u)" -eq 0 ]; then
-  chown 10001:10001 "$API_TOKEN_FILE"
-  chmod 0400 "$API_TOKEN_FILE"
+  chown 10001:10001 "$INSPECTION_CURL_CONFIG"
+  chmod 0400 "$INSPECTION_CURL_CONFIG"
 fi
 install -d -o 10001 -g 10001 -m 755 "$(dirname "$UI_DATABASE_ENV_FILE")/empty"
 echo "🚀 Starting the offline UI..."
@@ -346,8 +435,11 @@ $ENGINE run -d \
   --env-file "$UI_DATABASE_ENV_FILE" \
   -e "HOST=${BIND_ADDRESS:-127.0.0.1}" \
   -e "PORT=${HOST_PORT:-3003}" \
+  -e "TLS_HOSTNAME=${TLS_HOSTNAME}" \
   -e API_TOKEN_FILE=/run/secrets/api-token \
+  -e INSPECTION_TOKEN_FILE=/run/secrets/inspection-token \
   -v "${API_TOKEN_FILE}:/run/secrets/api-token:ro,Z" \
+  -v "${INSPECTION_TOKEN_FILE}:/run/secrets/inspection-token:ro,Z" \
   -v "$(dirname "$UI_DATABASE_ENV_FILE")/empty:/data:Z" \
   -v "$ANSIBLE_HOST_DIR:/ansible:Z" \
   -e ANSIBLE_WORKING_DIR=/ansible \
@@ -370,12 +462,15 @@ echo "   HTTPS is enabled. A self-signed certificate requires browser trust/acce
 echo "💾 PostgreSQL data directory: ${UI_DB_DATA_DIR}"
 echo "   Database ocp_metal_ui listens on ${UI_DB_PUBLISH_ADDRESS}."
 echo "   Credentials: ${UI_DB_CREDENTIALS_FILE}"
-echo "🔑 API token file: ${API_TOKEN_FILE}"
-echo "   Paste that token into the UI. Read it with: sudo cat ${API_TOKEN_FILE}"
-echo "   The file stays outside the git checkout. Delete it before the next deploy to rotate it."
+echo "🔑 Admin API token file: ${API_TOKEN_FILE}"
+echo "   Paste that token into the UI. It authorizes every /api/ route except health."
+echo "🔑 Inspection token file: ${INSPECTION_TOKEN_FILE}"
+echo "   The collector uses only this token. Curl config: ${INSPECTION_CURL_CONFIG}"
+echo "   Both files stay outside the git checkout. Delete a file before the next deploy to rotate it."
 echo "📂 Ansible workspace is mounted from: $ANSIBLE_HOST_DIR"
 echo "   Set ANSIBLE_HOST_DIR before deployment to use another host directory."
 echo "   Ensure the container user (UID 10001) can write to that directory."
 echo "⚠️  The default bind is 127.0.0.1. Set BIND_ADDRESS only for a network you trust."
-echo "   Writes and /api/v1/install-secrets require the API token. Inventory reads do not."
+echo "   Every /api/ route except /api/v1/health requires the admin token."
+echo "   POST /api/v1/inspections also accepts the inspection token and nothing else."
 echo "========================================================="

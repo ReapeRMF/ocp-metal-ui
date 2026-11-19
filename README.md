@@ -1,6 +1,6 @@
 # OpenShift Bare-Metal Builder
 
-Author: David Stratfor, assisted by AI.
+Author: David Stratford, assisted by AI.
 
 One container serves the PatternFly UI and its API. The operator reviews discovered hardware, sets disk and network choices, and writes Ansible files to a mounted workspace. The UI reads blueprint defaults, named hosts, and discovered hardware from PostgreSQL. It does not ship sample inventory. The node serial number is the hardware identifier that links a discovered system to its Ansible host.
 
@@ -8,14 +8,14 @@ One container serves the PatternFly UI and its API. The operator reviews discove
 
 | Where | Address | Port |
 | --- | --- | --- |
-| Host installed from the external boot drive | `205.28.113.35` (`genesisIp`) | `3003` |
+| Example installed host (`genesisIp`) | `192.0.2.35` | `3003` |
 | This workstation | `127.0.0.1` | `18080` |
 
-Port 3003 is the UI on the installed host. Semaphore on that host uses port 3000. The hardware collector on that host uses port 5000 and forwards reports to `http://127.0.0.1:3003`. Boot files are served by httpd on port 80.
+Port 3003 is the UI on the installed host. Semaphore on that host uses port 3000. The hardware collector on that host uses port 5000 and posts inspection reports to `https://127.0.0.1:3003` with the inspection token. It does not use the admin token. Boot files are served by httpd on port 80. See [Inspection client contract](#inspection-client-contract).
 
-The workstation container is a separate process. Open it at `https://edge.ocp.internal:18080`. The certificate name is `edge.ocp.internal`.
+The workstation container is a separate process. Open it at `https://edge.example.com:18080` when the certificate was issued for that name.
 
-`./airgap-deploy-bundle.sh` listens on `BIND_ADDRESS` (default `127.0.0.1`) and port `3003`. Set `BIND_ADDRESS` to publish another address, for example the genesis address. For the workstation, change only the port:
+`./airgap-deploy-bundle.sh` listens on `BIND_ADDRESS` (default `127.0.0.1`) and port `3003`. Set `BIND_ADDRESS` to publish another address, for example `192.0.2.35`. For the workstation, change only the port:
 
 ```sh
 HOST_PORT=18080 ./airgap-deploy-bundle.sh
@@ -49,7 +49,7 @@ A discovered node needs a serial number before it can be written to the Ansible 
 ```json
 {
   "uuid": "8a4f91c2-38d1-4bda-912c-bbfa47821001",
-  "bmc_address": "10.10.50.21",
+  "bmc_address": "192.0.2.21",
   "inventory": {
     "system_vendor": { "serial_number": "NODE-SERIAL-01" },
     "cpu": { "count": 64, "model_name": "Example CPU" },
@@ -80,13 +80,31 @@ On the installed host, post the report to port 3003. The DNS name in the URL mus
 
 ```sh
 curl --cacert /etc/ipa/ocp-metal-ui.crt \
-  -X POST https://edge.ocp.internal:3003/api/v1/inspections \
-  -H "Authorization: Bearer $(sudo cat /var/lib/ocp-metal-ui/api.token)" \
+  --config /var/lib/ocp-metal-ui/inspection.curl \
+  -X POST https://edge.example.com:3003/api/v1/inspections \
   -H 'Content-Type: application/json' \
   --data-binary @inspection-report.json
 ```
 
-The API stores the report. It does not configure IPA or replace an Ironic conductor. Point the existing inspection workflow at this URL. Inspection posts are write requests, so the client must send the API token.
+The API stores the report. It does not configure IPA or replace an Ironic conductor. Point the existing inspection workflow at this URL and give it the inspection token. Do not give it the admin token.
+
+## Inspection client contract
+
+The collector is not in this repository. `hw-interrogator` in `build-the-builder` has to do the following before discovery will succeed:
+
+1. Read the token from the file named by `INSPECTION_TOKEN_FILE`. When that variable is unset, the path is `/var/lib/ocp-metal-ui/inspection.token`. If the file is missing, use the `INSPECTION_TOKEN` environment variable. Do not read `API_TOKEN`, `API_TOKEN_FILE`, or `/var/lib/ocp-metal-ui/api.token`.
+2. `POST` the inspection JSON to `https://127.0.0.1:3003/api/v1/inspections` or `https://127.0.0.1:3003/api/v1/inspections/{uuid}`. The deploy serves HTTPS. Use the UI certificate. Do not post to plain HTTP.
+3. Set the header `Authorization: Bearer <inspection token>` in the HTTP client. The scheme is case-insensitive. Do not expand the token into a shell command line. A curl client can pass `--config /var/lib/ocp-metal-ui/inspection.curl` instead.
+4. Send `Host: 127.0.0.1`, `Host: localhost`, or `Host` set to `TLS_HOSTNAME`. Other names need `API_ALLOWED_HOSTS` on the UI.
+5. Do not call any other `/api/` path with this token. Config, nodes, install secrets, and the SSH private key reject it.
+
+```sh
+curl --cacert /etc/ipa/ocp-metal-ui.crt \
+  --config /var/lib/ocp-metal-ui/inspection.curl \
+  -X POST https://127.0.0.1:3003/api/v1/inspections \
+  -H 'Content-Type: application/json' \
+  --data-binary @inspection-report.json
+```
 
 ## Generated files
 
@@ -138,18 +156,18 @@ Initial defaults, written when the database is first created:
 | --- | --- |
 | `clusterName` | `ocp-baremetal` |
 | `baseDomain` | `ocp.internal` |
-| `machineNetworkCidr` | `205.28.113.0/24` |
-| `networkGateway` | `205.28.113.1` |
-| `dnsServers` | `205.28.113.35` |
+| `machineNetworkCidr` | `192.0.2.0/24` |
+| `networkGateway` | `192.0.2.1` |
+| `dnsServers` | `192.0.2.35` |
 | `genesisHostname` | `edge` |
-| `genesisIp` | `205.28.113.35` |
+| `genesisIp` | `192.0.2.35` |
 | `genesisNic` | `eno5` |
-| `mgmtNetworkCidr` | `205.28.114.0/24` |
+| `mgmtNetworkCidr` | `198.51.100.0/24` |
 | `mgmtVlan` | `280` |
 | `mgmtDc01Octet` | `6` |
 | `mgmtDc02Octet` | `7` |
 
-The blueprint stores `edge`. The installed host name is `edge.ocp.internal`. `genesis` is an alias.
+The blueprint stores `edge`. The installed host name is that short name plus the base domain (`edge.ocp.internal` with the defaults above). `genesis` is an alias.
 
 Hosts created before a hardware report have an empty inventory mapping and `node_status: awaiting_ipa`. Linking a placeholder to a discovered node keeps the Ansible host name and replaces the placeholder with that node. Every node uses `DEFAULT_ANSIBLE_GROUP` from `server.py`. The operator does not pick the group.
 
@@ -163,7 +181,7 @@ After linking, both sources use the same controls for disk, NIC, bond, and VLAN.
 
 ## Pull secret and SSH key
 
-The image build copies an Ansible vault file to `/app/pull-secret.vault`, mode 0600. The vault password is mounted at `/vault/password` and is not in the image. On the Blueprint page, paste a pull secret or choose a file to store one for this workspace, or create an SSH key. The saved vault file is `cluster-install/pull-secret.vault`. Leave the field blank to keep the pull secret built into the image.
+The image build copies an Ansible vault file to `/app/pull-secret.vault`, mode 0600. That file is produced on the build machine and is not stored in git. The vault password is mounted at `/vault/password` and is not in the image. On the Blueprint page, paste a pull secret or choose a file to store one for this workspace, or create an SSH key. The saved vault file is `cluster-install/pull-secret.vault`. Leave the field blank to keep the pull secret built into the image.
 
 The install preview shows the pull secret after the vault password can open it. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
 
@@ -179,13 +197,13 @@ BMC certificates are verified by default. For an untrusted BMC certificate, the 
 
 Build on a connected machine with Node.js 22, npm, and Podman or Docker. The image contains the built UI and the Python runtime. It does not need network access after it is built.
 
-`pull-secret.vault` in this directory is the committed cluster pull secret. It is an Ansible vault variable, `ocp_pre_install_pull_secret_contents`. The vault password is not in this repository. Mount that password at `/vault/password` when the container starts.
+The cluster pull secret is not in this repository. On the build machine, place the plaintext pull secret at `pull-secret.json` in this directory and set `VAULT_PASSWORD_FILE` to the Ansible vault password file. Neither file is committed. `airgap-build-bundle.sh` writes `pull-secret.vault` beside them, mode 0600, as the Ansible vault variable `ocp_pre_install_pull_secret_contents`. That vault file is gitignored. The image copies it to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image.
 
-To replace the secret, place the new plaintext at `pull-secret.json` and set `VAULT_PASSWORD_FILE` to the vault password file. The build writes `pull-secret.vault` again, and the image copies that file to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image. `pull-secret.json` is not committed.
+Mount the same password file at `/vault/password` when the container starts. `VAULT_PASSWORD_FILE` defaults to `/root/.vault_pass`. Keep that file outside the git checkout. When the deploy runs as root under Podman, it copies that file to `/var/lib/ocp-metal-ui/vault.password`, mode 0400, owned by uid 10001, and mounts that copy. A failed deploy shreds a partial copy under `/var/lib/ocp-metal-ui`. A file named `vault.password` in the checkout is removed only when it is the old staged copy (uid 10001, mode 0400) and it is not `VAULT_PASSWORD_FILE`. To use a different secret later, paste it on the Blueprint page or replace `pull-secret.json` and build again. A secret saved from the UI is `cluster-install/pull-secret.vault` in the Ansible workspace, and it overrides the copy in the image for that workspace.
 
 ```sh
 npm ci
-./airgap-build-bundle.sh
+VAULT_PASSWORD_FILE=/path/to/vault-password ./airgap-build-bundle.sh
 ```
 
 The script compiles `dist/`, vaults `pull-secret.json`, builds `Containerfile.airgap`, and writes `ocp-metal-ui-engine-bundle.tar`. Copy that tarball and `airgap-deploy-bundle.sh` to the disconnected host. `package-lock.json` pins the JavaScript dependencies. For a byte-for-byte image rebuild, also pin the Python base image by digest in `Containerfile.airgap`.
@@ -202,9 +220,17 @@ Replacing the UI container does not delete `/var/lib/ocp-metal-ui/postgres` or `
 
 The database holds nodes, placeholders, preferences, blueprint settings, and Redfish profile names. It does not hold BMC passwords. No sample BMC profiles are loaded. The UI listens on `BIND_ADDRESS` (default `127.0.0.1`) and port `3003`.
 
-The first deploy writes `/var/lib/ocp-metal-ui/api.token`, mode 0400, owned by uid 10001. That file is outside the git checkout. The container reads it from `/run/secrets/api-token`. Paste the token into the API token field in the UI and choose **Use token**. The browser keeps it in `sessionStorage` for the tab and sends `Authorization: Bearer` on API requests. It is not stored in PostgreSQL. Read the file with `sudo cat /var/lib/ocp-metal-ui/api.token`. Delete the file before the next deploy to rotate it. Set `API_TOKEN_FILE` to use a different path.
+The first deploy writes two token files outside the git checkout, mode 0400, owned by uid 10001:
 
-Writes (`POST`, `PUT`, `DELETE`) and every `/api/v1/install-secrets` request require that token. `GET /api/v1/health`, `GET /api/v1/config`, and `GET /api/v1/nodes` do not. Leave the bind on `127.0.0.1` unless exposing those reads is acceptable. `BIND_ADDRESS=0.0.0.0` still overrides the default.
+| File | Use |
+| --- | --- |
+| `/var/lib/ocp-metal-ui/api.token` | Admin token. Paste it into the UI **API token** field and choose **Use token**. The browser keeps it in `sessionStorage` for the tab. |
+| `/var/lib/ocp-metal-ui/inspection.token` | Inspection token. Only the hardware collector uses it. |
+| `/var/lib/ocp-metal-ui/inspection.curl` | curl config whose `header` line carries the inspection token. `curl --config` reads it, so the token is not placed on the command line. |
+
+The container reads the admin token from `/run/secrets/api-token` and the inspection token from `/run/secrets/inspection-token`. Delete a file before the next deploy to rotate that token. Set `API_TOKEN_FILE` or `INSPECTION_TOKEN_FILE` to use different paths.
+
+Every `/api/` route except `GET /api/v1/health` requires the admin token. The inspection token is accepted only for `POST /api/v1/inspections` and `POST /api/v1/inspections/{uuid}`. It cannot read config or nodes, and it cannot download the SSH private key. The `Host` header must be `localhost`, `127.0.0.1`, `::1`, `TLS_HOSTNAME`, or a name in `API_ALLOWED_HOSTS`. Leave the bind on `127.0.0.1`. `BIND_ADDRESS` still overrides it. Binding any other address without TLS prints a warning.
 
 To mount a different workspace directory:
 
@@ -222,7 +248,7 @@ The script prepares `/var/lib/ocp-metal-ui/postgres` and starts the database con
 BIND_ADDRESS=127.0.0.1 HOST_PORT=18080 ./airgap-deploy-bundle.sh
 ```
 
-Open `https://edge.ocp.internal:18080` when the certificate was issued for that name. Open `https://127.0.0.1:18080` when the certificate covers that address. Some systems resolve `localhost` to IPv6. The published port is IPv4.
+Open `https://edge.example.com:18080` when the certificate was issued for that name. Open `https://127.0.0.1:18080` when the certificate covers that address. Some systems resolve `localhost` to IPv6. The published port is IPv4.
 
 ## HTTPS
 
@@ -287,11 +313,12 @@ Start the API and the UI in two terminals:
 DATABASE_URL='postgresql://ocp_metal_ui:PASSWORD@127.0.0.1:5433/ocp_metal_ui?sslmode=disable' \
 ANSIBLE_WORKING_DIR=./ansible-workspace \
 API_TOKEN='local-dev-token' \
+INSPECTION_TOKEN='local-inspection-token' \
 python3 server.py
 npm run dev
 ```
 
-`python3 server.py` listens on `127.0.0.1` and port 3003 unless `HOST` or `PORT` is set. Set `API_TOKEN`, or `API_TOKEN_FILE` to a mode 0600 file outside the checkout. Paste that token into the UI. Without a token, write requests return 503. This process uses HTTP unless TLS certificate files are configured. The container deployment uses HTTPS. Vite proxies `/api` to `http://localhost:3003`.
+`python3 server.py` listens on `127.0.0.1` and port 3003 unless `HOST` or `PORT` is set. Set `API_TOKEN`, or `API_TOKEN_FILE` to a mode 0600 file outside the checkout. Paste the admin token into the UI. A missing or unreadable admin token file fails closed: protected routes return 503. `INSPECTION_TOKEN` or `INSPECTION_TOKEN_FILE` is only for inspection posts. This process uses HTTP unless TLS certificate files are configured. The container deployment uses HTTPS. Vite proxies `/api` to `http://localhost:3003`.
 
 ```sh
 npm run lint
@@ -318,6 +345,6 @@ npm run test:backend
 | `PUT` | `/api/v1/configuration` | Save the blueprint, workspace destination, and node preferences |
 | `POST` | `/api/v1/ansible-files` | Write the reviewed inventory and variables into the workspace |
 
-Writes and `/api/v1/install-secrets` require the bearer token from the deploy. HTTPS protects Redfish credentials and that token in transit. Inventory reads do not require the token. Keep the service on a network you control.
+Every `/api/` route except health requires the admin bearer token. The inspection token is a separate credential and only posts inspections. HTTPS protects credentials in transit. The `Host` header is checked so a DNS-rebinding name cannot call the API. Keep the service on a network you control.
 
 Generated host vars contain hardware inventory. Handle that data under your organization's policy. Keep secrets in Ansible Vault. Redfish credentials are not written to disk.

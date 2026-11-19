@@ -8,6 +8,7 @@ import re
 import shutil
 import ssl
 import subprocess
+import sys
 import tempfile
 import uuid
 from binascii import hexlify, unhexlify
@@ -28,9 +29,10 @@ APP_DIR = Path(__file__).resolve().parent
 DIST_DIR = APP_DIR / "dist"
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ANSIBLE_WORKING_DIR = Path(os.environ.get("ANSIBLE_WORKING_DIR", "/ansible"))
-# The image build copies the vaulted pull secret here. Keep the default on
-# /app so a source tree that also holds the file is not read by unit tests.
-# The vault password file is mounted at run time and is not in the image.
+# The image build copies the operator-supplied vault here. The default stays
+# on /app so a checkout is not read by unit tests. pull-secret.vault is not
+# stored in git. The vault password file is mounted at run time and is not
+# in the image.
 BUNDLED_PULL_SECRET_FILE = Path(
     os.environ.get("BUNDLED_PULL_SECRET_FILE", "/app/pull-secret.vault")
 )
@@ -385,16 +387,16 @@ DEFAULT_BLUEPRINT = {
     "controlPlaneTopology": "Compact",
     "mirrorRegistries": ["registry.airgap.internal:5000"],
     "caCertBundle": "",
-    "machineNetworkCidr": "205.28.113.0/24",
-    "dnsServers": ["205.28.113.35"],
+    "machineNetworkCidr": "192.0.2.0/24",
+    "dnsServers": ["192.0.2.35"],
     "ntpServers": [],
     "genesisHostname": "edge",
-    "genesisIp": "205.28.113.35",
+    "genesisIp": "192.0.2.35",
     "genesisNic": "eno5",
     "genesisNics": ["eno5"],
     "genesisDisks": [],
-    "networkGateway": "205.28.113.1",
-    "mgmtNetworkCidr": "205.28.114.0/24",
+    "networkGateway": "192.0.2.1",
+    "mgmtNetworkCidr": "198.51.100.0/24",
     "mgmtVlan": "280",
     "mgmtDc01Octet": "6",
     "mgmtDc02Octet": "7",
@@ -1133,14 +1135,22 @@ _MAX_PRIVATE_KEY_BYTES = 65536
 _SSH_PUBLIC_KEY = re.compile(
     r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/]+={0,3}(?: .*)?$"
 )
-# sha256 of 8-character fragments that must not appear in a pull secret.
-# The fragments themselves are not stored here.
+# HMAC-SHA256 of 8-character fragments that must not appear in a pull secret.
+# The fragments and an unsalted digest are not stored here.
 _FRAGMENT_LENGTH = 8
-_REJECTED_FRAGMENT_DIGESTS = frozenset(
+_FRAGMENT_HMAC_KEY = bytes.fromhex(
+    "5c3fed91e1880ab4777cd1b840ca8f669d524143357ca4b3c4320cce68dd8f8e"
+)
+_REJECTED_FRAGMENT_MACS = frozenset(
     {
-        "43c90a8e5f2a970183b1c98416ee17bdb0eecf92b7604a6e63285975fab72b12",
-        "eb73ea1898542f23b4a6b72591ca5c66c8d90bc459f06fdd3a007aa74ecaec24",
+        "1032ed170987a98fb2de470a51fb2d2e2a26ec5ecab07c61932d6af287d9f4fb",
+        "c71e53c181317105baa6a9751d370884fa55d86dd4922196175599a8c31a9e70",
     }
+)
+_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 )
 _INSTALL_SECRET_POSTS = {
     "/api/v1/install-secrets/pull-secret",
@@ -1187,40 +1197,126 @@ def normalize_pull_secret(text):
 def pull_secret_contains_rejected_fragment(text):
     if not isinstance(text, str) or len(text) < _FRAGMENT_LENGTH:
         return False
-    rejected = _REJECTED_FRAGMENT_DIGESTS
     for index in range(len(text) - _FRAGMENT_LENGTH + 1):
         window = text[index:index + _FRAGMENT_LENGTH]
-        if len(window.encode("utf-8")) != _FRAGMENT_LENGTH:
+        encoded = window.encode("utf-8")
+        if len(encoded) != _FRAGMENT_LENGTH:
             continue
-        if hashlib.sha256(window.encode("utf-8")).hexdigest() in rejected:
+        digest = hmac.new(_FRAGMENT_HMAC_KEY, encoded, hashlib.sha256).hexdigest()
+        if digest in _REJECTED_FRAGMENT_MACS:
             return True
     return False
 
 
-def configured_api_token():
+def _token_from_file(file_name):
+    try:
+        return Path(file_name).read_bytes().strip()
+    except OSError:
+        return None
+
+
+def configured_admin_token():
+    """Return the admin token, or None when it is missing.
+
+    A configured token file that cannot be read fails closed. An empty
+    result means protected routes must not run.
+    """
     file_name = os.environ.get("API_TOKEN_FILE", "").strip()
     if file_name:
-        try:
-            return Path(file_name).read_bytes().strip()
-        except OSError:
-            return b""
-    return os.environ.get("API_TOKEN", "").encode("utf-8").strip()
+        token = _token_from_file(file_name)
+        if not token:
+            return None
+        return token
+    token = os.environ.get("API_TOKEN", "").encode("utf-8").strip()
+    return token or None
+
+
+def configured_inspection_token():
+    file_name = os.environ.get("INSPECTION_TOKEN_FILE", "").strip()
+    if file_name:
+        token = _token_from_file(file_name)
+        return token or None
+    token = os.environ.get("INSPECTION_TOKEN", "").encode("utf-8").strip()
+    return token or None
 
 
 def bearer_matches(header_value, expected):
     presented = b""
-    if isinstance(header_value, str) and header_value.startswith("Bearer "):
-        presented = header_value[len("Bearer "):].encode("utf-8")
+    if isinstance(header_value, str):
+        scheme, separator, rest = header_value.partition(" ")
+        if separator and scheme.lower() == "bearer":
+            presented = rest.encode("utf-8")
+    if not expected:
+        return False
     return hmac.compare_digest(
         hashlib.sha256(presented).digest(),
         hashlib.sha256(expected).digest(),
     )
 
 
-def endpoint_requires_token(method, path):
-    if path == "/api/v1/install-secrets" or path.startswith("/api/v1/install-secrets/"):
+def is_inspection_post(method, path):
+    if method != "POST":
+        return False
+    if path == "/api/v1/inspections":
         return True
-    return method in {"POST", "PUT", "DELETE", "PATCH"}
+    return re.fullmatch(r"/api/v1/inspections/[^/]+", path) is not None
+
+
+def request_hostname(host_header):
+    if not isinstance(host_header, str):
+        return ""
+    host = host_header.strip().lower()
+    if not host:
+        return ""
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end > 1 else ""
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host.rstrip(".")
+
+
+def allowed_api_hosts():
+    names = {"localhost", "127.0.0.1", "::1"}
+    bind = os.environ.get("HOST", "127.0.0.1").strip().lower()
+    if bind and bind not in {"0.0.0.0", "::"}:
+        names.add(bind)
+    for source in (
+        os.environ.get("TLS_HOSTNAME", ""),
+        os.environ.get("API_ALLOWED_HOSTS", ""),
+    ):
+        for item in source.split(","):
+            name = item.strip().lower().rstrip(".")
+            if name:
+                names.add(name)
+    return names
+
+
+def host_is_allowed(host_header):
+    return request_hostname(host_header) in allowed_api_hosts()
+
+
+def authorize_api(method, path, authorization):
+    """Return None when the request may proceed, or (status, error).
+
+    Every /api/ path except health requires the admin token. An inspection
+    token is accepted only for inspection posts.
+    """
+    if not path.startswith("/api/") or path == "/api/v1/health":
+        return None
+    admin = configured_admin_token()
+    if admin is None:
+        return 503, "The API token is not configured."
+    if bearer_matches(authorization, admin):
+        return None
+    inspection = configured_inspection_token()
+    if (
+        inspection
+        and is_inspection_post(method, path)
+        and bearer_matches(authorization, inspection)
+    ):
+        return None
+    return 401, "Authentication is required."
 
 
 def normalize_ssh_public_key(text):
@@ -1471,6 +1567,7 @@ def write_secret_file(path, data, mode):
         raise InstallSecretError("Refusing to write through a symbolic link.")
     temporary = parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     fd = None
+    previous_umask = os.umask(0o077)
     try:
         parent.mkdir(parents=True, exist_ok=True)
         os.chmod(parent, 0o700)
@@ -1494,6 +1591,7 @@ def write_secret_file(path, data, mode):
     except OSError as error:
         raise InstallSecretError("Could not store the install secret.") from error
     finally:
+        os.umask(previous_umask)
         if fd is not None:
             os.close(fd)
         temporary.unlink(missing_ok=True)
@@ -1837,12 +1935,18 @@ class ApiHandler(BaseHTTPRequestHandler):
     def log_message(self, format_string, *args):
         print(f"{self.address_string()} - {format_string % args}")
 
+    def add_security_headers(self):
+        self.send_header("Content-Security-Policy", _CONTENT_SECURITY_POLICY)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+
     def send_json(self, status, value):
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.add_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -1852,6 +1956,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Cache-Control", "no-store")
+        self.add_security_headers()
         self.end_headers()
         self.wfile.write(data)
 
@@ -1863,22 +1968,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         if 0 < length <= MAX_REQUEST_BYTES:
             self.rfile.read(length)
 
-    def enforce_token(self, method, path):
-        if not endpoint_requires_token(method, path):
+    def guard_request(self, method):
+        path = urlparse(self.path).path
+        if not host_is_allowed(self.headers.get("Host", "")):
+            if method in {"POST", "PUT", "PATCH"}:
+                self.discard_body()
+            self.send_json(421, {"error": "Host is not allowed."})
+            return False
+        decision = authorize_api(method, path, self.headers.get("Authorization", ""))
+        if decision is None:
             return True
-        expected = configured_api_token()
-        authorized = bool(expected) and bearer_matches(
-            self.headers.get("Authorization", ""), expected
-        )
-        if not authorized and method in {"POST", "PUT", "PATCH"}:
+        status, error = decision
+        if method in {"POST", "PUT", "PATCH"}:
             self.discard_body()
-        if not expected:
-            self.send_json(503, {"error": "The API token is not configured."})
-            return False
-        if not authorized:
-            self.send_json(401, {"error": "Authentication is required."})
-            return False
-        return True
+        self.send_json(status, {"error": error})
+        return False
 
     def query_value(self, name):
         values = parse_qs(urlparse(self.path).query).get(name) or []
@@ -1899,6 +2003,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ValueError("Request body must be valid JSON.") from None
 
     def do_GET(self):
+        if not self.guard_request("GET"):
+            return
         path = urlparse(self.path).path
         if path == "/api/v1/health":
             self.send_json(200, {"status": "ok"})
@@ -1933,9 +2039,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                 },
             )
             return
-        if path == "/api/v1/install-secrets" or path.startswith("/api/v1/install-secrets/"):
-            if not self.enforce_token("GET", path):
-                return
         if path == "/api/v1/install-secrets":
             try:
                 self.send_json(200, install_secret_status(self.query_value("outputDirectory")))
@@ -1984,9 +2087,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.serve_static(path)
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        if not self.enforce_token("POST", path):
+        if not self.guard_request("POST"):
             return
+        path = urlparse(self.path).path
         if path == "/api/v1/redfish/retrieve" and not isinstance(
             self.connection, ssl.SSLSocket
         ):
@@ -2054,9 +2157,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": f"Unable to commit Ansible files: {error}"})
 
     def do_PUT(self):
-        path = urlparse(self.path).path
-        if not self.enforce_token("PUT", path):
+        if not self.guard_request("PUT"):
             return
+        path = urlparse(self.path).path
         if path == "/api/v1/configuration":
             try:
                 self.save_configuration(self.read_json())
@@ -2127,9 +2230,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": "Database operation failed."})
 
     def do_DELETE(self):
-        path = urlparse(self.path).path
-        if not self.enforce_token("DELETE", path):
+        if not self.guard_request("DELETE"):
             return
+        path = urlparse(self.path).path
         match = re.fullmatch(r"/api/v1/nodes/([^/]+)", path)
         if not match:
             self.send_json(404, {"error": "Not found."})
@@ -3009,17 +3112,27 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.add_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
 
+def _loopback_bind(host):
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
 if __name__ == "__main__":
-    os.umask(0o002)
     initialize_database()
     port = int(os.environ.get("PORT", "3003"))
     host = os.environ.get("HOST", "127.0.0.1")
     if bool(TLS_CERT_FILE) != bool(TLS_KEY_FILE):
         raise RuntimeError("TLS_CERT_FILE and TLS_KEY_FILE must be configured together.")
+    if not _loopback_bind(host) and not (TLS_CERT_FILE and TLS_KEY_FILE):
+        print(
+            f"Warning: listening on {host} without TLS. "
+            "Set TLS_CERT_FILE and TLS_KEY_FILE, or bind 127.0.0.1.",
+            file=sys.stderr,
+        )
     httpd = ThreadingHTTPServer((host, port), ApiHandler)
     protocol = "HTTP"
     if TLS_CERT_FILE and TLS_KEY_FILE:
