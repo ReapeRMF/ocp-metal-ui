@@ -178,7 +178,9 @@ BMC certificates are verified by default. For an untrusted BMC certificate, the 
 
 Build on a connected machine with Node.js 22, npm, and Podman or Docker. The image contains the built UI and the Python runtime. It does not need network access after it is built.
 
-Place the cluster pull secret at `pull-secret.json` in this directory. Set `VAULT_PASSWORD_FILE` to the Ansible vault password file. The build writes `pull-secret.vault` and the image copies that file to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image. Neither file is committed.
+`pull-secret.vault` in this directory is the committed cluster pull secret. It is an Ansible vault variable, `ocp_pre_install_pull_secret_contents`. The vault password is not in this repository. Mount that password at `/vault/password` when the container starts.
+
+To replace the secret, place the new plaintext at `pull-secret.json` and set `VAULT_PASSWORD_FILE` to the vault password file. The build writes `pull-secret.vault` again, and the image copies that file to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image. `pull-secret.json` is not committed.
 
 ```sh
 npm ci

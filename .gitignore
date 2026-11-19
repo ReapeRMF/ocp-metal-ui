@@ -23,10 +23,9 @@ data/
 *.tar
 *.tar.gz
 
-# Cluster pull secret supplied at image build, and the vault file the build
-# writes from it. Neither is committed. The image contains only the vault file.
+# Plaintext cluster pull secret. The build vaults it into pull-secret.vault,
+# which is committed. The vault password is not in this repository.
 pull-secret.json
-pull-secret.vault
 
 # Ignore local editor swap notes and compiler footprints
 *~
