@@ -2,14 +2,20 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   ci:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # postgres:16 manifest list, 2026-11-19
+        image: postgres@sha256:3950ad7c3148ca2175ef1b6c36c9efbf78957ae8fbe8b3a5d7c35af50500382f
         env:
           POSTGRES_USER: ocp_metal_ui
           POSTGRES_PASSWORD: ci-password
@@ -22,14 +28,25 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - name: gitleaks
+        # Scan the tree that will be merged, before npm ci creates node_modules.
+        # A full-history scan stays red until pull-secret.vault is removed from
+        # older commits.
+        run: |
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.24.2/gitleaks_8.24.2_linux_x64.tar.gz
+          echo "fa0500f6b7e41d28791ebc680f5dd9899cd42b58629218a5f041efa899151a8e  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks detect --source . --no-git --redact --verbose
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
 
@@ -65,14 +82,6 @@ jobs:
         run: |
           curl -fsSL -o /tmp/hadolint \
             https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          echo "56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010  /tmp/hadolint" | sha256sum -c -
           chmod +x /tmp/hadolint
           /tmp/hadolint Containerfile.airgap
-
-      - name: gitleaks
-        # Scan the tree that will be merged. A full-history scan stays red
-        # until pull-secret.vault is removed from older commits.
-        run: |
-          curl -fsSL -o /tmp/gitleaks.tar.gz \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.24.2/gitleaks_8.24.2_linux_x64.tar.gz
-          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
-          /tmp/gitleaks detect --source . --no-git --redact --verbose

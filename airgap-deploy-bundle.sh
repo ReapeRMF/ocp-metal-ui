@@ -305,12 +305,43 @@ fi
 
 VAULT_PASSWORD_HOST_FILE="${VAULT_PASSWORD_FILE:-/root/.vault_pass}"
 VAULT_ARGS=()
+VAULT_STAGE=""
+remove_secret_file() {
+  local target="$1"
+  if [ ! -e "$target" ]; then
+    return 0
+  fi
+  if command -v shred >/dev/null 2>&1; then
+    shred -u -- "$target" 2>/dev/null || rm -f -- "$target"
+  else
+    rm -f -- "$target"
+  fi
+}
+cleanup_vault_material() {
+  if [ -n "${VAULT_STAGE:-}" ]; then
+    remove_secret_file "$VAULT_STAGE"
+    VAULT_STAGE=""
+  fi
+  # Older versions of this script left a copy in the checkout.
+  if [ -n "${SCRIPT_DIR:-}" ]; then
+    remove_secret_file "$SCRIPT_DIR/vault.password"
+  fi
+}
+trap cleanup_vault_material EXIT
 if [ -f "$VAULT_PASSWORD_HOST_FILE" ]; then
   VAULT_PASSWORD_HOST_FILE="$(cd "$(dirname "$VAULT_PASSWORD_HOST_FILE")" && pwd -P)/$(basename "$VAULT_PASSWORD_HOST_FILE")"
   vault_mount_opts=ro
   if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -eq 0 ]; then
-    install -o 10001 -g 10001 -m 0400 "$VAULT_PASSWORD_HOST_FILE" "$SCRIPT_DIR/vault.password"
-    VAULT_PASSWORD_HOST_FILE="$SCRIPT_DIR/vault.password"
+    # The running container bind-mounts this file, so it stays under
+    # /var/lib and is not removed when the script exits.
+    install -d -o root -g root -m 755 /var/lib/ocp-metal-ui
+    VAULT_STAGE="$(mktemp /var/lib/ocp-metal-ui/vault.password.XXXXXX)"
+    install -o 10001 -g 10001 -m 0400 "$VAULT_PASSWORD_HOST_FILE" "$VAULT_STAGE"
+    mv -f -- "$VAULT_STAGE" /var/lib/ocp-metal-ui/vault.password
+    VAULT_STAGE=""
+    chown 10001:10001 /var/lib/ocp-metal-ui/vault.password
+    chmod 0400 /var/lib/ocp-metal-ui/vault.password
+    VAULT_PASSWORD_HOST_FILE="/var/lib/ocp-metal-ui/vault.password"
     vault_mount_opts=ro,Z
   fi
   VAULT_ARGS=(

@@ -180,7 +180,7 @@ Build on a connected machine with Node.js 22, npm, and Podman or Docker. The ima
 
 The cluster pull secret is not in this repository. On the build machine, place the plaintext pull secret at `pull-secret.json` in this directory and set `VAULT_PASSWORD_FILE` to the Ansible vault password file. Neither file is committed. `airgap-build-bundle.sh` writes `pull-secret.vault` beside them, mode 0600, as the Ansible vault variable `ocp_pre_install_pull_secret_contents`. That vault file is gitignored. The image copies it to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image.
 
-Mount the same password file at `/vault/password` when the container starts. To use a different secret later, paste it on the Blueprint page or replace `pull-secret.json` and build again. A secret saved from the UI is `cluster-install/pull-secret.vault` in the Ansible workspace, and it overrides the copy in the image for that workspace.
+Mount the same password file at `/vault/password` when the container starts. `VAULT_PASSWORD_FILE` defaults to `/root/.vault_pass`. When the deploy runs as root under Podman, it copies that file to `/var/lib/ocp-metal-ui/vault.password`, mode 0400, owned by uid 10001, and mounts that copy. The copy is outside the git checkout. A failed deploy shreds a partial copy, and a leftover `vault.password` in the checkout is removed. To use a different secret later, paste it on the Blueprint page or replace `pull-secret.json` and build again. A secret saved from the UI is `cluster-install/pull-secret.vault` in the Ansible workspace, and it overrides the copy in the image for that workspace.
 
 ```sh
 npm ci

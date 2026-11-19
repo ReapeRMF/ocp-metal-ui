@@ -1,6 +1,6 @@
 """Build agent-config and install-config facts from the UI inventory.
 
-The UI keeps SQLite. The publish step writes the same facts into
+The UI keeps PostgreSQL. The publish step writes the same facts into
 group_vars/ocp.yml and host_vars. This filter reads those published
 facts and returns the host records the install templates print.
 """

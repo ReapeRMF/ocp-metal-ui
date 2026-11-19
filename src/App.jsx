@@ -282,7 +282,7 @@ export default function App() {
 
   const commitConfiguration = async () => {
     setInventoryError('');
-    setInventoryStatus('Saving configuration to SQLite...');
+    setInventoryStatus('Saving configuration to PostgreSQL...');
     setIsSavingConfiguration(true);
     try {
       const response = await fetch('/api/v1/configuration', {
@@ -292,7 +292,7 @@ export default function App() {
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || `Configuration could not be saved (HTTP ${response.status}).`);
-      setInventoryStatus(`Configuration saved to SQLite for ${result.savedNodes} node${result.savedNodes === 1 ? '' : 's'}.`);
+      setInventoryStatus(`Configuration saved to PostgreSQL for ${result.savedNodes} node${result.savedNodes === 1 ? '' : 's'}.`);
     } catch (error) {
       setInventoryError(error.message);
       setInventoryStatus('Configuration save failed');
@@ -338,7 +338,7 @@ export default function App() {
   const refreshInventory = async () => {
     setIsRefreshingInventory(true);
     setInventoryError('');
-    setInventoryStatus('Refreshing inventory from SQLite...');
+    setInventoryStatus('Refreshing inventory from PostgreSQL...');
     try {
       const loadedNodes = await loadInventory();
       const discoveredCount = loadedNodes.filter((node) => !node.is_placeholder).length;
@@ -375,7 +375,7 @@ export default function App() {
           setInventoryError('');
           setInventoryStatus(
             loadedNodes.length
-              ? `${loadedNodes.length} node${loadedNodes.length === 1 ? '' : 's'} loaded from SQLite`
+              ? `${loadedNodes.length} node${loadedNodes.length === 1 ? '' : 's'} loaded from PostgreSQL`
               : 'Inventory is empty; add named nodes or wait for IPA reports'
           );
         }
@@ -393,7 +393,7 @@ export default function App() {
           setInventoryError('');
           setInventoryStatus(
             loadedNodes.length
-              ? `${loadedNodes.length} node${loadedNodes.length === 1 ? '' : 's'} loaded from SQLite`
+              ? `${loadedNodes.length} node${loadedNodes.length === 1 ? '' : 's'} loaded from PostgreSQL`
               : 'Inventory is empty; add named nodes or wait for IPA reports'
           );
         }
@@ -1344,7 +1344,7 @@ function RedfishManagementStep({
     setStatus('');
     try {
       await onSaveEndpoints();
-      setStatus('Redfish BMC profiles saved in SQLite.');
+      setStatus('Redfish BMC profiles saved in PostgreSQL.');
     } catch (saveError) {
       setError(saveError.message);
     }

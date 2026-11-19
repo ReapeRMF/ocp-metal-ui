@@ -1,4 +1,5 @@
-FROM docker.io/library/python:3.13-alpine
+# python:3.13-alpine manifest list, 2026-11-19
+FROM docker.io/library/python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -29,7 +30,7 @@ RUN chmod 600 /app/pull-secret.vault \
     && chown 10001:10001 /vault /app/pull-secret.vault
 
 VOLUME ["/data", "/ansible"]
-EXPOSE 8080
+EXPOSE 3003
 USER 10001:10001
 
 CMD ["python3", "/app/server.py"]
