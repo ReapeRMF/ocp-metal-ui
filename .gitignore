@@ -23,6 +23,11 @@ data/
 *.tar
 *.tar.gz
 
+# Cluster pull secret supplied at image build, and the vault file the build
+# writes from it. Neither is committed. The image contains only the vault file.
+pull-secret.json
+pull-secret.vault
+
 # Ignore local editor swap notes and compiler footprints
 *~
 .*~

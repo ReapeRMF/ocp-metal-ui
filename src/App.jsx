@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
 // 1. Red Hat PatternFly Enterprise Scaffolding components
 import { 
@@ -27,6 +27,7 @@ import {
 
 // 2. Structural design system icons
 import { CheckCircleIcon, InfrastructureIcon, NetworkIcon, ClusterIcon, AddCircleOIcon, TrashIcon, AutomationIcon, KeyIcon, RedhatIcon } from '@patternfly/react-icons';
+import { highlightYamlTokens } from './highlightYaml.js';
 
 // Core stylesheets required for official compilation layout rules
 import '@patternfly/react-core/dist/styles/base.css';
@@ -34,6 +35,43 @@ import '@patternfly/react-styles/css/components/Wizard/wizard.css';
 import '@patternfly/react-styles/css/components/Card/card.css';
 import '@patternfly/react-styles/css/components/Page/page.css';
 import '@patternfly/react-styles/css/components/Masthead/masthead.css';
+
+const NODE_ROLES = ['master', 'worker', 'storage'];
+const ROLE_LABELS = { master: 'Master', worker: 'Worker', storage: 'Storage' };
+
+function selectedRoles(config = {}) {
+  if (Array.isArray(config.roles)) return config.roles;
+  if (config.role === 'master' || config.role === 'worker') return [config.role];
+  return [];
+}
+
+function roleLabel(config) {
+  const roles = selectedRoles(config);
+  if (!roles.length) return 'Not chosen';
+  return roles.map((role) => ROLE_LABELS[role] || role).join(', ');
+}
+
+function assignedVlan(config) {
+  const enabled = config.netType === 'bond' ? config.bondVlanEnabled : config.singleVlanEnabled;
+  const vlanId = config.netType === 'bond' ? config.bondVlanId : config.singleVlanId;
+  const text = String(vlanId ?? '').trim();
+  return enabled && text ? text : '';
+}
+
+function hostAddress(octet, machineNetworkCidr, currentIp) {
+  const text = String(octet ?? '').trim();
+  const network = String(machineNetworkCidr || '').split('/')[0];
+  const parts = network.split('.');
+  if (
+    /^\d{1,3}$/.test(text)
+    && Number(text) <= 255
+    && parts.length === 4
+    && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+  ) {
+    return [...parts.slice(0, -1), String(Number(text))].join('.');
+  }
+  return currentIp || 'From IPA';
+}
 
 function findFastestDrive(disks) {
   if (!disks || disks.length === 0) return '';
@@ -158,13 +196,25 @@ function routeHash(route) {
 
 const DEFAULT_BLUEPRINT = {
   clusterName: 'ocp-baremetal',
-  baseDomain: 'example.com',
-  controlPlaneTopology: 'HighlyAvailable',
+  baseDomain: 'ocp.internal',
+  controlPlaneTopology: 'Compact',
   mirrorRegistries: ['registry.airgap.internal:5000'],
   caCertBundle: '',
-  machineNetworkCidr: '',
-  dnsServers: [],
-  ntpServers: []
+  machineNetworkCidr: '205.28.113.0/24',
+  dnsServers: ['205.28.113.35'],
+  ntpServers: [],
+  genesisHostname: 'edge',
+  genesisIp: '205.28.113.35',
+  genesisNic: 'eno5',
+  genesisNics: ['eno5'],
+  genesisDisks: [],
+  networkGateway: '205.28.113.1',
+  mgmtNetworkCidr: '205.28.114.0/24',
+  mgmtVlan: '280',
+  mgmtDc01Octet: '6',
+  mgmtDc02Octet: '7',
+  apiVip: '',
+  ingressVip: ''
 };
 
 export default function App() {
@@ -180,9 +230,13 @@ export default function App() {
   const [discoveryAssignments, setDiscoveryAssignments] = useState({});
 
   const [blueprint, setBlueprint] = useState(DEFAULT_BLUEPRINT);
+  const blueprintRef = useRef(blueprint);
+  blueprintRef.current = blueprint;
   const [redfishEndpoints, setRedfishEndpoints] = useState([]);
   const [httpsEnabled, setHttpsEnabled] = useState(false);
   const [isSavingConfiguration, setIsSavingConfiguration] = useState(false);
+  const [configPreview, setConfigPreview] = useState(null);
+  const [yamlView, setYamlView] = useState('');
 
   const navigateToPage = (nextPage, replace = false) => {
     const previousRoute = routeKey(page);
@@ -254,18 +308,21 @@ export default function App() {
       const savedPreferences = Object.fromEntries(
         Object.entries(node.preferences || {}).filter(([key]) => key !== 'ansibleGroup')
       );
+      if (!Array.isArray(savedPreferences.roles) && (savedPreferences.role === 'master' || savedPreferences.role === 'worker')) {
+        savedPreferences.roles = [savedPreferences.role];
+      }
       const currentPreferences = Object.fromEntries(
         Object.entries(current[node.uuid] || {}).filter(([key]) => key !== 'ansibleGroup')
       );
       return [node.uuid, {
         rootDisk: findFastestDrive(node.inventory.disks),
         netType: 'single',
-        singleNic: node.inventory.interfaces[0]?.name || '',
-        singleVlanEnabled: false,
-        singleVlanId: '',
+        singleNic: blueprintRef.current.genesisNic || 'eno5',
+        singleVlanEnabled: true,
+        singleVlanId: '281',
         bondNics: [],
-        bondVlanEnabled: false,
-        bondVlanId: '',
+        bondVlanEnabled: true,
+        bondVlanId: '281',
         ...savedPreferences,
         ...currentPreferences,
         ansibleHost: currentPreferences.ansibleHost
@@ -422,7 +479,18 @@ export default function App() {
   };
 
   const updateConfigField = (uuid, field, value) => {
-    setNodeConfigs(prev => ({ ...prev, [uuid]: { ...prev[uuid], [field]: value } }));
+    setNodeConfigs((prev) => {
+      const next = { ...prev, [uuid]: { ...prev[uuid], [field]: value } };
+      if (field === 'roles' && !(value || []).includes('master')) {
+        next[uuid] = { ...next[uuid], rendezvous: false };
+      }
+      if (field === 'rendezvous' && value === true) {
+        for (const [otherId, config] of Object.entries(next)) {
+          if (otherId !== uuid) next[otherId] = { ...config, rendezvous: false };
+        }
+      }
+      return next;
+    });
   };
 
   const updateDiscoveryAssignment = (nodeUuid, field, value) => {
@@ -502,6 +570,8 @@ export default function App() {
 
   const commitReviewedConfiguration = async () => {
     setInventoryError('');
+    setConfigPreview(null);
+    setYamlView('');
     setInventoryStatus('Committing reviewed inventory and preferences...');
     try {
       const saveResponse = await fetch('/api/v1/ansible-files', {
@@ -514,7 +584,23 @@ export default function App() {
         throw new Error(error.error || `Ansible files could not be committed (HTTP ${saveResponse.status}).`);
       }
       const result = await saveResponse.json();
-      setInventoryStatus(`Reviewed files committed. Inventory: ${result.inventoryFile}`);
+      const installConfigFile = result.installConfigFile || '';
+      const agentConfigFile = result.agentConfigFile || '';
+      let statusText = `Reviewed files committed. Inventory: ${result.inventoryFile}`;
+      if (installConfigFile && agentConfigFile) {
+        statusText = `Reviewed files committed. Wrote ${installConfigFile} and ${agentConfigFile}.`;
+      } else if (result.installFilesMessage) {
+        statusText = `Reviewed files committed. Inventory: ${result.inventoryFile}. ${result.installFilesMessage}`;
+      }
+      setInventoryStatus(statusText);
+      setConfigPreview({
+        installConfig: result.installConfig || '',
+        agentConfig: result.agentConfig || '',
+        error: result.configPreviewError || '',
+        installConfigFile,
+        agentConfigFile,
+        installFilesMessage: result.installFilesMessage || ''
+      });
     } catch (error) {
       setInventoryError(error.message);
       setInventoryStatus('Save or export failed');
@@ -532,6 +618,7 @@ export default function App() {
   );
 
   return (
+    <>
     <Page header={header} sidebar={null} className="openshift-builder-wizard" style={{ height: '100vh' }}>
       <div style={{ height: 'calc(100vh - 70px)', display: 'flex', flexDirection: 'column' }}>
         {page.type === 'landing' && (
@@ -564,6 +651,7 @@ export default function App() {
                     outputDirectory={outputDirectory}
                     onOutputDirectoryChange={setOutputDirectory}
                     ansibleWorkingDir={ansibleWorkingDir}
+                    httpsEnabled={httpsEnabled}
                     onAddRegistry={() => setBlueprint((current) => ({ ...current, mirrorRegistries: [...current.mirrorRegistries, ''] }))}
                     onRegistryChange={(index, value) => setBlueprint((current) => {
                       const registries = [...current.mirrorRegistries];
@@ -606,6 +694,7 @@ export default function App() {
                 <InventoryReviewPage
                   nodes={nodes}
                   configs={nodeConfigs}
+                  machineNetworkCidr={blueprint.machineNetworkCidr}
                   outputDirectory={outputDirectory}
                   status={inventoryStatus}
                   error={inventoryError}
@@ -613,6 +702,8 @@ export default function App() {
                   onRefresh={refreshInventory}
                   onBack={returnToInventory}
                   onConfirm={commitReviewedConfiguration}
+                  configPreview={configPreview}
+                  onViewYaml={setYamlView}
                 />
               )}
               {page.stage === 'discovered' && (
@@ -652,6 +743,17 @@ export default function App() {
 
       </div>
     </Page>
+    {yamlView && (
+      <YamlPopout
+        which={yamlView}
+        installConfig={configPreview?.installConfig || ''}
+        agentConfig={configPreview?.agentConfig || ''}
+        written={Boolean(configPreview?.installConfigFile)}
+        onChoose={setYamlView}
+        onClose={() => setYamlView('')}
+      />
+    )}
+    </>
   );
 }
 
@@ -720,8 +822,7 @@ function StrategyLandingScreen({ onStart, onOpenBmc }) {
               </Button>
             </div>
             <p className="splash-note">
-              Built for disconnected environments. Your hardware data stays in your
-              local SQLite-backed workspace.
+              Built for disconnected environments. Your hardware data aligned with automation.
             </p>
           </div>
           <div className="splash-workflow" aria-label="Workflow overview">
@@ -729,7 +830,7 @@ function StrategyLandingScreen({ onStart, onOpenBmc }) {
             <div className="splash-flow-step">
               <span className="splash-step-number">01</span>
               <span className="splash-step-icon"><AutomationIcon /></span>
-              <span><strong>Discover hardware</strong><small>IPA or secure Redfish</small></span>
+              <span><strong>Discover hardware</strong><small>PXE or iLO</small></span>
             </div>
             <div className="splash-flow-connector" />
             <div className="splash-flow-step">
@@ -760,14 +861,322 @@ function StrategyLandingScreen({ onStart, onOpenBmc }) {
           </article>
         </div>
         <footer className="splash-footer">
-          <span>Designed for OpenShift bare-metal installation planning</span>
-          <span>Secrets stay in Ansible Vault — never in generated inventory</span>
+          <span>Designed for OpenShift bare-metal installation automation</span>
         </footer>
       </div>
     </PageSection>
   );
 }
-function BlueprintStep({ blueprint, onChangeField, onChangeListField, onAddRegistry, onRegistryChange, onRemoveRegistry, outputDirectory, onOutputDirectoryChange, ansibleWorkingDir }) {
+function InstallSecrets({ outputDirectory, httpsEnabled }) {
+  const fileInputRef = useRef(null);
+  const emptySecretStatus = {
+    pullSecretStored: false,
+    pullSecretBuiltIn: false,
+    pullSecretReady: false,
+    vaultPasswordAvailable: false,
+    privateKeyStored: false,
+    sshPublicKey: ''
+  };
+  const [status, setStatus] = useState(emptySecretStatus);
+  const [pullSecretText, setPullSecretText] = useState('');
+  const [publicKeyText, setPublicKeyText] = useState('');
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const canSave = Boolean(outputDirectory) && httpsEnabled && !busy;
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      if (!outputDirectory) {
+        setStatus(emptySecretStatus);
+        return;
+      }
+      try {
+        const response = await fetch(
+          `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
+        );
+        const result = await response.json();
+        if (!response.ok) {
+          throw new Error(result.error || `Could not read install secret status (HTTP ${response.status}).`);
+        }
+        if (!cancelled) {
+          setStatus({
+            pullSecretStored: Boolean(result.pullSecretStored),
+            pullSecretBuiltIn: Boolean(result.pullSecretBuiltIn),
+            pullSecretReady: Boolean(result.pullSecretReady),
+            vaultPasswordAvailable: Boolean(result.vaultPasswordAvailable),
+            privateKeyStored: Boolean(result.privateKeyStored),
+            sshPublicKey: typeof result.sshPublicKey === 'string' ? result.sshPublicKey : ''
+          });
+        }
+      } catch (loadError) {
+        if (!cancelled) setError(loadError.message);
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [outputDirectory]);
+
+  const applyStatus = (result) => {
+    setStatus({
+      pullSecretStored: Boolean(result.pullSecretStored),
+      pullSecretBuiltIn: Boolean(result.pullSecretBuiltIn),
+      pullSecretReady: Boolean(result.pullSecretReady),
+      vaultPasswordAvailable: Boolean(result.vaultPasswordAvailable),
+      privateKeyStored: Boolean(result.privateKeyStored),
+      sshPublicKey: typeof result.sshPublicKey === 'string' ? result.sshPublicKey : ''
+    });
+  };
+
+  const postSecret = async (path, body) => {
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Request failed (HTTP ${response.status}).`);
+      applyStatus(result);
+      return result;
+    } catch (postError) {
+      setError(postError.message);
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onPullSecretFile = (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setPullSecretText(typeof reader.result === 'string' ? reader.result : '');
+      setError('');
+      setMessage('Pull secret file loaded. Save it to keep it for this workspace.');
+    };
+    reader.onerror = () => setError('Could not read that file.');
+    reader.readAsText(file);
+  };
+
+  const savePullSecret = async () => {
+    const text = pullSecretText.trim();
+    if (!text) {
+      setError(status.pullSecretBuiltIn
+        ? 'Paste a pull secret to replace the one in the vault. Leave it blank and skip Save to keep that one.'
+        : 'Paste the cluster pull secret, or choose the pull-secret.json file you downloaded.');
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      setError('The pull secret must be the JSON you downloaded, with an auths object.');
+      return;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !parsed.auths || typeof parsed.auths !== 'object' || Array.isArray(parsed.auths)) {
+      setError('The pull secret must be JSON with an auths object.');
+      return;
+    }
+    if (!Object.keys(parsed.auths).length) {
+      setError('The pull secret needs at least one registry under auths.');
+      return;
+    }
+    const saved = await postSecret('/api/v1/install-secrets/pull-secret', {
+      outputDirectory,
+      pullSecret: text
+    });
+    if (!saved) return;
+    setPullSecretText('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    setMessage('Pull secret saved in the Ansible vault for this workspace. It is not in the inventory or the database.');
+  };
+
+  const createSshKey = async () => {
+    if (status.privateKeyStored && !window.confirm('Create a new SSH key? The previous private key will no longer be offered for download.')) {
+      return;
+    }
+    const saved = await postSecret('/api/v1/install-secrets/ssh-key', {
+      outputDirectory,
+      replace: Boolean(status.privateKeyStored)
+    });
+    if (!saved) return;
+    setMessage('SSH key created. Download the private key and keep it. The public key is shown here.');
+  };
+
+  const usePublicKey = async () => {
+    const text = publicKeyText.trim();
+    if (!text) {
+      setError('Paste one public key line.');
+      return;
+    }
+    if (text.includes('PRIVATE KEY') || text.includes('-----BEGIN')) {
+      setError('That looks like a private key. Paste the public key, one line that starts with ssh-ed25519, ssh-rsa, or ecdsa-sha2-nistp256.');
+      return;
+    }
+    const lines = text.split(/\r?\n/).filter(Boolean);
+    if (lines.length !== 1) {
+      setError('Paste one public key line that starts with ssh-ed25519, ssh-rsa, or ecdsa-sha2-nistp256.');
+      return;
+    }
+    let replace = false;
+    if (status.privateKeyStored && status.sshPublicKey !== text) {
+      if (!window.confirm('Use this public key instead? The stored private key will be removed because it will no longer match.')) return;
+      replace = true;
+    }
+    const saved = await postSecret('/api/v1/install-secrets/ssh-public-key', {
+      outputDirectory,
+      sshPublicKey: text,
+      replace
+    });
+    if (!saved) return;
+    setPublicKeyText('');
+    setMessage(replace
+      ? 'Public key saved. The previous private key was removed.'
+      : 'Public key saved for this cluster.');
+  };
+
+  const downloadPrivateKey = async () => {
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      const response = await fetch(
+        `/api/v1/install-secrets/ssh-private-key?outputDirectory=${encodeURIComponent(outputDirectory)}`
+      );
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(result.error || `Could not download the private key (HTTP ${response.status}).`);
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'id_ed25519';
+      link.click();
+      URL.revokeObjectURL(url);
+      setMessage('Private key download started. Keep that file. This page does not show the private key.');
+    } catch (downloadError) {
+      setError(downloadError.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="install-secrets">
+      <FormGroup label="Cluster pull secret" fieldId="bp-pull-secret">
+        <TextArea
+          id="bp-pull-secret"
+          style={{ resize: 'vertical', minHeight: '80px', fontFamily: 'monospace', fontSize: '0.85rem' }}
+          value={pullSecretText}
+          onChange={(_event, value) => setPullSecretText(value)}
+          placeholder='{"auths":{"registry.example.com":{"auth":"..."}}}'
+          spellCheck={false}
+          autoComplete="off"
+        />
+        <HelperText>
+          <HelperTextItem>
+            {status.pullSecretBuiltIn
+              ? 'This container was built with a pull secret in the Ansible vault. Paste or choose a file to store a different one for this workspace. Leave the box blank to keep the one that was built in.'
+              : 'Paste the cluster pull secret, or choose the pull-secret.json file you downloaded. A saved copy is stored in the Ansible vault.'}
+          </HelperTextItem>
+        </HelperText>
+        <div className="install-secret-actions">
+          <input
+            id="bp-pull-secret-file"
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json"
+            aria-label="Choose pull-secret.json"
+            onChange={onPullSecretFile}
+          />
+          <Button id="bp-pull-secret-save" variant="secondary" onClick={savePullSecret} isDisabled={!canSave}>
+            Save pull secret
+          </Button>
+        </div>
+        <HelperText>
+          <HelperTextItem>
+            {status.pullSecretReady && status.pullSecretStored
+              ? 'A pull secret saved for this workspace replaces the one built into the container.'
+              : status.pullSecretReady
+                ? 'Using the pull secret from the Ansible vault in this container. Paste one here to replace it for this workspace.'
+                : (status.pullSecretBuiltIn || status.pullSecretStored) && !status.vaultPasswordAvailable
+                  ? 'The pull secret is in the Ansible vault. The vault password file is not available.'
+                  : (status.pullSecretBuiltIn || status.pullSecretStored)
+                    ? 'The vault password did not open the pull secret.'
+                    : 'No pull secret is available yet. Paste one to store it in the vault for this workspace.'}
+            {' '}A saved pull secret is written as cluster-install/pull-secret.vault, outside the generated inventory.
+          </HelperTextItem>
+        </HelperText>
+      </FormGroup>
+      <FormGroup label="SSH key for the cluster nodes" fieldId="bp-ssh-public-key">
+        <HelperText>
+          <HelperTextItem>
+            Create a key if you do not already have one. You can also paste a public key. The install uses the public key. Download the private key and keep it somewhere else.
+          </HelperTextItem>
+        </HelperText>
+        {status.sshPublicKey && (
+          <TextArea
+            id="bp-ssh-public-key-stored"
+            className="install-secret-key"
+            value={status.sshPublicKey}
+            readOnly
+            aria-label="Public key for this cluster"
+            rows={3}
+            spellCheck={false}
+          />
+        )}
+        <div className="install-secret-actions">
+          <Button id="bp-ssh-create" variant="secondary" onClick={createSshKey} isDisabled={!canSave}>
+            Create an SSH key
+          </Button>
+          <Button id="bp-ssh-download" variant="secondary" onClick={downloadPrivateKey} isDisabled={!canSave || !status.privateKeyStored}>
+            Download private key
+          </Button>
+        </div>
+        {!status.privateKeyStored && status.sshPublicKey && (
+          <HelperText>
+            <HelperTextItem>No private key is stored here. Keep the private half wherever you created this public key.</HelperTextItem>
+          </HelperText>
+        )}
+        <TextArea
+          id="bp-ssh-public-key"
+          style={{ resize: 'vertical', minHeight: '60px', fontFamily: 'monospace', fontSize: '0.85rem' }}
+          value={publicKeyText}
+          onChange={(_event, value) => setPublicKeyText(value)}
+          placeholder="ssh-ed25519 AAAA... comment"
+          spellCheck={false}
+          autoComplete="off"
+          aria-label="Paste an existing public key"
+        />
+        <div className="install-secret-actions">
+          <Button id="bp-ssh-public-key-save" variant="secondary" onClick={usePublicKey} isDisabled={!canSave}>
+            Use this public key
+          </Button>
+        </div>
+      </FormGroup>
+      {!httpsEnabled && (
+        <p role="status">Open this page over HTTPS before saving a pull secret or SSH key.</p>
+      )}
+      {!outputDirectory && (
+        <p role="status">Choose the workspace directory before saving a pull secret or SSH key.</p>
+      )}
+      {(error || message) && (
+        <p id="bp-install-secret-status" role={error ? 'alert' : 'status'}>{error || message}</p>
+      )}
+    </div>
+  );
+}
+
+function BlueprintStep({ blueprint, onChangeField, onChangeListField, onAddRegistry, onRegistryChange, onRemoveRegistry, outputDirectory, onOutputDirectoryChange, ansibleWorkingDir, httpsEnabled }) {
   return (
     <PageSection variant="default" className="workflow-page">
       <div className="workflow-page-content">
@@ -780,15 +1189,22 @@ function BlueprintStep({ blueprint, onChangeField, onChangeListField, onAddRegis
           </div>
         </div>
       </div>
-      <Gallery hasGutter minWidths={{ default: '430px' }}>
+      <Gallery hasGutter minWidths={{ default: 'min(100%, 430px)' }}>
         {/* Card A: Identity Info */}
         <GalleryItem>
           <Card isPlain className="openshift-node-card" style={{ height: '100%' }}>
             <CardHeader><Title headingLevel="h2" size="lg">Identity & Topology</Title></CardHeader>
             <CardBody>
               <FormGroup label="Cluster Name" isRequired fieldId="bp-cluster-name"><TextInput id="bp-cluster-name" value={blueprint.clusterName} onChange={(_e, val) => onChangeField('clusterName', val)} /></FormGroup>
-              <FormGroup label="Base Domain" isRequired fieldId="bp-base-domain" className="pf-v6-u-mt-md"><TextInput id="bp-base-domain" value={blueprint.baseDomain} onChange={(_e, val) => onChangeField('baseDomain', val)} placeholder="example.com" /></FormGroup>
-              <FormGroup label="Topology" className="pf-v6-u-mt-md"><div style={{ display: 'flex', gap: '20px' }}><Radio id="topo-ha" name="t-g" label="Highly Available" isChecked={blueprint.controlPlaneTopology === 'HighlyAvailable'} onChange={() => onChangeField('controlPlaneTopology', 'HighlyAvailable')} /><Radio id="topo-sno" name="t-g" label="Compact SNO" isChecked={blueprint.controlPlaneTopology === 'SingleNode'} onChange={() => onChangeField('controlPlaneTopology', 'SingleNode')} /></div></FormGroup>
+              <FormGroup label="Base Domain" isRequired fieldId="bp-base-domain" className="pf-v6-u-mt-md"><TextInput id="bp-base-domain" value={blueprint.baseDomain} onChange={(_e, val) => onChangeField('baseDomain', val)} placeholder="ocp.internal" /></FormGroup>
+              <FormGroup label="Topology" className="pf-v6-u-mt-md">
+                <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap' }}>
+                  <Radio id="topo-compact" name="t-g" label="Compact" isChecked={blueprint.controlPlaneTopology === 'Compact'} onChange={() => onChangeField('controlPlaneTopology', 'Compact')} />
+                  <Radio id="topo-ha" name="t-g" label="Highly Available" isChecked={blueprint.controlPlaneTopology === 'HighlyAvailable'} onChange={() => onChangeField('controlPlaneTopology', 'HighlyAvailable')} />
+                  <Radio id="topo-sno" name="t-g" label="Single node" isChecked={blueprint.controlPlaneTopology === 'SingleNode'} onChange={() => onChangeField('controlPlaneTopology', 'SingleNode')} />
+                </div>
+                <HelperText><HelperTextItem>Compact is three nodes, and each node is a master, a worker, and storage. Larger clusters can mix those roles.</HelperTextItem></HelperText>
+              </FormGroup>
             </CardBody>
           </Card>
         </GalleryItem>
@@ -799,21 +1215,33 @@ function BlueprintStep({ blueprint, onChangeField, onChangeListField, onAddRegis
               <FormGroup
                 label="Machine network CIDR"
                 fieldId="bp-machine-network-cidr"
-                labelHelp={<span>Subnet where the OpenShift hosts are connected, for example 192.168.10.0/24.</span>}
+                labelHelp={<span>Subnet where the OpenShift hosts are connected, for example 205.28.113.0/24.</span>}
               >
                 <TextInput
                   id="bp-machine-network-cidr"
                   value={blueprint.machineNetworkCidr || ''}
                   onChange={(_event, value) => onChangeField('machineNetworkCidr', value)}
-                  placeholder="192.168.10.0/24"
+                  placeholder="205.28.113.0/24"
                 />
+              </FormGroup>
+              <FormGroup label="Network gateway" fieldId="bp-network-gateway" className="pf-v6-u-mt-md">
+                <TextInput id="bp-network-gateway" value={blueprint.networkGateway || ''} onChange={(_event, value) => onChangeField('networkGateway', value)} placeholder="205.28.113.1" />
+                <HelperText><HelperTextItem>Written as networkGateway. The DHCP pool is not stored here.</HelperTextItem></HelperText>
+              </FormGroup>
+              <FormGroup label="API VIP" fieldId="bp-api-vip" className="pf-v6-u-mt-md">
+                <TextInput id="bp-api-vip" value={blueprint.apiVip || ''} onChange={(_event, value) => onChangeField('apiVip', value)} placeholder="205.28.113.2" />
+                <HelperText><HelperTextItem>Written as apiVip. Compact and Highly Available need this address. Single node leaves it blank.</HelperTextItem></HelperText>
+              </FormGroup>
+              <FormGroup label="Ingress VIP" fieldId="bp-ingress-vip" className="pf-v6-u-mt-md">
+                <TextInput id="bp-ingress-vip" value={blueprint.ingressVip || ''} onChange={(_event, value) => onChangeField('ingressVip', value)} placeholder="205.28.113.3" />
+                <HelperText><HelperTextItem>Written as ingressVip. Use a different machine-network address from the API VIP and from every node.</HelperTextItem></HelperText>
               </FormGroup>
               <FormGroup label="DNS servers" fieldId="bp-dns-servers">
                 <TextArea
                   id="bp-dns-servers"
                   value={(blueprint.dnsServers || []).join('\n')}
                   onChange={(_event, value) => onChangeListField('dnsServers', value)}
-                  placeholder={'192.168.10.10\n192.168.10.11'}
+                  placeholder={'205.28.113.35'}
                   rows={3}
                 />
                 <HelperText><HelperTextItem>Enter one IP address or hostname per line.</HelperTextItem></HelperText>
@@ -884,7 +1312,8 @@ function BlueprintStep({ blueprint, onChangeField, onChangeListField, onAddRegis
               <FormGroup label="Additional Trust Bundle (Root CA Certificate PEM)" fieldId="bp-ca-certs">
                 <TextArea style={{ resize: 'vertical', minHeight: '80px', fontFamily: 'monospace', fontSize: '0.85rem' }} id="bp-ca-certs" value={blueprint.caCertBundle} onChange={(_e, val) => onChangeField('caCertBundle', val)} placeholder="-----BEGIN CERTIFICATE-----\nMIID5TCCAs2gAwIBAgIJAK...\n-----END CERTIFICATE-----" />
               </FormGroup>
-              <p>Keep pull secrets, BMC credentials, and other secrets in Ansible Vault. They are not collected or included in this export.</p>
+              <InstallSecrets outputDirectory={outputDirectory} httpsEnabled={httpsEnabled} />
+              <p>BMC passwords are entered only when inventory is retrieved, and they are not stored. The pull secret and the SSH key are not written to inventory, group_vars, host_vars, or the database.</p>
             </CardBody>
           </Card>
         </GalleryItem>
@@ -1122,7 +1551,7 @@ function DiscoveredNodesPage({ nodes, assignments, onAssignmentChange, inventory
                     <tr key={node.uuid}>
                       <td>
                         <strong>{node.serial_number || 'Serial unavailable'}</strong>
-                        <div>{node.bmc_address || 'BMC address unavailable'}</div>
+                        {node.source === 'redfish' && <div>{node.bmc_address || 'BMC address unavailable'}</div>}
                         <small style={{ color: '#6a6e73' }}>{node.source === 'redfish' ? 'Redfish' : 'IPA'} · UUID {node.uuid}</small>
                       </td>
                       <td className="assignment-cell">
@@ -1273,7 +1702,7 @@ function InventoryStep({ nodes, configs, onChangeField, onBondToggle, onReview, 
           </CardBody>
         </Card>
       )}
-      <Gallery hasGutter minWidths={{ default: '360px' }}>
+      <Gallery hasGutter minWidths={{ default: 'min(100%, 680px)' }}>
         {inventoryNodes.map(node => {
           const cfg = configs[node.uuid] || {};
           const selectedHardware = node;
@@ -1303,12 +1732,32 @@ function InventoryStep({ nodes, configs, onChangeField, onBondToggle, onReview, 
                       <div>
                         <div>{selectedHardware.inventory.cpus.count} Cores ({selectedHardware.inventory.cpus.model})</div>
                         <div>{Math.round(selectedHardware.inventory.memory.total / 1073741824)} GB RAM Allocated</div>
+                        <div className="node-device-lists">
+                          <div>
+                            <strong>Storage devices ({(selectedHardware.inventory.disks || []).length})</strong>
+                            <div className="node-device-list">
+                              {(selectedHardware.inventory.disks || []).length === 0 && <div>No storage devices reported</div>}
+                              {(selectedHardware.inventory.disks || []).map((disk) => (
+                                <div key={disk.serial}>{disk.model} — {disk.name || disk.serial} ({Math.round(disk.size / 1000000000)} GB)</div>
+                              ))}
+                            </div>
+                          </div>
+                          <div>
+                            <strong>NICs ({(selectedHardware.inventory.interfaces || []).length})</strong>
+                            <div className="node-device-list">
+                              {(selectedHardware.inventory.interfaces || []).length === 0 && <div>No NICs reported</div>}
+                              {(selectedHardware.inventory.interfaces || []).map((nic) => (
+                                <div key={nic.name}>{nic.name} [{nic.mac}]</div>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
                       </div>
                     ) : (
                       <div>Select an IPA node to view hardware</div>
                     )}
                   </div>
-                  <FormGroup label="Designated Root Installation Disk" isRequired fieldId={`disk-${node.uuid}`} className="pf-v6-u-mb-md">
+                  <FormGroup label="Install disk" isRequired fieldId={`disk-${node.uuid}`} className="pf-v6-u-mb-md">
                     <FormSelect id={`disk-${node.uuid}`} value={cfg.rootDisk || ''} onChange={(_e, val) => onChangeField(node.uuid, 'rootDisk', val)} isDisabled={!hasHardware}>
                       <FormSelectOption value="" label="-- Choose target drive --" isDisabled />
                       {(selectedHardware?.inventory.disks || []).map(d => {
@@ -1316,6 +1765,7 @@ function InventoryStep({ nodes, configs, onChangeField, onBondToggle, onReview, 
                         return <FormSelectOption key={d.serial} value={d.serial} label={`${d.model}${speedTag} (${Math.round(d.size / 1000000000)} GB)`} />;
                       })}
                     </FormSelect>
+                    <HelperText><HelperTextItem>OpenShift installs on this disk. The other reported drives stay in the host inventory.</HelperTextItem></HelperText>
                   </FormGroup>
                   <Title headingLevel="h4" size="md" className="pf-v6-u-mb-xs" style={{ display: 'flex', alignItems: 'center', color: '#151515' }}><NetworkIcon className="pf-v6-u-mr-xs" style={{ color: '#4f5255' }} /> Logical Interface Mapping</Title>
                   <div className="pf-v6-u-mb-sm" style={{ display: 'flex', gap: '20px' }}>
@@ -1324,7 +1774,7 @@ function InventoryStep({ nodes, configs, onChangeField, onBondToggle, onReview, 
                   </div>
                   {cfg.netType === 'single' && (
                     <div style={{ border: '1px solid #d2d2d2', padding: '12px', borderRadius: '4px', backgroundColor: '#fafafa' }}>
-                      <FormGroup label="Primary Logical Port" isRequired fieldId={`s-nic-${node.uuid}`} className="pf-v6-u-mb-sm">
+                      <FormGroup label="Machine-network NIC" isRequired fieldId={`s-nic-${node.uuid}`} className="pf-v6-u-mb-sm">
                         <FormSelect
                           id={`s-nic-${node.uuid}`}
                           value={cfg.singleNic || ''}
@@ -1347,6 +1797,7 @@ function InventoryStep({ nodes, configs, onChangeField, onBondToggle, onReview, 
                             );
                           })}
                         </FormSelect>
+                        <HelperText><HelperTextItem>The other reported NICs stay in the host inventory.</HelperTextItem></HelperText>
                       </FormGroup>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }} className="pf-v6-u-mt-sm"><Checkbox label="Enable VLAN Encapsulation" id={`v-s-${node.uuid}`} isChecked={cfg.singleVlanEnabled || false} onChange={(_e, chk) => onChangeField(node.uuid, 'singleVlanEnabled', chk)} isDisabled={!hasHardware} />{cfg.singleVlanEnabled && <TextInput style={{ maxWidth: '90px', height: '26px', fontSize: '0.85rem' }} type="number" placeholder="VLAN ID" value={cfg.singleVlanId || ''} onChange={(_e, val) => onChangeField(node.uuid, 'singleVlanId', val)} />}</div>
                     </div>
@@ -1371,9 +1822,49 @@ function InventoryStep({ nodes, configs, onChangeField, onBondToggle, onReview, 
                           </div>
                         ))}
                       </div>
+                      <HelperText><HelperTextItem>Checked NICs form the machine-network bond. Unchecked NICs stay in the host inventory.</HelperTextItem></HelperText>
                       <div style={{ borderTop: '1px dashed #c5c5c5' }} className="pf-v6-u-mt-sm pf-v6-u-pt-sm"><div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}><Checkbox label="Attach VLAN to bond0" id={`v-b-${node.uuid}`} isChecked={cfg.bondVlanEnabled || false} onChange={(_e, chk) => onChangeField(node.uuid, 'bondVlanEnabled', chk)} isDisabled={!hasHardware} />{cfg.bondVlanEnabled && <TextInput style={{ maxWidth: '90px', height: '26px', fontSize: '0.85rem' }} type="number" placeholder="VLAN ID" value={cfg.bondVlanId || ''} onChange={(_e, val) => onChangeField(node.uuid, 'bondVlanId', val)} />}</div></div>
                     </div>
                   )}
+                  <FormGroup label="Roles" fieldId={`role-${node.uuid}`} className="pf-v6-u-mt-md">
+                    <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap' }}>
+                      {NODE_ROLES.map((role) => (
+                        <Checkbox
+                          key={role}
+                          id={`role-${role}-${node.uuid}`}
+                          label={ROLE_LABELS[role]}
+                          isChecked={selectedRoles(cfg).includes(role)}
+                          onChange={(_event, checked) => {
+                            const nextRoles = NODE_ROLES.filter((name) => (name === role ? checked : selectedRoles(cfg).includes(name)));
+                            onChangeField(node.uuid, 'roles', nextRoles);
+                          }}
+                          isDisabled={!hasHardware}
+                        />
+                      ))}
+                    </div>
+                    <HelperText><HelperTextItem>Written as roles in host_vars. Compact checks all three. A master is the installer role when it is selected with other duties.</HelperTextItem></HelperText>
+                  </FormGroup>
+                  <Checkbox
+                    className="pf-v6-u-mt-sm"
+                    label="Rendezvous host"
+                    id={`rendezvous-${node.uuid}`}
+                    isChecked={cfg.rendezvous === true}
+                    onChange={(_event, checked) => onChangeField(node.uuid, 'rendezvous', checked)}
+                    isDisabled={!hasHardware || !selectedRoles(cfg).includes('master')}
+                  />
+                  <HelperText><HelperTextItem>Written as rendezvous. One master holds the rendezvous IP.</HelperTextItem></HelperText>
+                  <FormGroup label="Last octet" fieldId={`octet-${node.uuid}`} className="pf-v6-u-mt-md">
+                    <TextInput
+                      id={`octet-${node.uuid}`}
+                      value={cfg.ipv4LastOctet || ''}
+                      onChange={(_event, value) => onChangeField(node.uuid, 'ipv4LastOctet', value)}
+                      placeholder="15"
+                      isDisabled={!hasHardware}
+                    />
+                    <HelperText>
+                      <HelperTextItem>Written as ipv4LastOctet in host_vars. Combined with the machine network. Leave blank to keep the IPA address.</HelperTextItem>
+                    </HelperText>
+                  </FormGroup>
                 </CardBody>
               </Card>
             </GalleryItem>
@@ -1395,7 +1886,7 @@ function InventoryStep({ nodes, configs, onChangeField, onBondToggle, onReview, 
   );
 }
 
-function InventoryReviewPage({ nodes, configs, outputDirectory, status, error, isRefreshing, onRefresh, onBack, onConfirm }) {
+function InventoryReviewPage({ nodes, configs, machineNetworkCidr, outputDirectory, status, error, isRefreshing, onRefresh, onBack, onConfirm, configPreview, onViewYaml }) {
   const discoveredNodes = nodes.filter((node) => !node.is_placeholder);
   const unnamedNodes = nodes.filter((node) => !configs[node.uuid]?.ansibleHost?.trim());
   const missingSerials = discoveredNodes.filter((node) => !node.serial_number);
@@ -1426,7 +1917,7 @@ function InventoryReviewPage({ nodes, configs, outputDirectory, status, error, i
           <CardBody>
             <p><strong>{nodes.length}</strong> total nodes: <strong>{discoveredNodes.length}</strong> discovered, <strong>{nodes.length - discoveredNodes.length}</strong> named and awaiting hardware.</p>
             <p><strong>Destination:</strong> {outputDirectory || 'Not configured'}/ocp-metal-ui/</p>
-            {unnamedNodes.length > 0 && <p role="alert" style={{ color: '#a30000' }}>{unnamedNodes.length} node(s) need an Ansible host name before continuing.</p>}
+            {unnamedNodes.length > 0 && <p role="alert" style={{ color: '#a30000' }}>{unnamedNodes.length} node(s) need a host name before continuing.</p>}
             {missingSerials.length > 0 && <p role="alert" style={{ color: '#a30000' }}>{missingSerials.length} discovered node(s) have no serial number; export will be rejected until each serial is reported.</p>}
           </CardBody>
         </Card>
@@ -1439,28 +1930,35 @@ function InventoryReviewPage({ nodes, configs, outputDirectory, status, error, i
               </Button>
             </CardHeader>
             <CardBody>
-              <div role="list" aria-label="All nodes in inventory" style={{ display: 'grid', gap: '8px' }}>
+              <div role="list" aria-label="All nodes in inventory" className="review-roster">
                 {nodes.map((node) => {
                   const config = configs[node.uuid] || {};
                   const statusText = node.is_placeholder
                     ? 'Named host · waiting for hardware'
                     : `${node.source === 'redfish' ? 'Redfish' : 'IPA'} · discovered`;
+                  const address = hostAddress(
+                    config.ipv4LastOctet,
+                    machineNetworkCidr,
+                    node.inventory?.current_ip
+                  );
+                  const vlan = assignedVlan(config);
                   return (
-                    <div
-                      key={node.uuid}
-                      role="listitem"
-                      style={{
-                        display: 'grid',
-                        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-                        gap: '8px 16px',
-                        padding: '10px 12px',
-                        border: '1px solid #d2d2d2',
-                        borderRadius: '4px'
-                      }}
-                    >
-                      <div><strong>Ansible host</strong><br />{config.ansibleHost || 'Not assigned'}</div>
+                    <div key={node.uuid} role="listitem" className="review-roster-item">
+                      <div><strong>Host name</strong><br />{config.ansibleHost || 'Not assigned'}</div>
+                      <div><strong>Roles</strong><br />{roleLabel(config)}</div>
+                      <div><strong>Rendezvous</strong><br />{config.rendezvous ? 'Yes' : 'No'}</div>
+                      <div><strong>Storage devices</strong><br />{(node.inventory?.disks || []).length}</div>
+                      <div><strong>NICs</strong><br />{(node.inventory?.interfaces || []).length}</div>
+                      <div><strong>Install disk</strong><br />{config.rootDisk || 'Not chosen'}</div>
+                      <div><strong>Machine NIC</strong><br />{config.netType === 'bond' ? (config.bondNics || []).join(', ') || 'Bond not chosen' : config.singleNic || 'Not chosen'}</div>
+                      <div><strong>Address</strong><br />{address}</div>
+                      {vlan && (
+                        <div><strong>VLAN</strong><br />{vlan}</div>
+                      )}
                       <div><strong>Serial number</strong><br />{node.serial_number || (node.is_placeholder ? 'Awaiting discovery' : 'Not reported')}</div>
-                      <div><strong>BMC address</strong><br />{node.bmc_address || 'Not reported'}</div>
+                      {node.source === 'redfish' && (
+                        <div><strong>BMC address</strong><br />{node.bmc_address || 'Not reported'}</div>
+                      )}
                       <div><strong>Status</strong><br />{statusText}</div>
                     </div>
                   );
@@ -1473,13 +1971,93 @@ function InventoryReviewPage({ nodes, configs, outputDirectory, status, error, i
             <CardBody><p>No nodes are currently in the inventory. Go back to add a named host or wait for discovery.</p></CardBody>
           </Card>
         )}
-        <div className="workflow-actions pf-v6-u-pt-lg pf-v6-u-mt-xl">
+        <p className="yaml-review-note">
+          {configPreview?.installConfigFile
+            ? `Wrote ${configPreview.installConfigFile} and ${configPreview.agentConfigFile}.`
+            : (configPreview?.installFilesMessage
+              || 'Generate writes the inventory under ocp-metal-ui. The pull secret in the Ansible vault, plus an SSH public key, also writes install-config.yaml and agent-config.yaml in cluster-install.')}
+        </p>
+        <div className="workflow-actions pf-v6-u-pt-lg">
           <Button variant="secondary" onClick={onBack}>Back to inventory</Button>
+          <div className="yaml-review-actions">
+            <Button variant="secondary" onClick={() => onViewYaml('install')} isDisabled={!configPreview?.installConfig}>
+              View install-config
+            </Button>
+            <Button variant="secondary" onClick={() => onViewYaml('agent')} isDisabled={!configPreview?.agentConfig}>
+              View agent-config
+            </Button>
+          </div>
           <Button variant="primary" onClick={onConfirm} isDisabled={!canConfirm} >
             {isCommitting ? 'Generating...' : 'Generate Ansible Files'}
           </Button>
         </div>
+        {configPreview?.error && <p role="alert" className="yaml-review-error">{configPreview.error}</p>}
       </div>
     </PageSection>
+  );
+}
+
+function renderYaml(text) {
+  const lines = highlightYamlTokens(text);
+  return lines.map((tokens, lineIndex) => (
+    <span key={lineIndex}>
+      {tokens.map((part, partIndex) => (
+        part.kind
+          ? <span key={partIndex} className={`yaml-token-${part.kind}`}>{part.text}</span>
+          : part.text
+      ))}
+      {lineIndex < lines.length - 1 ? '\n' : null}
+    </span>
+  ));
+}
+
+function YamlPopout({ which, installConfig, agentConfig, written, onChoose, onClose }) {
+  const panelRef = useRef(null);
+  useEffect(() => {
+    panelRef.current?.focus();
+    const onKey = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  const title = which === 'agent' ? 'agent-config.yaml' : 'install-config.yaml';
+  const text = which === 'agent' ? agentConfig : installConfig;
+  return (
+    <div className="yaml-popout" role="presentation" onClick={onClose}>
+      <div
+        className="yaml-popout-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="yaml-popout-title"
+        tabIndex={-1}
+        ref={panelRef}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="yaml-popout-toolbar">
+          <strong id="yaml-popout-title">{title}</strong>
+          <div className="yaml-popout-choice">
+            <Button variant={which === 'install' ? 'primary' : 'secondary'} onClick={() => onChoose('install')}>
+              install-config.yaml
+            </Button>
+            <Button variant={which === 'agent' ? 'primary' : 'secondary'} onClick={() => onChoose('agent')}>
+              agent-config.yaml
+            </Button>
+          </div>
+          <Button variant="secondary" onClick={onClose}>Close</Button>
+        </div>
+        {which === 'install' && (
+          <p className="yaml-popout-note">
+            {written
+              ? 'This is the install-config.yaml written in cluster-install. The agent-config.yaml beside it is the matching file.'
+              : 'The pull secret stays in the Ansible vault. Save an SSH public key, and paste a pull secret if this container was not built with one, then generate again.'}
+          </p>
+        )}
+        {which === 'agent' && written && (
+          <p className="yaml-popout-note">This is the agent-config.yaml written in cluster-install.</p>
+        )}
+        <pre className="yaml-popout-body">{renderYaml(text)}</pre>
+      </div>
+    </div>
   );
 }

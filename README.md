@@ -1,53 +1,50 @@
 # OpenShift Bare-Metal Builder
 
-This application serves the React/PatternFly interface and a small SQLite-backed
-API from one container. The browser reads discovered nodes from the API, lets an
-operator choose disk and network preferences, and saves the reviewed
-configuration to SQLite and a mounted Ansible workspace. Blueprint defaults,
-operator-named hosts, and discovered hardware are served from SQLite; the UI
-does not embed mock inventory. A node's reported serial number is the hardware
-identifier that links each discovered system to its Ansible inventory host.
+Author: David Stratfor, assisted by AI.
+
+One container serves the PatternFly UI and its API. The operator reviews discovered hardware, sets disk and network choices, and writes Ansible files to a mounted workspace. The UI reads blueprint defaults, named hosts, and discovered hardware from PostgreSQL. It does not ship sample inventory. The node serial number is the hardware identifier that links a discovered system to its Ansible host.
+
+## Ports
+
+| Where | Address | Port |
+| --- | --- | --- |
+| Host installed from the external boot drive | `205.28.113.35` (`genesisIp`) | `3003` |
+| This workstation | `127.0.0.1` | `18080` |
+
+Port 3003 is the UI on the installed host. Semaphore on that host uses port 3000. The hardware collector on that host uses port 5000 and forwards reports to `http://127.0.0.1:3003`. Boot files are served by httpd on port 80.
+
+The workstation container is a separate process. Open it at `https://edge.ocp.internal:18080`. The certificate name is `edge.ocp.internal`.
+
+`./airgap-deploy-bundle.sh` defaults to the installed host: bind `205.28.113.35`, port `3003`. For the workstation:
+
+```sh
+BIND_ADDRESS=127.0.0.1 HOST_PORT=18080 ./airgap-deploy-bundle.sh
+```
 
 ## Data flow
 
-1. An Ironic inspection/reporting integration sends each node's UUID and
-   `inventory` JSON to `POST /api/v1/inspections` (or sends it to
-   `POST /api/v1/inspections/{uuid}`).
-2. The API upserts the report into SQLite. A later report for the same UUID
-   refreshes inventory while preserving the operator's preferences.
-3. The UI polls `GET /api/v1/nodes` every 15 seconds and displays current
-   hardware inventory.
-4. Operators can create named placeholder hosts before any reports arrive,
-   assign host names, and later link each name to a discovered node. The
-   inventory group is fixed in application configuration.
-5. Operators review all discovered nodes and named placeholders on a dedicated
-   **Review and confirm** page. The page summarizes inventory readiness and
-   allows a refresh before confirmation.
-6. The Blueprint and Inventory Config pages can each commit the current
-   configuration to SQLite, then continue to the next workflow page. Review
-   provides the final **Generate Ansible Files** action, which writes the
-   inventory and variables to the configured workspace. It does not run
-   Ansible; a separately delivered Execution Environment can use the files.
-7. If PXE/IPA is unavailable, the Redfish discovery workflow lets an operator
-   enter BMC HTTPS URLs and retrieve inventory from HPE iLO, Dell iDRAC,
-   Supermicro, or another Redfish-compatible BMC. Retrieved systems are stored
-   in the same SQLite inventory as IPA reports and continue through the same
-   assignment and hardware configuration workflow.
+1. An inspection client sends a node UUID and `inventory` JSON to `POST /api/v1/inspections`, or to `POST /api/v1/inspections/{uuid}`.
+2. The API upserts the report in PostgreSQL. A later report for the same UUID refreshes inventory and keeps the operator's preferences.
+3. The UI polls `GET /api/v1/nodes` every 15 seconds.
+4. The operator can create named placeholder hosts before reports arrive, then link each name to a discovered node. The inventory group is set in application configuration.
+5. **Review and confirm** lists discovered nodes and named placeholders. The operator can refresh before confirming.
+6. Blueprint and Inventory Config can each save the current configuration to PostgreSQL and continue. **Generate Ansible Files** on Review writes the inventory and variables. It does not run Ansible.
+7. If PXE or IPA is unavailable, the operator can enter BMC HTTPS URLs and retrieve inventory from HPE iLO, Dell iDRAC, Supermicro, or another Redfish BMC. Those systems are stored in the same inventory and use the same assignment workflow.
 
-The home page introduces the hardware-discovery and OpenShift-install
-configuration workflow and links directly to the cluster blueprint or BMC/iLO
-profiles. Workflow stages are URL-addressable and participate in browser
-history; browser Back and Forward move among blueprint, inventory/BMC, and
-review pages.
+The home page links to the cluster blueprint and to BMC profiles. Blueprint, inventory, and review are separate URLs. Browser Back and Forward move among those pages.
 
-The report body follows the Ironic inspection shape: a JSON object with an
-`inventory` object and a node `uuid` (the UUID may instead be in the URL).
-`bmc_address` is optional. The node serial is read from the top-level
-`serial_number`, `inventory.serial_number`,
-`inventory.system_vendor.serial_number` (preferred), or
-`inventory.system.serial_number`. Discovered nodes require a serial number
-before they can be committed to the Ansible inventory. Named placeholders can
-be committed before the hardware reports arrive. For example:
+## Inspection reports
+
+The body matches an Ironic inspection report: a JSON object with an `inventory` object and a node `uuid`. The UUID may be in the URL instead. `bmc_address` is optional.
+
+The serial number is read from, in order:
+
+- `inventory.system_vendor.serial_number`
+- top-level `serial_number`
+- `inventory.serial_number`
+- `inventory.system.serial_number`
+
+A discovered node needs a serial number before it can be written to the Ansible inventory. A named placeholder can be written before its hardware report arrives.
 
 ```json
 {
@@ -61,14 +58,13 @@ be committed before the hardware reports arrive. For example:
       { "name": "/dev/nvme0n1", "serial": "EXAMPLE123", "model": "Example NVMe", "size": 1000000000000 }
     ],
     "interfaces": [
-      { "name": "eno1", "mac_address": "52:54:00:fa:19:bc" }
+      { "name": "eno5", "mac_address": "52:54:00:fa:19:bc" }
     ]
   }
 }
 ```
 
-For serials provided outside the inventory object, a top-level field is also
-accepted:
+A top-level serial is also accepted:
 
 ```json
 {
@@ -80,173 +76,158 @@ accepted:
 }
 ```
 
-For report clients on another host, copy the server certificate there (or use a
-certificate issued by a CA already trusted by the client). The DNS name in the
-URL must match `TLS_HOSTNAME`.
+On the installed host, post the report to port 3003. The DNS name in the URL must match `TLS_HOSTNAME`. Copy the server certificate to the client, or use a certificate from a CA the client already trusts.
 
 ```sh
 curl --cacert /etc/ipa/ocp-metal-ui.crt \
-  -X POST https://ui-host.example.internal:8080/api/v1/inspections \
+  -X POST https://edge.ocp.internal:3003/api/v1/inspections \
   -H 'Content-Type: application/json' \
   --data-binary @inspection-report.json
 ```
 
-The API accepts an inspection report; it does not replace the Ironic conductor
-or configure IPA to report here automatically. Configure the existing
-inspection/reporting workflow (or a trusted-network callback) to forward the
-report to this API.
+The API stores the report. It does not configure IPA or replace an Ironic conductor. Point the existing inspection workflow at this URL.
 
-The generated files are written under `<selected-directory>/ocp-metal-ui/`:
+## Generated files
 
-- `inventory.yml`: maps the selected Ansible host name to the reported serial number
-  and BMC address, grouped under the configured `baremetal` inventory group.
-- `host_vars/<host>.yml`: includes `serial_number`, `bmc_address`,
-  operator-selected `node_preferences`, `inventory_source`, `ironic_uuid` for
-  IPA or `redfish_uuid` for Redfish, and source-specific
-  inventory under `ipa_inventory` or `redfish_inventory`.
-- `group_vars/baremetal.yml`: includes the non-secret cluster blueprint for
-  the configured inventory group.
+**Generate Ansible Files** writes under `<selected-directory>/ocp-metal-ui/`:
 
-The inventory host key is the stable Ansible `inventory_hostname`; its
-`serial_number` variable ties that host to the physical node reported by IPA or
-Redfish.
-The Global Cluster Blueprint includes the machine network CIDR, DNS servers,
-NTP sources, and the selected Ansible workspace directory. Cluster identity,
-network service lists, registry mirrors, and the CA trust bundle are exported
-under `cluster_blueprint` in `group_vars/baremetal.yml`. The workspace choice is
-saved in SQLite and constrains where generated files may be written; it is not
-included as a cluster variable.
-Hosts created before hardware reporting appear with an empty inventory host mapping
-and a `node_status: awaiting_ipa` host var. When the operator links a placeholder
-to a discovered node, the placeholder is replaced by that node while preserving
-its Ansible host name. All nodes use the inventory group configured
-in the application (`DEFAULT_ANSIBLE_GROUP` in `server.py`); it is intentionally
-not an operator-selectable field.
-Both IPA inspection reports and manually retrieved Redfish hardware are stored
-as discovered nodes in the same SQLite inventory. Redfish profiles contain only
-a profile name and BMC URL; they do not assign an Ansible host. From either
-discovery method, use the shared **Discovered Nodes** page to link an available
-discovered node to an inventory name, or enter a new host name. Inventory names
-can also be linked from their own rows. Links can be staged, unlinked, and saved
-together; unlinking restores the inventory name as an available item. Duplicate
-host names and duplicate node assignments are rejected. Mistaken discoveries
-and unused inventory names can be deleted. Assignment changes are validated and
-saved as one SQLite transaction. After linking, both discovery sources use the
-same hardware configuration tiles for disk, NIC, bond, and VLAN selections.
-Once in the shared
-workflow, the persistent left navigation provides access to **Global Cluster
-Blueprint**, **BMC / iLO Profiles**, **Discovered Nodes**, **Inventory Config**,
-and **Review**. The Blueprint and Inventory Config pages each provide a commit
-action that saves the current blueprint and node preferences to SQLite without
-generating files, followed by a separate Continue action. Review remains the
-final confirmation before generating Ansible inventory and variable files.
-Use the generated `host_vars` for node-specific hardware and preferences, and
-the group's `group_vars` file for shared cluster configuration. Secret values
-such as pull secrets and BMC passwords are not included in generated files;
-define them separately in Ansible Vault and reference the vaulted variables
-from your playbooks. Redfish BMC URLs and profile names are stored in SQLite.
-BMC usernames and passwords are entered only when
-inventory is retrieved, are sent only over HTTPS, and are not stored or
-logged. The Redfish workflow retrieves system, processor, memory, storage /
-drive, and Ethernet-interface details. Missing optional resources are reported
-as warnings; a missing system serial prevents exporting that node until the
-serial is available. Generated files are confined to an app-owned
-`ocp-metal-ui` subdirectory under the selected workspace directory; other
-playbooks and files are not modified.
+- `inventory.yml` maps each Ansible host name to its serial number and BMC address. Cluster nodes are in the `ocp` group. `dc01` and `dc02` are in the `mgmt` group. Those two names are DNS names, not cluster nodes.
+- `host_vars/<host>.yml` contains `serial_number`, `bmc_address`, `node_preferences`, `inventory_source`, and `ironic_uuid` or `redfish_uuid`. Hardware is under `ipa_inventory` or `redfish_inventory`, including every reported disk and NIC. The install disk and the machine-network NIC are the operator's choices in `node_preferences`.
+  - `ipv4LastOctet` is written when the operator sets a last octet.
+  - `ipv4_ip` is the machine-network address from that octet, or the IPA address when the octet is blank.
+  - `roles` lists `master`, `worker`, and `storage` as checked.
+  - `role` is the installer value. `master` takes precedence over `worker`.
+  - `rendezvous` is written when set, and only a master can hold it.
+  - `host_vars/dc01.yml` and `host_vars/dc02.yml` contain the last octet only.
+- `group_vars/ocp.yml` holds variables for the `ocp` group, including `apiVip` and `ingressVip` when entered. The DC last octets are not in this file. There is no `group_vars/mgmt.yml`.
 
-BMC certificates are verified by default. For an untrusted BMC certificate,
-the operator must explicitly accept the risk for that retrieval. The UI/API
-itself must use HTTPS before the retrieval action is enabled.
+The inventory host key is the Ansible `inventory_hostname`. Its `serial_number` variable ties that name to the physical node.
 
-## Build an air-gap bundle
+The pull secret and the SSH public key are not written under `ocp-metal-ui/` and are not stored in PostgreSQL. When the operator pastes a pull secret or creates an SSH key, the files are written beside that tree in `cluster-install/`:
 
-Build on a connected machine with Node.js 22, npm, and Podman or Docker. The
-container image contains the built UI, Python's standard-library SQLite API,
-and the Python runtime; it needs no internet access once deployed.
+- `pull-secret.vault`, mode 0600, Ansible vault variable `ocp_pre_install_pull_secret_contents`
+- `id_ed25519`, mode 0600
+- `id_ed25519.pub`, mode 0644
+
+When the inventory can build a cluster, a pull secret can be opened, and an SSH public key is present, the same action also writes:
+
+- `cluster-install/install-config.yaml`, mode 0600
+- `cluster-install/agent-config.yaml`, mode 0644
+
+`install-config.yaml` contains the opened pull secret because the installer reads that file. The vault password stays in its own file. A generate that cannot build the cluster removes a previously written pair and leaves the pull secret and the SSH key in place. Other files in the workspace are left as they are.
+
+The configurator install keeps its profile under `/var/ocp-config/ocp/dev/<profile>/` and writes its own `install-config.yaml` and `agent-config.yaml` under `/opt/ocp/<platform>/<version>/`. Generate refuses a directory inside `/var/ocp-config`, `/opt/ocp`, or `/etc/ansible`. The files from this UI stay in the selected workspace.
+
+The container does not include `ansible-playbook` and does not start a play. The offline Ansible Execution Environment consumes the generated files.
+
+## Blueprint
+
+The Blueprint page collects the base domain, machine network CIDR, network gateway, API VIP, ingress VIP, DNS servers, NTP sources, and the Ansible workspace directory.
+
+These values stay in the saved blueprint and are not fields on that page:
+
+- genesis hostname, genesis IP, genesis NIC, genesis NIC list, genesis storage devices
+- management network CIDR, management VLAN, DC01 last octet, DC02 last octet
+
+The OpenShift install uses the base domain, the machine network CIDR, and the genesis IP. Cluster identity, network service lists, registry mirrors, the CA trust bundle, and the management prefix are written to `group_vars/ocp.yml`. The DC last octets are written as `ipv4LastOctet` on `dc01` and `dc02`. The DHCP pool is not one of those variables. The workspace path is saved in PostgreSQL and limits where files may be written. It is not a cluster variable.
+
+Initial defaults, written when the database is first created:
+
+| Key | Value |
+| --- | --- |
+| `clusterName` | `ocp-baremetal` |
+| `baseDomain` | `ocp.internal` |
+| `machineNetworkCidr` | `205.28.113.0/24` |
+| `networkGateway` | `205.28.113.1` |
+| `dnsServers` | `205.28.113.35` |
+| `genesisHostname` | `edge` |
+| `genesisIp` | `205.28.113.35` |
+| `genesisNic` | `eno5` |
+| `mgmtNetworkCidr` | `205.28.114.0/24` |
+| `mgmtVlan` | `280` |
+| `mgmtDc01Octet` | `6` |
+| `mgmtDc02Octet` | `7` |
+
+The blueprint stores `edge`. The installed host name is `edge.ocp.internal`. `genesis` is an alias.
+
+Hosts created before a hardware report have an empty inventory mapping and `node_status: awaiting_ipa`. Linking a placeholder to a discovered node keeps the Ansible host name and replaces the placeholder with that node. Every node uses `DEFAULT_ANSIBLE_GROUP` from `server.py`. The operator does not pick the group.
+
+## Discovered nodes
+
+IPA reports and Redfish retrievals are both discovered nodes. A Redfish profile is a name and a BMC URL. It does not assign an Ansible host.
+
+On **Discovered Nodes**, link a discovered node to an inventory name or enter a new host name. Links can be staged, unlinked, and saved together. Unlinking returns the inventory name to the available list. Duplicate host names and duplicate node assignments are rejected. Unused names and mistaken discoveries can be deleted. Assignment changes are one database transaction.
+
+After linking, both sources use the same controls for disk, NIC, bond, and VLAN. The left navigation is **Global Cluster Blueprint**, **BMC / iLO Profiles**, **Discovered Nodes**, **Inventory Config**, and **Review**. Blueprint and Inventory Config each save to PostgreSQL, then continue. Review is the step that writes the Ansible files.
+
+## Pull secret and SSH key
+
+The image build copies an Ansible vault file to `/app/pull-secret.vault`, mode 0600. The vault password is mounted at `/vault/password` and is not in the image. On the Blueprint page, paste a pull secret or choose a file to store one for this workspace, or create an SSH key. The saved vault file is `cluster-install/pull-secret.vault`. Leave the field blank to keep the pull secret built into the image.
+
+The install preview shows the pull secret after the vault password can open it. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
+
+## Redfish
+
+BMC usernames and passwords are entered for a retrieval, sent only over HTTPS, and are not stored or logged. The retrieval reads system, processor, memory, storage, drive, and Ethernet-interface details. Missing optional resources are warnings. A missing system serial blocks export of that node until the serial is present.
+
+Generated files stay in the `ocp-metal-ui` directory under the selected workspace. The API checks that the path remains under `/ansible`.
+
+BMC certificates are verified by default. For an untrusted BMC certificate, the operator must accept that certificate for that retrieval. The UI enables retrieval only when its own API is served over HTTPS.
+
+## Build the image
+
+Build on a connected machine with Node.js 22, npm, and Podman or Docker. The image contains the built UI and the Python runtime. It does not need network access after it is built.
+
+Place the cluster pull secret at `pull-secret.json` in this directory. Set `VAULT_PASSWORD_FILE` to the Ansible vault password file. The build writes `pull-secret.vault` and the image copies that file to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image. Neither file is committed.
 
 ```sh
 npm ci
 ./airgap-build-bundle.sh
 ```
 
-The build script compiles `dist/`, builds `Containerfile.airgap`, and writes
-`ocp-metal-ui-engine-bundle.tar`. Transfer that tarball and
-`airgap-deploy-bundle.sh` into the disconnected environment. The npm lockfile
-pins JavaScript dependencies; for byte-for-byte reproducible image builds, also
-pin the Python base image by digest in `Containerfile.airgap`.
+The script compiles `dist/`, vaults `pull-secret.json`, builds `Containerfile.airgap`, and writes `ocp-metal-ui-engine-bundle.tar`. Copy that tarball and `airgap-deploy-bundle.sh` to the disconnected host. `package-lock.json` pins the JavaScript dependencies. For a byte-for-byte image rebuild, also pin the Python base image by digest in `Containerfile.airgap`.
 
-## Run in a disconnected container
+## Deploy on the installed host
 
 ```sh
 ./airgap-deploy-bundle.sh
 ```
 
-The script imports the image and runs it on port 8080. SQLite is stored in the
-named `ocp-metal-ui-data` volume, so replacing/restarting the application
-container does not delete inventory or preferences. Back up this volume using
-the container engine's normal volume backup procedure. The host's
-`ansible-workspace` directory is mounted at `/ansible` inside the container by
-default. The UI lets the operator confirm that directory or choose another
-absolute path inside the mounted workspace.
+The script loads the UI image. It also loads `postgresql:latest` from `/var/www/html/pub/images/postgresql/postgresql.tar` when that image is not already loaded. The tar's own name is `registry.access.redhat.com/hi/postgresql:latest`. The script tags it `postgresql:latest` and starts container `ocp-metal-ui-db`. The data directory is `/var/lib/ocp-metal-ui/postgres`, owned by uid 999. The database listens on `127.0.0.1:5433`. The database name and login role are `ocp_metal_ui`. The first start writes `/var/lib/ocp-metal-ui/db.env`, mode 0600. That file holds the role password and the PostgreSQL superuser password. The UI does not connect as the superuser. Quay later uses the same image as `postgresql-quay` on port 5432 and the `quay` database. The two data directories are separate.
 
-The SQLite database file is `/data/ocp-metal-ui.sqlite3` inside the container.
-On the container host, its storage is managed by the named volume
-`ocp-metal-ui-data` (inspect its mount location with
-`podman volume inspect ocp-metal-ui-data` or `docker volume inspect
-ocp-metal-ui-data`). Nodes, named placeholders, preferences, and app settings (including initial
-blueprint defaults and manually entered Redfish BMC profiles) are stored there.
-The database is separate from the Ansible workspace. No sample BMC profiles
-are preloaded.
+Replacing the UI container does not delete `/var/lib/ocp-metal-ui/postgres` or `db.env`. Back those up together. A newer major version of `postgresql.tar` has to match the `PG_VERSION` file in that directory. Keep the tar that initialized it. The host directory `ansible-workspace` is mounted at `/ansible`. The operator can keep that directory or choose another absolute path inside the mount.
 
-To mount a different host directory:
+The database holds nodes, placeholders, preferences, blueprint settings, and Redfish profile names. It does not hold BMC passwords. No sample BMC profiles are loaded. The UI listens on the address in `BIND_ADDRESS` (default `0.0.0.0`) and port `3003`.
+
+To mount a different workspace directory:
 
 ```sh
 ANSIBLE_HOST_DIR=/srv/ansible-workspace ./airgap-deploy-bundle.sh
 ```
 
-The deploy script grants group write access on the selected workspace root and
-uses the host directory's group for the container process. Choose a dedicated
-workspace or review that permission change if using an existing shared
-directory. The UI validates that selected output paths remain within `/ansible`.
-On **Generate Ansible Files**, generated inventory, group vars, and host vars
-are written under `<selected-directory>/ocp-metal-ui/`; SQLite preferences are
-committed as part of that operation. Other
-files and playbooks in the workspace are left alone. The UI container does not
-include `ansible-playbook` and does not start a playbook. This keeps the UI
-independent of the separately versioned, offline-delivered Ansible Execution
-Environment, which can consume the generated inventory path.
+The script grants group write on the workspace root and runs the container as that directory's group. Use a dedicated directory, or review that permission change before pointing it at a shared directory. On **Generate Ansible Files**, inventory and host vars are written under `<selected-directory>/ocp-metal-ui/`, and the preferences are saved in PostgreSQL as part of that action.
 
-To use a different host port, set `HOST_PORT` when running the deploy script:
+## Deploy on this workstation
+
+The script prepares `/var/lib/ocp-metal-ui/postgres` and starts the database container. Run it as root. `postgresql:latest` must already be loaded, or `POSTGRES_IMAGE_TAR` must point at the image archive.
 
 ```sh
-HOST_PORT=18080 ./airgap-deploy-bundle.sh
+BIND_ADDRESS=127.0.0.1 HOST_PORT=18080 ./airgap-deploy-bundle.sh
 ```
 
-### HTTPS and certificates
+Open `https://edge.ocp.internal:18080` when the certificate was issued for that name. Open `https://127.0.0.1:18080` when the certificate covers that address. Some systems resolve `localhost` to IPv6. The published port is IPv4.
 
-The deployment script always enables HTTPS. If no certificate is supplied, it
-creates a self-signed certificate and private key in
-`~/.config/ocp-metal-ui/tls/` (or `$TLS_CERT_DIR`), with `localhost` and the
-host's fully-qualified name in the certificate. The certificate is reused on
-subsequent deployments and is valid for 365 days. OpenSSL 1.1.1 or later is
-required on the deployment host. To rotate an expired certificate or change
-`TLS_HOSTNAME`, use a new `TLS_CERT_DIR`. Set `TLS_HOSTNAME` when operators use
-a different hostname, and ensure that name resolves to the container host:
+## HTTPS
+
+The deploy script always enables HTTPS. If no certificate is supplied, it creates a self-signed certificate and key in `~/.config/ocp-metal-ui/tls/` (or `$TLS_CERT_DIR`). The certificate includes `localhost` and the host's fully qualified name, and is valid for 365 days. Later runs reuse it. OpenSSL 1.1.1 or later is required. To rotate the certificate or change `TLS_HOSTNAME`, use a new `TLS_CERT_DIR`.
 
 ```sh
 TLS_HOSTNAME=ui.example.internal ./airgap-deploy-bundle.sh
 ```
 
-When browsing on the container host itself, use
-`https://127.0.0.1:8080` rather than `https://localhost:8080`. The default
-container port publish is IPv4; some systems resolve `localhost` to IPv6 first.
-The deploy script prints the loopback URL when the certificate covers it.
+`TLS_HOSTNAME` must be a DNS name on the certificate and must resolve to the host.
 
-Browsers will warn about a self-signed certificate until it is trusted. For
-regular use, distribute and trust the generated certificate on operator
-workstations, or provision a certificate from your organization's CA. Do not
-disable browser certificate checks. You can instead supply a trusted server
-certificate and private key:
+To supply an existing certificate:
 
 ```sh
 TLS_CERT_HOST_FILE=/etc/ocp-metal-ui/ui.crt \
@@ -254,24 +235,13 @@ TLS_KEY_HOST_FILE=/etc/ocp-metal-ui/ui.key \
 ./airgap-deploy-bundle.sh
 ```
 
-For a supplied certificate, set `TLS_HOSTNAME` to a DNS name present in its
-subject alternative names. The deploy script checks the certificate's
-validity, hostname, and match with the unencrypted private key before stopping
-an existing container.
+The script checks that the certificate is valid, matches `TLS_HOSTNAME`, and matches the unencrypted private key before it stops an existing container. The deploy does not download a certificate. Keep the private key on the host.
 
-The app serves HTTPS on the configured host port (8080 by default). Deployment
-performs no internet access or certificate download. Keep the private key
-protected on the host. Redfish BMC certificates are a separate trust decision:
-they are verified by default, and an operator can explicitly accept an
-untrusted BMC certificate for an individual retrieval.
+A browser warns until a self-signed certificate is trusted. Distribute the generated certificate to operator workstations, or use a certificate from your CA. Do not disable certificate checks in the browser.
 
-### Reliable browser testing
+### Trust a local test certificate in Chrome
 
-For a self-signed local test certificate, use the IPv4 loopback URL
-`https://127.0.0.1:8080`; some systems resolve `localhost` to IPv6 even though
-the container port is published on IPv4. To make Chrome trust only this exact
-test certificate, import it as a trusted peer in the local NSS certificate
-database (do not use CA trust flags):
+Import the certificate as a peer. Do not mark it as a CA.
 
 ```sh
 certutil -A \
@@ -281,9 +251,7 @@ certutil -A \
   -i "$HOME/.config/ocp-metal-ui-test/tls/tls.crt"
 ```
 
-Restart Chrome after importing the certificate, then open
-`https://127.0.0.1:8080`. For a certificate rotated or replaced later, remove
-the prior peer entry before importing the new certificate:
+Restart Chrome, then open the workstation URL. When the certificate is replaced, delete the old peer entry first:
 
 ```sh
 certutil -D \
@@ -291,41 +259,31 @@ certutil -D \
   -n "ocp-metal-ui-local-test"
 ```
 
-This avoids turning off TLS validation or trusting the test certificate as a
-general certificate authority.
+### Smoke test
 
-Run the repeatable API, asset, and browser-render smoke test from the project
-directory:
+From the project directory:
 
 ```sh
 TLS_CA_FILE="$HOME/.config/ocp-metal-ui-test/tls/tls.crt" \
   ./airgap-smoke-test.sh
 ```
 
-The script verifies TLS normally, checks health/config/inventory APIs, fetches
-the page's JavaScript and CSS bundles, and uses headless Chrome to confirm the
-React landing page and discovered-node inventory rendered. When `TLS_CA_FILE`
-is supplied, it pins that exact certificate in the temporary headless Chrome
-profile; no persistent browser or system trust changes are made. Without
-`TLS_CA_FILE`, Chrome must already trust the server certificate. Set `BASE_URL`
-for another HTTPS address, `CHROME_BIN` for a different Chrome/Chromium
-executable, or `BROWSER_TIMEOUT` to adjust the headless browser timeout. The
-smoke test does not skip certificate checks.
+The script checks TLS, the health, config, and inventory APIs, the page's JavaScript and CSS, and a headless Chrome render of the landing page and the discovered-node inventory. With `TLS_CA_FILE`, Chrome pins that certificate in a temporary profile. Without it, Chrome must already trust the server certificate. The script does not skip certificate checks.
 
-## Local development and checks
+Optional variables: `BASE_URL` for another HTTPS address, `CHROME_BIN` for the Chrome binary, `BROWSER_TIMEOUT` for the headless timeout. The script default for `BASE_URL` is `https://127.0.0.1:3003`. For the workstation container set `BASE_URL=https://127.0.0.1:18080`.
 
-Start the API and UI in separate terminals:
+## Local development
+
+Start the API and the UI in two terminals:
 
 ```sh
-DATABASE_PATH=./data/ocp-metal-ui.sqlite3 \
+DATABASE_URL='postgresql://ocp_metal_ui:PASSWORD@127.0.0.1:5433/ocp_metal_ui?sslmode=disable' \
 ANSIBLE_WORKING_DIR=./ansible-workspace \
 python3 server.py
 npm run dev
 ```
 
-This development-only setup uses HTTP on localhost; the container deployment
-above always uses HTTPS. Vite proxies `/api` requests to the local API on port
-8080. Run checks with:
+`python3 server.py` listens on port 3003 unless `PORT` is set. This process uses HTTP unless TLS certificate files are configured. The container deployment uses HTTPS. Vite proxies `/api` to `http://localhost:3003`.
 
 ```sh
 npm run lint
@@ -333,34 +291,25 @@ npm run build
 npm run test:backend
 ```
 
-## API summary
+## API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/health` | Container readiness |
-| `GET` | `/api/v1/config` | Configured Ansible workspace, saved destination, and blueprint |
-| `GET` | `/api/v1/nodes` | Read inventory and saved preferences |
-| `PUT` | `/api/v1/redfish/endpoints` | Save manually entered BMC profiles (no credentials) |
-| `POST` | `/api/v1/redfish/retrieve` | Retrieve and store BMC inventory; HTTPS required |
-| `POST` | `/api/v1/nodes` | Create an operator-named placeholder host |
-| `POST` | `/api/v1/nodes/link` | Link a named placeholder to a reported IPA node |
-| `POST` | `/api/v1/nodes/assignments` | Batch link or unlink discovered nodes and inventory names |
+| `GET` | `/api/v1/health` | Readiness |
+| `GET` | `/api/v1/config` | Ansible workspace, saved destination, and blueprint |
+| `GET` | `/api/v1/nodes` | Inventory and saved preferences |
+| `PUT` | `/api/v1/redfish/endpoints` | Save BMC profiles. No credentials. |
+| `POST` | `/api/v1/redfish/retrieve` | Retrieve and store BMC inventory. HTTPS required. |
+| `POST` | `/api/v1/nodes` | Create a named placeholder host |
+| `POST` | `/api/v1/nodes/link` | Link a placeholder to a reported node |
+| `POST` | `/api/v1/nodes/assignments` | Link or unlink discovered nodes and inventory names |
 | `DELETE` | `/api/v1/nodes/{uuid}` | Delete a node or inventory name |
-| `POST` | `/api/v1/inspections` | Ingest report with `uuid` and `inventory` |
-| `POST` | `/api/v1/inspections/{uuid}` | Ingest report with UUID supplied in the path |
+| `POST` | `/api/v1/inspections` | Store a report that includes `uuid` and `inventory` |
+| `POST` | `/api/v1/inspections/{uuid}` | Store a report. UUID is in the path. |
 | `PUT` | `/api/v1/nodes/preferences` | Save `{ "preferences": { "<uuid>": { ... } } }` |
-| `PUT` | `/api/v1/configuration` | Batch-save the blueprint, workspace destination, and node preferences to SQLite |
-| `POST` | `/api/v1/ansible-files` | Commit reviewed preferences and generated inventory/vars into workspace |
+| `PUT` | `/api/v1/configuration` | Save the blueprint, workspace destination, and node preferences |
+| `POST` | `/api/v1/ansible-files` | Write the reviewed inventory and variables into the workspace |
 
-The API has no application-level authentication. HTTPS protects Redfish
-credentials in transit but does not add user authentication. Do not expose it
-to untrusted networks; protect access with network segmentation/firewall policy.
+The API has no application login. HTTPS protects Redfish credentials in transit. It does not authenticate the operator. Keep the service on a network you control.
 
-The initial cluster blueprint defaults are seeded in SQLite when the database
-is first initialized. Blueprint and node preference changes can be saved to SQLite before review.
-The final review action generates files and persists the reviewed configuration;
-Redfish profiles are saved separately and before retrieval.
-Generated host vars contain discovered hardware inventory, which
-may include infrastructure details; handle it according to your organization's
-data policy. Keep secrets in Ansible Vault rather than in SQLite or generated files.
-Redfish credentials are transient and never persisted.
+Generated host vars contain hardware inventory. Handle that data under your organization's policy. Keep secrets in Ansible Vault. Redfish credentials are not written to disk.

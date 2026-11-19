@@ -1,22 +1,40 @@
+import hashlib
+import hmac
+import importlib.util
 import json
 import http.client
 import os
 import re
-import sqlite3
+import shutil
 import ssl
+import subprocess
 import tempfile
 import uuid
+from binascii import hexlify, unhexlify
+
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
+
+import psycopg
+from psycopg.rows import dict_row
 
 
 APP_DIR = Path(__file__).resolve().parent
 DIST_DIR = APP_DIR / "dist"
-DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", "/data/ocp-metal-ui.sqlite3"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ANSIBLE_WORKING_DIR = Path(os.environ.get("ANSIBLE_WORKING_DIR", "/ansible"))
+# The image build copies the vaulted pull secret here. Keep the default on
+# /app so a source tree that also holds the file is not read by unit tests.
+# The vault password file is mounted at run time and is not in the image.
+BUNDLED_PULL_SECRET_FILE = Path(
+    os.environ.get("BUNDLED_PULL_SECRET_FILE", "/app/pull-secret.vault")
+)
+VAULT_PASSWORD_FILE = Path(os.environ.get("VAULT_PASSWORD_FILE", "/vault/password"))
 TLS_CERT_FILE = os.environ.get("TLS_CERT_FILE")
 TLS_KEY_FILE = os.environ.get("TLS_KEY_FILE")
 MAX_REQUEST_BYTES = 5 * 1024 * 1024
@@ -32,8 +50,12 @@ PREFERENCE_FIELDS = {
     "bondVlanEnabled",
     "bondVlanId",
     "ansibleHost",
+    "ipv4LastOctet",
+    "role",
+    "roles",
+    "rendezvous",
 }
-DEFAULT_ANSIBLE_GROUP = "baremetal"
+DEFAULT_ANSIBLE_GROUP = "ocp"
 BLUEPRINT_FIELDS = {
     "clusterName",
     "baseDomain",
@@ -43,12 +65,43 @@ BLUEPRINT_FIELDS = {
     "machineNetworkCidr",
     "dnsServers",
     "ntpServers",
+    "genesisHostname",
+    "genesisIp",
+    "genesisNic",
+    "genesisNics",
+    "genesisDisks",
+    "networkGateway",
+    "mgmtNetworkCidr",
+    "mgmtVlan",
+    "mgmtDc01Octet",
+    "mgmtDc02Octet",
+    "apiVip",
+    "ingressVip",
 }
+# These stay on the blueprint so the form can reload them. They are host
+# vars for dc01 and dc02, so they are not written to group_vars/ocp.yml.
+_DC_OCTET_FIELDS = {
+    "mgmtDc01Octet",
+    "mgmtDc02Octet",
+}
+_MGMT_HOSTS = (
+    ("dc01", "mgmtDc01Octet"),
+    ("dc02", "mgmtDc02Octet"),
+)
+_MGMT_GROUP = "mgmt"
+_HOST_LEVEL_PREFERENCES = {"ansibleHost", "ipv4LastOctet", "role", "roles", "rendezvous"}
+_OPTIONAL_BLANK_GROUP_VARS = {"apiVip", "ingressVip"}
 DEFAULT_REDFISH_ENDPOINTS = []
 
 
 class RedfishError(ValueError):
     def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+class InstallSecretError(ValueError):
+    def __init__(self, message, status=400):
         super().__init__(message)
         self.status = status
 
@@ -328,13 +381,563 @@ class RedfishClient:
                     pass
 DEFAULT_BLUEPRINT = {
     "clusterName": "ocp-baremetal",
-    "baseDomain": "example.com",
-    "controlPlaneTopology": "HighlyAvailable",
+    "baseDomain": "ocp.internal",
+    "controlPlaneTopology": "Compact",
     "mirrorRegistries": ["registry.airgap.internal:5000"],
     "caCertBundle": "",
-    "machineNetworkCidr": "",
-    "dnsServers": [],
+    "machineNetworkCidr": "205.28.113.0/24",
+    "dnsServers": ["205.28.113.35"],
     "ntpServers": [],
+    "genesisHostname": "edge",
+    "genesisIp": "205.28.113.35",
+    "genesisNic": "eno5",
+    "genesisNics": ["eno5"],
+    "genesisDisks": [],
+    "networkGateway": "205.28.113.1",
+    "mgmtNetworkCidr": "205.28.114.0/24",
+    "mgmtVlan": "280",
+    "mgmtDc01Octet": "6",
+    "mgmtDc02Octet": "7",
+    "apiVip": "",
+    "ingressVip": "",
+}
+# Saved blueprints from earlier builds used these names. The values move
+# onto genesisHostname and genesisIp, and the old keys are not written again.
+_RETIRED_BLUEPRINT_FIELDS = {
+    "bastionHostname": "genesisHostname",
+    "bastionIp": "genesisIp",
+}
+# Full DC addresses used to live in the group file. The last octet is now
+# a host var. A stored address moves onto the octet key, then the address
+# key is dropped.
+_RETIRED_DC_ADDRESS_FIELDS = {
+    "mgmtDc01Ip": "mgmtDc01Octet",
+    "mgmtDc02Ip": "mgmtDc02Octet",
+}
+
+
+def bare_octet(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
+    if not text.isdigit():
+        return None
+    number = int(text)
+    if number > 255:
+        return None
+    return str(number)
+
+
+def octet_from_address(value):
+    if isinstance(value, str) and value.count(".") == 3:
+        return bare_octet(value.strip().split(".")[-1])
+    return bare_octet(value)
+
+
+def optional_octet(value, label):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ""
+    octet = bare_octet(value)
+    if octet is None:
+        raise ValueError(f"{label} must be a last octet from 0 to 255.")
+    return octet
+
+
+def optional_ipv4(value, label):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be an IPv4 address.")
+    parts = value.strip().split(".")
+    if len(parts) != 4 or any(not part.isdigit() or int(part) > 255 for part in parts):
+        raise ValueError(f"{label} must be an IPv4 address.")
+    return ".".join(str(int(part)) for part in parts)
+
+
+def canonicalize_vips(blueprint):
+    canonical = dict(blueprint)
+    for key in ("apiVip", "ingressVip"):
+        canonical[key] = optional_ipv4(canonical.get(key, ""), f"Blueprint field {key}")
+    return canonical
+
+
+_ROLE_ORDER = ("master", "worker", "storage")
+_TOPOLOGIES = {"Compact", "HighlyAvailable", "SingleNode"}
+
+
+def normalize_topology(value):
+    if value not in _TOPOLOGIES:
+        raise ValueError("Topology must be Compact, HighlyAvailable, or SingleNode.")
+    return value
+
+
+def normalize_role(value, node_uuid):
+    if value is None or value == "":
+        return ""
+    if value not in {"master", "worker"}:
+        raise ValueError(f"Node {node_uuid} role must be master or worker.")
+    return value
+
+
+def normalize_roles(value, node_uuid):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [value] if value.strip() else []
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise ValueError(f"Node {node_uuid} roles must be a list.")
+    selected = []
+    for item in items:
+        if not isinstance(item, str) or item not in _ROLE_ORDER:
+            raise ValueError(
+                f"Node {node_uuid} role must be master, worker, or storage."
+            )
+        if item not in selected:
+            selected.append(item)
+    return [name for name in _ROLE_ORDER if name in selected]
+
+
+def installer_role(roles):
+    if "master" in roles:
+        return "master"
+    if "worker" in roles:
+        return "worker"
+    return ""
+
+
+def apply_role_fields(preferences, node_uuid):
+    """Keep the role list and the installer role together.
+
+    roles is the operator's selection and can hold more than one duty.
+    role is the single value the agent installer accepts: master wins
+    over worker. Storage stays in the list.
+    """
+    if "roles" in preferences:
+        roles = normalize_roles(preferences.get("roles"), node_uuid)
+        preferences["roles"] = roles
+        preferences["role"] = installer_role(roles)
+    elif "role" in preferences:
+        role = normalize_role(preferences.get("role"), node_uuid)
+        preferences["role"] = role
+        preferences["roles"] = [role] if role else []
+    return preferences
+
+
+def normalize_rendezvous(value, node_uuid):
+    if value is None or value == "":
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"Node {node_uuid} rendezvous must be true or false.")
+    return value
+
+
+def validate_node_roles(preferences_by_uuid):
+    rendezvous_hosts = []
+    for node_uuid, preferences in preferences_by_uuid.items():
+        if "roles" in preferences or "role" in preferences:
+            apply_role_fields(preferences, node_uuid)
+        if "rendezvous" in preferences:
+            preferences["rendezvous"] = normalize_rendezvous(
+                preferences.get("rendezvous"), node_uuid
+            )
+        if preferences.get("rendezvous"):
+            roles = preferences.get("roles") or []
+            if "master" not in roles and preferences.get("role") != "master":
+                raise ValueError(f"Node {node_uuid} rendezvous host must be a master.")
+            rendezvous_hosts.append(node_uuid)
+    if len(rendezvous_hosts) > 1:
+        raise ValueError("Only one node can be the rendezvous host.")
+
+
+def published_ipv4(octet, cidr, current_ip):
+    network = ""
+    if isinstance(cidr, str) and "/" in cidr:
+        network = cidr.split("/", 1)[0].strip()
+    parts = network.split(".")
+    if octet and len(parts) == 4 and all(part.isdigit() and int(part) <= 255 for part in parts):
+        return ".".join(parts[:-1] + [str(int(octet))])
+    if isinstance(current_ip, str):
+        text = current_ip.strip().split("/", 1)[0]
+        ip_parts = text.split(".")
+        if len(ip_parts) == 4 and all(part.isdigit() and int(part) <= 255 for part in ip_parts):
+            return ".".join(str(int(part)) for part in ip_parts)
+    return ""
+
+
+def migrate_dc_addresses(blueprint, strict=False):
+    migrated = dict(blueprint)
+    for old_key, new_key in _RETIRED_DC_ADDRESS_FIELDS.items():
+        if old_key not in migrated:
+            continue
+        if new_key not in migrated:
+            octet = octet_from_address(migrated[old_key])
+            if octet is None:
+                if strict:
+                    raise ValueError(
+                        f"{old_key} is not an IPv4 address. Put the last octet in {new_key}."
+                    )
+            else:
+                migrated[new_key] = octet
+        migrated.pop(old_key, None)
+    for key in _DC_OCTET_FIELDS:
+        if key not in migrated:
+            continue
+        octet = bare_octet(migrated[key])
+        if octet is not None:
+            migrated[key] = octet
+    return migrated
+
+
+def migrate_blueprint(blueprint):
+    if not isinstance(blueprint, dict):
+        return {}
+    migrated = dict(blueprint)
+    for old_key, new_key in _RETIRED_BLUEPRINT_FIELDS.items():
+        if new_key not in migrated and old_key in migrated:
+            migrated[new_key] = migrated[old_key]
+        migrated.pop(old_key, None)
+    return migrate_dc_addresses(migrated)
+
+
+def canonicalize_dc_octets(blueprint):
+    canonical = dict(blueprint)
+    for key in _DC_OCTET_FIELDS:
+        octet = bare_octet(canonical.get(key))
+        if octet is None:
+            raise ValueError(f"Blueprint field {key} must be a last octet from 0 to 255.")
+        canonical[key] = octet
+    return canonical
+
+
+def device_names(value, label):
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"Blueprint {label} must be a list of strings.")
+    names = []
+    seen = set()
+    for item in value:
+        name = item.strip()
+        if not name:
+            continue
+        if any(character.isspace() for character in name):
+            raise ValueError(f"{label} entries are device names, one per line.")
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def canonicalize_genesis_devices(blueprint):
+    canonical = dict(blueprint)
+    nics = device_names(canonical.get("genesisNics", []), "genesisNics")
+    service_nic = canonical.get("genesisNic")
+    if isinstance(service_nic, str):
+        service_nic = service_nic.strip()
+        if service_nic and not any(character.isspace() for character in service_nic):
+            if service_nic not in nics:
+                nics.insert(0, service_nic)
+    canonical["genesisNics"] = nics
+    canonical["genesisDisks"] = device_names(
+        canonical.get("genesisDisks", []), "genesisDisks"
+    )
+    return canonical
+
+
+def blueprint_for_group_vars(incoming):
+    migrated = migrate_blueprint(incoming)
+    canonical = canonicalize_vips(
+        canonicalize_genesis_devices(
+            canonicalize_dc_octets(
+                {
+                    **DEFAULT_BLUEPRINT,
+                    **{key: value for key, value in migrated.items() if key in BLUEPRINT_FIELDS},
+                }
+            )
+        )
+    )
+    canonical["controlPlaneTopology"] = normalize_topology(
+        canonical.get("controlPlaneTopology")
+    )
+    return canonical
+
+
+def group_vars_document(blueprint):
+    document = {}
+    for key, value in blueprint.items():
+        if key in _DC_OCTET_FIELDS:
+            continue
+        if key in _OPTIONAL_BLANK_GROUP_VARS and isinstance(value, str) and not value.strip():
+            continue
+        document[key] = value
+    return document
+
+
+# A saved pull secret and SSH public key fill the review preview. Until
+# those files exist, the preview keeps the placeholder. Neither value is
+# written into inventory, group_vars, host_vars, or the database.
+_PREVIEW_SUPPLIED_LATER = "<supplied at install>"
+_PLAIN_SCALAR = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./+-]*")
+_PLAIN_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+_NUMERIC_SCALAR = re.compile(r"-?\d+(?:\.\d+)?")
+_RESERVED_SCALAR = {"true", "false", "null", "yes", "no", "on", "off", "~"}
+_agent_hosts_filter = None
+_agent_hosts_checked = False
+
+
+def load_agent_hosts():
+    global _agent_hosts_filter, _agent_hosts_checked
+    if _agent_hosts_checked:
+        return _agent_hosts_filter
+    _agent_hosts_checked = True
+    candidates = [APP_DIR / "agent_install.py"]
+    override = os.environ.get("AGENT_INSTALL_FILTER")
+    if override:
+        candidates.insert(0, Path(override))
+    candidates.append(
+        APP_DIR.parent
+        / "git-repos"
+        / "ansible"
+        / "ocp-ansible-playbooks"
+        / "playbooks"
+        / "filter_plugins"
+        / "agent_install.py"
+    )
+    for path in candidates:
+        if not path.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("ui_agent_install", path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        agent_hosts = getattr(module, "agent_hosts", None)
+        if callable(agent_hosts):
+            _agent_hosts_filter = agent_hosts
+            break
+    return _agent_hosts_filter
+
+
+def preview_key(key):
+    if _PLAIN_KEY.fullmatch(key):
+        return key
+    return json.dumps(key, ensure_ascii=False)
+
+
+def preview_scalar(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        if (
+            value
+            and "\n" not in value
+            and _PLAIN_SCALAR.fullmatch(value)
+            and value.lower() not in _RESERVED_SCALAR
+            and not _NUMERIC_SCALAR.fullmatch(value)
+        ):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+    raise ValueError(f"Unsupported preview value: {type(value).__name__}")
+
+
+def preview_lines(value, indent=0):
+    prefix = " " * indent
+    if isinstance(value, dict):
+        lines = []
+        for key, item in value.items():
+            rendered_key = preview_key(key)
+            if isinstance(item, dict):
+                if item:
+                    lines.append(f"{prefix}{rendered_key}:")
+                    lines.extend(preview_lines(item, indent + 2))
+                else:
+                    lines.append(f"{prefix}{rendered_key}: {{}}")
+            elif isinstance(item, list):
+                if item:
+                    lines.append(f"{prefix}{rendered_key}:")
+                    lines.extend(preview_lines(item, indent))
+                else:
+                    lines.append(f"{prefix}{rendered_key}: []")
+            else:
+                lines.append(f"{prefix}{rendered_key}: {preview_scalar(item)}")
+        return lines
+    if isinstance(value, list):
+        lines = []
+        for item in value:
+            if isinstance(item, dict) and item:
+                pairs = list(item.items())
+                first_key, first_value = pairs[0]
+                first_key_text = preview_key(first_key)
+                if isinstance(first_value, (dict, list)) and first_value:
+                    lines.append(f"{prefix}- {first_key_text}:")
+                    lines.extend(preview_lines(first_value, indent + 2))
+                elif isinstance(first_value, dict):
+                    lines.append(f"{prefix}- {first_key_text}: {{}}")
+                elif isinstance(first_value, list):
+                    lines.append(f"{prefix}- {first_key_text}: []")
+                else:
+                    lines.append(f"{prefix}- {first_key_text}: {preview_scalar(first_value)}")
+                for key, item_value in pairs[1:]:
+                    key_text = preview_key(key)
+                    nested_prefix = prefix + "  "
+                    if isinstance(item_value, (dict, list)) and item_value:
+                        lines.append(f"{nested_prefix}{key_text}:")
+                        child_indent = indent + 4 if isinstance(item_value, dict) else indent + 2
+                        lines.extend(preview_lines(item_value, child_indent))
+                    elif isinstance(item_value, dict):
+                        lines.append(f"{nested_prefix}{key_text}: {{}}")
+                    elif isinstance(item_value, list):
+                        lines.append(f"{nested_prefix}{key_text}: []")
+                    else:
+                        lines.append(f"{nested_prefix}{key_text}: {preview_scalar(item_value)}")
+            elif isinstance(item, list) and item:
+                lines.append(f"{prefix}-")
+                lines.extend(preview_lines(item, indent + 2))
+            else:
+                lines.append(f"{prefix}- {preview_scalar(item)}")
+        return lines
+    return [prefix + preview_scalar(value)]
+
+
+def preview_yaml(value):
+    return "\n".join(preview_lines(value)) + "\n"
+
+
+def render_install_document(result, pull_secret="", ssh_key=""):
+    document = {
+        "additionalTrustBundlePolicy": "Proxyonly",
+        "apiVersion": "v1",
+        "baseDomain": result["base_domain"],
+        "fips": True,
+        "imageDigestSources": [
+            {
+                "mirrors": [f"{result['edge_fqdn']}/ocp/openshift/release"],
+                "source": "quay.io/openshift-release-dev/ocp-v4.0-art-dev",
+            },
+            {
+                "mirrors": [f"{result['edge_fqdn']}/ocp/openshift/release-images"],
+                "source": "quay.io/openshift-release-dev/ocp-release",
+            },
+        ],
+        "compute": [
+            {
+                "architecture": "amd64",
+                "hyperthreading": "Enabled",
+                "name": "worker",
+                "replicas": result["worker_replicas"],
+            }
+        ],
+        "controlPlane": {
+            "architecture": "amd64",
+            "hyperthreading": "Enabled",
+            "name": "master",
+            "replicas": result["master_replicas"],
+        },
+        "metadata": {
+            "creationTimestamp": None,
+            "name": result["cluster_name"],
+        },
+        "networking": {
+            "clusterNetwork": [{"cidr": "10.128.0.0/14", "hostPrefix": 23}],
+            "machineNetwork": [{"cidr": result["machine_network_cidr"]}],
+            "networkType": "OVNKubernetes",
+            "serviceNetwork": ["172.30.0.0/16"],
+        },
+    }
+    if result["platform"] == "none":
+        document["platform"] = {"none": {}}
+    else:
+        document["platform"] = {
+            "baremetal": {
+                "apiVIPs": list(result["api_vips"]),
+                "ingressVIPs": list(result["ingress_vips"]),
+            }
+        }
+    document["publish"] = "External"
+    document["pullSecret"] = pull_secret or _PREVIEW_SUPPLIED_LATER
+    document["sshKey"] = ssh_key or _PREVIEW_SUPPLIED_LATER
+    ca_bundle = result.get("ca_cert_bundle")
+    if isinstance(ca_bundle, str) and ca_bundle.strip():
+        document["additionalTrustBundle"] = ca_bundle
+    return document
+
+
+def render_agent_document(result):
+    document = {
+        "apiVersion": "v1beta1",
+        "kind": "AgentConfig",
+        "metadata": {"name": result["cluster_name"]},
+        "rendezvousIP": result["rendezvous_ip"],
+    }
+    if result["ntp_sources"]:
+        document["additionalNTPSources"] = list(result["ntp_sources"])
+    document["hosts"] = [
+        {
+            "hostname": host["hostname"],
+            "role": host["role"],
+            "interfaces": [
+                {"name": iface["name"], "macAddress": iface["macAddress"]}
+                for iface in host["interfaces"]
+            ],
+            "rootDeviceHints": {
+                "serialNumber": host["root_device_hints"]["serialNumber"]
+            },
+            "networkConfig": host["network_config"],
+        }
+        for host in result["hosts"]
+    ]
+    return document
+
+
+def config_preview(blueprint, inventory_groups, host_vars, pull_secret="", ssh_key=""):
+    empty = {"installConfig": "", "agentConfig": "", "configPreviewError": ""}
+    agent_hosts = load_agent_hosts()
+    if agent_hosts is None:
+        empty["configPreviewError"] = "Install preview is unavailable."
+        return empty
+    ocp_hosts = inventory_groups.get(DEFAULT_ANSIBLE_GROUP) or {}
+    if not ocp_hosts:
+        empty["configPreviewError"] = "The inventory has no hosts in the ocp group."
+        return empty
+    try:
+        result = agent_hosts(
+            {
+                "blueprint": group_vars_document(blueprint),
+                "hosts": [
+                    {"name": name, "variables": host_vars[name]}
+                    for name in ocp_hosts
+                ],
+            }
+        )
+    except Exception:
+        empty["configPreviewError"] = "Install preview failed."
+        return empty
+    if not result.get("ok"):
+        empty["configPreviewError"] = result.get("error") or "Install preview failed."
+        return empty
+    empty["installConfig"] = preview_yaml(
+        render_install_document(result, pull_secret=pull_secret, ssh_key=ssh_key)
+    )
+    empty["agentConfig"] = preview_yaml(render_agent_document(result))
+    return empty
+
+
+DEFAULT_NODE_PREFERENCES = {
+    "netType": "single",
+    "singleNic": "eno5",
+    "singleVlanEnabled": True,
+    "singleVlanId": "281",
+    "bondVlanEnabled": True,
+    "bondVlanId": "281",
 }
 
 
@@ -342,22 +945,73 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# One lock for every request, so overlapping requests cannot interleave
+# a read-then-update of the same nodes.
+_UI_DB_LOCK = 8342751
+_JSON_EXTRACT = re.compile(
+    r"json_extract\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*'\$\.([A-Za-z_][A-Za-z0-9_]*)'\s*\)"
+)
+
+
+def translate_sql(sql):
+    if sql.strip() == "BEGIN IMMEDIATE":
+        return None
+    translated = _JSON_EXTRACT.sub(r"(\1::json ->> '\2')", sql)
+    if re.search(r"\bINSERT\s+OR\s+IGNORE\b", translated, re.IGNORECASE):
+        translated = re.sub(
+            r"\bINSERT\s+OR\s+IGNORE\b",
+            "INSERT",
+            translated,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        translated = translated.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+    return translated.replace("?", "%s")
+
+
+class DatabaseConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, sql, params=None):
+        translated = translate_sql(sql)
+        if translated is None:
+            return self._connection.execute("SELECT 1")
+        if params is None:
+            return self._connection.execute(translated)
+        return self._connection.execute(translated, params)
+
+
+def database_log_target():
+    if not DATABASE_URL:
+        return "PostgreSQL (DATABASE_URL is not set)"
+    parsed = urlparse(DATABASE_URL)
+    host = parsed.hostname or "database"
+    port = parsed.port or 5432
+    name = parsed.path.lstrip("/").split("?", 1)[0] or "database"
+    return f"PostgreSQL {host}:{port}/{name}"
+
+
 @contextmanager
 def connect_database():
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 10000")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is required.")
+    connection = psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+        row_factory=dict_row,
+    )
     try:
         with connection:
-            yield connection
+            connection.execute("SET lock_timeout = '10s'")
+            connection.execute("SELECT pg_advisory_xact_lock(%s)", (_UI_DB_LOCK,))
+            yield DatabaseConnection(connection)
     finally:
         connection.close()
 
 
 def initialize_database():
     with connect_database() as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS nodes (
@@ -382,15 +1036,23 @@ def initialize_database():
             """
         )
         connection.execute(
-            "INSERT OR IGNORE INTO app_settings (key, value_json) VALUES (?, ?)",
+            "INSERT INTO app_settings (key, value_json) VALUES (?, ?) "
+            "ON CONFLICT (key) DO NOTHING",
             ("blueprint", json.dumps(DEFAULT_BLUEPRINT)),
         )
         connection.execute(
-            "INSERT OR IGNORE INTO app_settings (key, value_json) VALUES (?, ?)",
+            "INSERT INTO app_settings (key, value_json) VALUES (?, ?) "
+            "ON CONFLICT (key) DO NOTHING",
             ("redfish_endpoints", json.dumps(DEFAULT_REDFISH_ENDPOINTS)),
         )
         columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(nodes)")
+            row["column_name"]
+            for row in connection.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'nodes'
+                """
+            )
         }
         if "serial_number" not in columns:
             connection.execute(
@@ -413,6 +1075,22 @@ def normalized_uuid(value):
         raise ValueError("A valid node UUID is required.") from None
 
 
+# The configurator install owns these trees. The UI writes its inventory
+# and install files only in its own workspace.
+RESERVED_OUTPUT_ROOTS = (
+    Path("/var/ocp-config"),
+    Path("/opt/ocp"),
+    Path("/etc/ansible"),
+)
+
+
+def reserved_output_root(path):
+    for root in RESERVED_OUTPUT_ROOTS:
+        if path == root or root in path.parents:
+            return root
+    return None
+
+
 def validate_output_directory(destination):
     if not isinstance(destination, str) or not destination.strip():
         raise ValueError("An absolute Ansible output directory is required.")
@@ -428,7 +1106,550 @@ def validate_output_directory(destination):
             f"Output directory must be inside the configured Ansible workspace "
             f"({working_root})."
         ) from None
+    reserved = reserved_output_root(destination_path)
+    if reserved is not None:
+        raise ValueError(
+            "Output directory is inside the configurator install "
+            f"({reserved}). Choose a workspace outside /var/ocp-config, "
+            "/opt/ocp, and /etc/ansible."
+        )
     return destination_path, working_root
+
+
+CLUSTER_INSTALL_DIRNAME = "cluster-install"
+_PULL_SECRET_NAME = "pull-secret.json"
+_PULL_SECRET_VAULT = "pull-secret.vault"
+_VAULT_VARIABLE = "ocp_pre_install_pull_secret_contents"
+_PRIVATE_KEY_NAME = "id_ed25519"
+_PUBLIC_KEY_NAME = "id_ed25519.pub"
+_MAX_PULL_SECRET_CHARS = 1024 * 1024
+_MAX_VAULT_CHARS = 2 * 1024 * 1024
+_VAULT_PASSWORD_MISSING = (
+    "The vault password file is not available, so the pull secret cannot be saved."
+)
+_VAULT_PASSWORD_REJECTED = "The vault password did not open the pull secret."
+_MAX_PUBLIC_KEY_CHARS = 16384
+_MAX_PRIVATE_KEY_BYTES = 65536
+_SSH_PUBLIC_KEY = re.compile(
+    r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/]+={0,3}(?: .*)?$"
+)
+_REJECTED_SECRET_MARKERS = ("a8c2744b", "e9bd34f4")
+_INSTALL_SECRET_POSTS = {
+    "/api/v1/install-secrets/pull-secret",
+    "/api/v1/install-secrets/ssh-key",
+    "/api/v1/install-secrets/ssh-public-key",
+}
+_PUBLIC_KEY_ERROR = (
+    "Paste one public key line that starts with ssh-ed25519, ssh-rsa, "
+    "or ecdsa-sha2-nistp256."
+)
+_PRIVATE_KEY_PASTE_ERROR = (
+    "That looks like a private key. Paste the public key, one line that "
+    "starts with ssh-ed25519, ssh-rsa, or ecdsa-sha2-nistp256."
+)
+
+
+def normalize_pull_secret(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(
+            "Paste the cluster pull secret, or choose the pull-secret.json file you downloaded."
+        )
+    if len(text) > _MAX_PULL_SECRET_CHARS:
+        raise ValueError("That pull secret is too large.")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise ValueError(
+            "The pull secret must be the JSON you downloaded, with an auths object."
+        ) from None
+    auths = parsed.get("auths") if isinstance(parsed, dict) else None
+    if not isinstance(auths, dict):
+        raise ValueError("The pull secret must be JSON with an auths object.")
+    if not auths:
+        raise ValueError("The pull secret needs at least one registry under auths.")
+    for name, entry in auths.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(entry, dict):
+            raise ValueError("Each auths entry must be an object keyed by a registry name.")
+    normalized = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+    if any(marker in normalized for marker in _REJECTED_SECRET_MARKERS):
+        raise ValueError("That pull secret is not accepted.")
+    return normalized
+
+
+def normalize_ssh_public_key(text):
+    if not isinstance(text, str):
+        raise ValueError(_PUBLIC_KEY_ERROR)
+    if "PRIVATE KEY" in text or "-----BEGIN" in text:
+        raise ValueError(_PRIVATE_KEY_PASTE_ERROR)
+    if len(text) > _MAX_PUBLIC_KEY_CHARS:
+        raise ValueError(_PUBLIC_KEY_ERROR)
+    line = text.strip()
+    if "\n" in line or not _SSH_PUBLIC_KEY.fullmatch(line):
+        raise ValueError(_PUBLIC_KEY_ERROR)
+    return line
+
+
+def install_secret_directory(destination):
+    if isinstance(destination, Path):
+        destination = str(destination)
+    destination_path, working_root = validate_output_directory(destination)
+    candidate = destination_path / CLUSTER_INSTALL_DIRNAME
+    if candidate.is_symlink():
+        raise ValueError("cluster-install cannot be a symbolic link.")
+    directory = candidate.resolve()
+    try:
+        directory.relative_to(working_root)
+    except ValueError:
+        raise ValueError("cluster-install resolves outside the Ansible workspace.") from None
+    return directory
+
+
+def _read_text_file(path, limit):
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        if path.stat().st_size > limit:
+            return None
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+
+def vault_password_bytes():
+    path = VAULT_PASSWORD_FILE
+    if not isinstance(path, Path):
+        path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        return b""
+    try:
+        return path.read_bytes().strip()
+    except OSError:
+        return b""
+
+
+def _vault_keys(password, salt):
+    # Ansible vault 1.1 derives a 32-byte AES key, a 32-byte HMAC key, and a 16-byte CTR nonce.
+    derived = hashlib.pbkdf2_hmac("sha256", password, salt, 10000, dklen=80)
+    return derived[:32], derived[32:64], derived[64:80]
+
+
+def encrypt_vault_envelope(plaintext, password):
+    if not isinstance(password, (bytes, bytearray)) or not password:
+        raise ValueError(_VAULT_PASSWORD_MISSING)
+    raw = plaintext.encode("utf-8")
+    salt = os.urandom(32)
+    key, mac_key, nonce = _vault_keys(bytes(password), salt)
+    # PKCS7 is part of the Ansible vault format even though the cipher is CTR.
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(raw) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.CTR(nonce)).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    digest = hmac.new(mac_key, ciphertext, hashlib.sha256).digest()
+    inner = b"\n".join((hexlify(salt), hexlify(digest), hexlify(ciphertext)))
+    outer = hexlify(inner).decode("ascii")
+    lines = ["$ANSIBLE_VAULT;1.1;AES256"]
+    lines.extend(outer[index:index + 80] for index in range(0, len(outer), 80))
+    return "\n".join(lines) + "\n"
+
+
+def decrypt_vault_envelope(envelope, password):
+    if not isinstance(password, (bytes, bytearray)) or not password:
+        raise ValueError(_VAULT_PASSWORD_MISSING)
+    lines = [line.strip() for line in envelope.splitlines() if line.strip()]
+    if not lines or not lines[0].startswith("$ANSIBLE_VAULT;") or "AES256" not in lines[0]:
+        raise ValueError("That file is not an Ansible vault secret.")
+    try:
+        inner = unhexlify("".join(lines[1:]))
+        salt_hex, digest_hex, cipher_hex = inner.split(b"\n", 2)
+        salt = unhexlify(salt_hex)
+        ciphertext = unhexlify(cipher_hex)
+        expected = unhexlify(digest_hex)
+    except (ValueError, TypeError):
+        raise ValueError("That file is not an Ansible vault secret.") from None
+    key, mac_key, nonce = _vault_keys(bytes(password), salt)
+    actual = hmac.new(mac_key, ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(actual, expected):
+        raise ValueError(_VAULT_PASSWORD_REJECTED)
+    decryptor = Cipher(algorithms.AES(key), modes.CTR(nonce)).decryptor()
+    padded = decryptor.update(ciphertext) + decryptor.finalize()
+    try:
+        unpadder = padding.PKCS7(128).unpadder()
+        raw = unpadder.update(padded) + unpadder.finalize()
+    except ValueError:
+        raise ValueError(_VAULT_PASSWORD_REJECTED) from None
+    return raw.decode("utf-8")
+
+
+def format_pull_secret_vault(plaintext, password):
+    envelope = encrypt_vault_envelope(plaintext, password).rstrip("\n")
+    indented = "\n".join(f"          {line}" for line in envelope.splitlines())
+    return f"{_VAULT_VARIABLE}: !vault |\n{indented}\n"
+
+
+def extract_vault_envelope(text):
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("$ANSIBLE_VAULT;"):
+            continue
+        body = [stripped]
+        for extra in lines[index + 1:]:
+            piece = extra.strip()
+            if not piece:
+                continue
+            if not re.fullmatch(r"[0-9a-fA-F]+", piece):
+                break
+            body.append(piece)
+        return "\n".join(body) + "\n"
+    raise ValueError("That file is not an Ansible vault secret.")
+
+
+def _vault_text_present(path):
+    text = _read_text_file(path, _MAX_VAULT_CHARS)
+    return bool(text and "$ANSIBLE_VAULT;" in text)
+
+
+def _open_pull_secret_text(text):
+    if "$ANSIBLE_VAULT;" in text:
+        try:
+            opened = decrypt_vault_envelope(extract_vault_envelope(text), vault_password_bytes())
+        except ValueError:
+            return ""
+        text = opened
+    try:
+        return normalize_pull_secret(text)
+    except ValueError:
+        return ""
+
+
+def _read_pull_secret(path):
+    text = _read_text_file(path, _MAX_PULL_SECRET_CHARS)
+    if text is None or "$ANSIBLE_VAULT;" in text:
+        return ""
+    return _open_pull_secret_text(text)
+
+
+def _read_vaulted_pull_secret(path):
+    text = _read_text_file(path, _MAX_VAULT_CHARS)
+    if text is None or "$ANSIBLE_VAULT;" not in text:
+        return ""
+    return _open_pull_secret_text(text)
+
+
+def _read_public_key(path):
+    text = _read_text_file(path, _MAX_PUBLIC_KEY_CHARS)
+    if text is None:
+        return ""
+    try:
+        return normalize_ssh_public_key(text)
+    except ValueError:
+        return ""
+
+
+def _private_key_stored(path):
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    return 0 < size <= _MAX_PRIVATE_KEY_BYTES
+
+
+def bundled_pull_secret_path():
+    path = BUNDLED_PULL_SECRET_FILE
+    if not isinstance(path, Path):
+        path = Path(path)
+    return path
+
+
+def bundled_pull_secret():
+    return _read_vaulted_pull_secret(bundled_pull_secret_path())
+
+
+def workspace_pull_secret(directory):
+    # A vault file saved for this workspace replaces the image copy. A
+    # plaintext pull-secret.json is still read when no vault file is present.
+    return (
+        _read_vaulted_pull_secret(directory / _PULL_SECRET_VAULT)
+        or _read_pull_secret(directory / _PULL_SECRET_NAME)
+    )
+
+
+def pull_secret_is_vaulted(destination):
+    paths = [bundled_pull_secret_path()]
+    try:
+        directory = install_secret_directory(destination)
+    except ValueError:
+        directory = None
+    if directory is not None:
+        paths.append(directory / _PULL_SECRET_VAULT)
+    return any(_vault_text_present(path) for path in paths)
+
+
+def _secret_status(directory):
+    workspace_secret = workspace_pull_secret(directory)
+    built_in_secret = bundled_pull_secret()
+    return {
+        "pullSecretStored": _vault_text_present(directory / _PULL_SECRET_VAULT) or bool(
+            _read_pull_secret(directory / _PULL_SECRET_NAME)
+        ),
+        "pullSecretBuiltIn": _vault_text_present(bundled_pull_secret_path()),
+        "pullSecretReady": bool(workspace_secret or built_in_secret),
+        "vaultPasswordAvailable": bool(vault_password_bytes()),
+        "privateKeyStored": _private_key_stored(directory / _PRIVATE_KEY_NAME),
+        "sshPublicKey": _read_public_key(directory / _PUBLIC_KEY_NAME),
+    }
+
+
+def install_secret_status(destination):
+    return _secret_status(install_secret_directory(destination))
+
+
+def stored_install_material(destination):
+    try:
+        directory = install_secret_directory(destination)
+    except ValueError:
+        return "", ""
+    # The image copy stays in the image. It is not written into the workspace.
+    pull_secret = workspace_pull_secret(directory) or bundled_pull_secret()
+    return pull_secret, _read_public_key(directory / _PUBLIC_KEY_NAME)
+
+
+def write_secret_file(path, data, mode):
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    parent = path.parent
+    if parent.is_symlink() or path.is_symlink():
+        raise InstallSecretError("Refusing to write through a symbolic link.")
+    temporary = parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    fd = None
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(parent, 0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(temporary, flags, mode)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("Could not finish writing the install secret.")
+            view = view[written:]
+        os.fchmod(fd, mode)
+        os.close(fd)
+        fd = None
+        os.replace(temporary, path)
+        os.chmod(path, mode)
+    except InstallSecretError:
+        raise
+    except OSError as error:
+        raise InstallSecretError("Could not store the install secret.") from error
+    finally:
+        if fd is not None:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
+
+
+def save_pull_secret(destination, pull_secret):
+    normalized = normalize_pull_secret(pull_secret)
+    password = vault_password_bytes()
+    if not password:
+        raise ValueError(_VAULT_PASSWORD_MISSING)
+    directory = install_secret_directory(destination)
+    legacy = directory / _PULL_SECRET_NAME
+    if legacy.is_symlink():
+        raise ValueError("pull-secret.json cannot be a symbolic link.")
+    vault_path = directory / _PULL_SECRET_VAULT
+    if vault_path.is_symlink():
+        raise ValueError("pull-secret.vault cannot be a symbolic link.")
+    write_secret_file(
+        vault_path,
+        format_pull_secret_vault(normalized, password),
+        0o600,
+    )
+    if legacy.is_file():
+        legacy.unlink()
+    return _secret_status(directory)
+
+
+def save_ssh_public_key(destination, public_key, replace=False):
+    if not isinstance(replace, bool):
+        raise ValueError("replace must be true or false.")
+    normalized = normalize_ssh_public_key(public_key)
+    directory = install_secret_directory(destination)
+    private_path = directory / _PRIVATE_KEY_NAME
+    current = _read_public_key(directory / _PUBLIC_KEY_NAME)
+    private_stored = _private_key_stored(private_path)
+    if private_stored and current != normalized and not replace:
+        raise InstallSecretError(
+            "An SSH private key is already stored. Confirm replace to use a different "
+            "public key. The stored private key will be removed.",
+            status=409,
+        )
+    if private_stored and current != normalized and replace:
+        try:
+            private_path.unlink()
+        except OSError as error:
+            raise InstallSecretError("Could not store the install secret.") from error
+    write_secret_file(directory / _PUBLIC_KEY_NAME, normalized + "\n", 0o644)
+    return _secret_status(directory)
+
+
+def generate_cluster_ssh_key(destination, replace=False):
+    if not isinstance(replace, bool):
+        raise ValueError("replace must be true or false.")
+    directory = install_secret_directory(destination)
+    private_path = directory / _PRIVATE_KEY_NAME
+    if _private_key_stored(private_path) and not replace:
+        raise InstallSecretError(
+            "An SSH key is already stored. Confirm that you want to replace it.",
+            status=409,
+        )
+    keygen = shutil.which("ssh-keygen")
+    if not keygen:
+        raise InstallSecretError(
+            "This UI cannot create an SSH key because ssh-keygen is not installed. "
+            "Paste a public key instead.",
+            status=503,
+        )
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        with tempfile.TemporaryDirectory(dir=directory) as temporary_name:
+            temp_private = Path(temporary_name) / _PRIVATE_KEY_NAME
+            completed = subprocess.run(
+                [
+                    keygen,
+                    "-q",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-C",
+                    "ocp",
+                    "-f",
+                    str(temp_private),
+                ],
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+            temp_public = Path(str(temp_private) + ".pub")
+            if completed.returncode != 0 or not temp_private.is_file() or not temp_public.is_file():
+                raise InstallSecretError("Could not create an SSH key.", status=500)
+            private_bytes = temp_private.read_bytes()
+            public_text = normalize_ssh_public_key(temp_public.read_text(encoding="utf-8"))
+            if b"PRIVATE KEY" not in private_bytes or len(private_bytes) > _MAX_PRIVATE_KEY_BYTES:
+                raise InstallSecretError("Could not create an SSH key.", status=500)
+            write_secret_file(private_path, private_bytes, 0o600)
+            write_secret_file(directory / _PUBLIC_KEY_NAME, public_text + "\n", 0o644)
+    except InstallSecretError:
+        raise
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise InstallSecretError("Could not create an SSH key.", status=500) from error
+    return _secret_status(directory)
+
+
+_INSTALL_CONFIG_NAME = "install-config.yaml"
+_AGENT_CONFIG_NAME = "agent-config.yaml"
+_INSTALL_FILES_NEED_SECRETS = (
+    "Save a pull secret and an SSH public key on the Blueprint page. "
+    "Generate again to write install-config.yaml and agent-config.yaml."
+)
+_INSTALL_FILES_NEED_PULL_SECRET = (
+    "Paste a pull secret on the Blueprint page. "
+    "Generate again to write install-config.yaml and agent-config.yaml."
+)
+_INSTALL_FILES_NEED_SSH = (
+    "Save an SSH public key on the Blueprint page. "
+    "Generate again to write install-config.yaml and agent-config.yaml."
+)
+
+
+def install_files_gap_message(pull_secret, ssh_key, destination):
+    if not pull_secret and pull_secret_is_vaulted(destination):
+        if vault_password_bytes():
+            vault_text = "The vault password did not open the pull secret."
+        else:
+            vault_text = (
+                "The pull secret is in the Ansible vault. "
+                "Provide the vault password file."
+            )
+        if ssh_key:
+            return (
+                vault_text
+                + " Generate again to write install-config.yaml and agent-config.yaml."
+            )
+        return (
+            vault_text
+            + " An SSH public key is also required."
+            + " Generate again to write install-config.yaml and agent-config.yaml."
+        )
+    if not pull_secret and not ssh_key:
+        return _INSTALL_FILES_NEED_SECRETS
+    if not pull_secret:
+        return _INSTALL_FILES_NEED_PULL_SECRET
+    if not ssh_key:
+        return _INSTALL_FILES_NEED_SSH
+    return ""
+
+
+def remove_install_configs(destination):
+    try:
+        directory = install_secret_directory(destination)
+    except ValueError:
+        return
+    if not directory.is_dir():
+        return
+    for name in (_INSTALL_CONFIG_NAME, _AGENT_CONFIG_NAME):
+        path = directory / name
+        if path.is_symlink():
+            raise ValueError(f"{name} cannot be a symbolic link.")
+        if path.is_file():
+            path.unlink()
+
+
+def write_install_configs(destination, install_text, agent_text):
+    directory = install_secret_directory(destination)
+    install_path = directory / _INSTALL_CONFIG_NAME
+    agent_path = directory / _AGENT_CONFIG_NAME
+    write_secret_file(install_path, install_text, 0o600)
+    try:
+        write_secret_file(agent_path, agent_text, 0o644)
+    except Exception:
+        if install_path.is_file() and not install_path.is_symlink():
+            install_path.unlink()
+        raise
+    return install_path, agent_path
+
+
+def read_private_key(destination):
+    directory = install_secret_directory(destination)
+    path = directory / _PRIVATE_KEY_NAME
+    if not _private_key_stored(path):
+        raise InstallSecretError(
+            "No private key is stored. Create one, or paste a public key you already have.",
+            status=404,
+        )
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise InstallSecretError("The stored private key could not be read.", status=500) from error
+    if b"PRIVATE KEY" not in data:
+        raise InstallSecretError("The stored private key could not be read.", status=500)
+    return data
+
+
+def install_secret_request(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Request must contain an object.")
+    replace = payload.get("replace", False)
+    if not isinstance(replace, bool):
+        raise ValueError("replace must be true or false.")
+    return payload.get("outputDirectory"), replace
 
 
 def parse_inspection(payload, path_uuid=None):
@@ -539,6 +1760,30 @@ def yaml_dump(value, indent=0):
     return prefix + yaml_scalar(value)
 
 
+def remove_replaced_host_vars(output_root, generated_files):
+    """Drop host var files from the previous generation.
+
+    The UI owns host_vars/*.yml under the generated directory. A later
+    generation is the current Ansible inventory, so a renamed or removed
+    host must not leave its old file behind. Other files, including
+    group_vars the operator added, stay in place.
+    """
+    directory = output_root / "host_vars"
+    if not directory.is_dir():
+        return
+    for existing in directory.iterdir():
+        if existing.is_symlink() or not existing.is_file() or existing.suffix != ".yml":
+            continue
+        relative = f"host_vars/{existing.name}"
+        if relative in generated_files:
+            continue
+        try:
+            existing.resolve().relative_to(output_root)
+        except ValueError:
+            continue
+        existing.unlink()
+
+
 class ApiHandler(BaseHTTPRequestHandler):
     server_version = "OcpMetalUI/1.0"
 
@@ -553,6 +1798,29 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def send_attachment(self, filename, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def discard_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return
+        if 0 < length <= MAX_REQUEST_BYTES:
+            self.rfile.read(length)
+
+    def query_value(self, name):
+        values = parse_qs(urlparse(self.path).query).get(name) or []
+        if len(values) != 1 or not isinstance(values[0], str) or not values[0]:
+            raise ValueError(f"{name} is required.")
+        return values[0]
 
     def read_json(self):
         try:
@@ -588,11 +1856,38 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "outputDirectory": settings.get(
                         "output_directory", str(ANSIBLE_WORKING_DIR.resolve())
                     ),
-                    "blueprint": {**DEFAULT_BLUEPRINT, **settings["blueprint"]},
+                    "blueprint": canonicalize_vips(
+                        canonicalize_genesis_devices(
+                            {
+                                **DEFAULT_BLUEPRINT,
+                                **migrate_blueprint(settings["blueprint"]),
+                            }
+                        )
+                    ),
                     "redfishEndpoints": settings["redfish_endpoints"],
                     "httpsEnabled": bool(TLS_CERT_FILE and TLS_KEY_FILE),
                 },
             )
+            return
+        if path == "/api/v1/install-secrets":
+            try:
+                self.send_json(200, install_secret_status(self.query_value("outputDirectory")))
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+            return
+        if path == "/api/v1/install-secrets/ssh-private-key":
+            if not isinstance(self.connection, ssl.SSLSocket):
+                self.send_json(
+                    426,
+                    {"error": "Pull secrets and SSH keys are accepted only over HTTPS."},
+                )
+                return
+            try:
+                self.send_attachment("id_ed25519", read_private_key(self.query_value("outputDirectory")))
+            except InstallSecretError as error:
+                self.send_json(error.status, {"error": str(error)})
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
             return
         if path == "/api/v1/nodes":
             with connect_database() as connection:
@@ -634,6 +1929,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path in _INSTALL_SECRET_POSTS and not isinstance(self.connection, ssl.SSLSocket):
+            self.discard_body()
+            self.send_json(
+                426,
+                {"error": "Pull secrets and SSH keys are accepted only over HTTPS."},
+            )
+            return
         try:
             payload = self.read_json()
             if path == "/api/v1/inspections":
@@ -651,14 +1953,34 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.assign_discovered_nodes(payload)
             elif path == "/api/v1/redfish/retrieve":
                 self.retrieve_redfish_endpoint(payload)
+            elif path == "/api/v1/install-secrets/pull-secret":
+                if not isinstance(payload, dict):
+                    raise ValueError("Request must contain an object.")
+                self.send_json(
+                    200,
+                    save_pull_secret(payload.get("outputDirectory"), payload.get("pullSecret")),
+                )
+            elif path == "/api/v1/install-secrets/ssh-key":
+                destination, replace = install_secret_request(payload)
+                self.send_json(200, generate_cluster_ssh_key(destination, replace=replace))
+            elif path == "/api/v1/install-secrets/ssh-public-key":
+                destination, replace = install_secret_request(payload)
+                self.send_json(
+                    200,
+                    save_ssh_public_key(
+                        destination, payload.get("sshPublicKey"), replace=replace
+                    ),
+                )
             else:
                 self.send_json(404, {"error": "Not found."})
+        except InstallSecretError as error:
+            self.send_json(error.status, {"error": str(error)})
         except RedfishError as error:
             self.send_json(502, {"error": str(error)})
         except ValueError as error:
             self.send_json(400, {"error": str(error)})
-        except sqlite3.Error:
-            self.send_json(500, {"error": "SQLite operation failed."})
+        except psycopg.Error:
+            self.send_json(500, {"error": "Database operation failed."})
         except OSError as error:
             self.send_json(500, {"error": f"Unable to commit Ansible files: {error}"})
 
@@ -669,16 +1991,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.save_configuration(self.read_json())
             except ValueError as error:
                 self.send_json(400, {"error": str(error)})
-            except sqlite3.Error:
-                self.send_json(500, {"error": "SQLite operation failed."})
+            except psycopg.Error:
+                self.send_json(500, {"error": "Database operation failed."})
             return
         if path == "/api/v1/redfish/endpoints":
             try:
                 self.save_redfish_endpoints(self.read_json())
             except ValueError as error:
                 self.send_json(400, {"error": str(error)})
-            except sqlite3.Error:
-                self.send_json(500, {"error": "SQLite operation failed."})
+            except psycopg.Error:
+                self.send_json(500, {"error": "Database operation failed."})
             return
         if path != "/api/v1/nodes/preferences":
             self.send_json(404, {"error": "Not found."})
@@ -698,6 +2020,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise ValueError(
                         f"Unsupported preference field(s): {', '.join(sorted(unknown_fields))}"
                     )
+                if "roles" in value or "role" in value:
+                    apply_role_fields(value, node_uuid)
+                if "rendezvous" in value:
+                    value["rendezvous"] = normalize_rendezvous(value.get("rendezvous"), node_uuid)
+                if "ipv4LastOctet" in value:
+                    value["ipv4LastOctet"] = optional_octet(
+                        value["ipv4LastOctet"], f"Last octet for {node_uuid}"
+                    )
                 normalized[node_uuid] = json.dumps(value, ensure_ascii=False)
 
             with connect_database() as connection:
@@ -713,6 +2043,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 for node_uuid, value in normalized.items():
                     rows[node_uuid].update(json.loads(value))
                 validate_unique_ansible_hosts(rows)
+                validate_node_roles(rows)
                 for node_uuid, value in normalized.items():
                     connection.execute(
                         "UPDATE nodes SET preferences_json = ?, updated_at = ? WHERE uuid = ?",
@@ -721,8 +2052,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"saved": len(normalized)})
         except ValueError as error:
             self.send_json(400, {"error": str(error)})
-        except sqlite3.Error:
-            self.send_json(500, {"error": "SQLite operation failed."})
+        except psycopg.Error:
+            self.send_json(500, {"error": "Database operation failed."})
 
     def do_DELETE(self):
         path = urlparse(self.path).path
@@ -769,8 +2100,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"status": "deleted", "uuid": node_uuid})
         except ValueError as error:
             self.send_json(400, {"error": str(error)})
-        except sqlite3.Error:
-            self.send_json(500, {"error": "SQLite operation failed."})
+        except psycopg.Error:
+            self.send_json(500, {"error": "Database operation failed."})
 
     def save_configuration(self, payload):
         if not isinstance(payload, dict):
@@ -781,6 +2112,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ValueError("Request must contain a blueprint object.")
         if not isinstance(preferences_payload, dict):
             raise ValueError("Preferences must be an object keyed by node UUID.")
+        blueprint = migrate_dc_addresses(blueprint, strict=True)
         unknown_blueprint_fields = set(blueprint) - BLUEPRINT_FIELDS
         if unknown_blueprint_fields:
             raise ValueError(
@@ -795,19 +2127,38 @@ class ApiHandler(BaseHTTPRequestHandler):
             ).fetchone()
         normalized_blueprint = {
             **DEFAULT_BLUEPRINT,
-            **(json.loads(stored_blueprint["value_json"]) if stored_blueprint else {}),
+            **migrate_blueprint(
+                json.loads(stored_blueprint["value_json"]) if stored_blueprint else {}
+            ),
             **blueprint,
         }
+        normalized_blueprint = canonicalize_genesis_devices(
+            canonicalize_dc_octets(normalized_blueprint)
+        )
         for key in (
             "clusterName",
             "baseDomain",
             "controlPlaneTopology",
             "caCertBundle",
             "machineNetworkCidr",
+            "genesisHostname",
+            "genesisIp",
+            "genesisNic",
+            "networkGateway",
+            "mgmtNetworkCidr",
+            "mgmtVlan",
+            "mgmtDc01Octet",
+            "mgmtDc02Octet",
+            "apiVip",
+            "ingressVip",
         ):
             if not isinstance(normalized_blueprint[key], str):
                 raise ValueError(f"Blueprint field {key} must be a string.")
-        for key in ("mirrorRegistries", "dnsServers", "ntpServers"):
+        normalized_blueprint = canonicalize_vips(normalized_blueprint)
+        normalized_blueprint["controlPlaneTopology"] = normalize_topology(
+            normalized_blueprint.get("controlPlaneTopology")
+        )
+        for key in ("mirrorRegistries", "dnsServers", "ntpServers", "genesisNics", "genesisDisks"):
             if not isinstance(normalized_blueprint[key], list) or any(
                 not isinstance(value, str) for value in normalized_blueprint[key]
             ):
@@ -822,6 +2173,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             if unknown_fields:
                 raise ValueError(
                     f"Unsupported preference field(s): {', '.join(sorted(unknown_fields))}"
+                )
+            if "ipv4LastOctet" in preferences:
+                preferences["ipv4LastOctet"] = optional_octet(
+                    preferences["ipv4LastOctet"],
+                    f"Last octet for {normalized_uuid_value}",
+                )
+            if "roles" in preferences or "role" in preferences:
+                apply_role_fields(preferences, normalized_uuid_value)
+            if "rendezvous" in preferences:
+                preferences["rendezvous"] = normalize_rendezvous(
+                    preferences.get("rendezvous"), normalized_uuid_value
                 )
             normalized_preferences[normalized_uuid_value] = preferences
 
@@ -841,6 +2203,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 saved_preferences = rows[node_uuid]
                 saved_preferences.update(incoming_preferences)
             validate_unique_ansible_hosts(rows)
+            validate_node_roles(rows)
             for node_uuid, incoming_preferences in normalized_preferences.items():
                 saved_preferences = rows[node_uuid]
                 connection.execute(
@@ -1259,13 +2622,19 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def build_ansible_files(self, payload):
         blueprint, inventory_groups, host_vars = self.prepare_ansible_files(payload)
+        return self.ansible_file_map(blueprint, inventory_groups, host_vars)
+
+    def ansible_file_map(self, blueprint, inventory_groups, host_vars):
         files = {
             "inventory.yml": self.build_inventory(inventory_groups),
         }
-        for group in sorted(inventory_groups):
-            files[f"group_vars/{group}.yml"] = yaml_dump(
-                {"cluster_blueprint": blueprint}
-            ) + "\n"
+        # group_vars/ocp.yml is the file Ansible loads for the ocp group.
+        # The management last octets are host vars, so they are left out.
+        # The mgmt group does not get a copy of the cluster blueprint.
+        if DEFAULT_ANSIBLE_GROUP in inventory_groups:
+            files[f"group_vars/{DEFAULT_ANSIBLE_GROUP}.yml"] = (
+                yaml_dump(group_vars_document(blueprint)) + "\n"
+            )
         for hostname, variables in sorted(host_vars.items()):
             files[f"host_vars/{hostname}.yml"] = yaml_dump(variables) + "\n"
         return files
@@ -1274,10 +2643,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         blueprint = payload.get("blueprint") if isinstance(payload, dict) else None
         if not isinstance(blueprint, dict):
             raise ValueError("Request must contain a blueprint object.")
-        blueprint = {
-            **DEFAULT_BLUEPRINT,
-            **{key: value for key, value in blueprint.items() if key in BLUEPRINT_FIELDS},
-        }
+        blueprint = blueprint_for_group_vars(blueprint)
         with connect_database() as connection:
             rows = connection.execute(
                 "SELECT uuid, bmc_address, serial_number, inventory_json, preferences_json, "
@@ -1288,6 +2654,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         host_vars = {}
         seen_hosts = set()
         seen_serials = set()
+        merged_preferences = {}
         preferences_payload = payload.get("preferences", {})
         if not isinstance(preferences_payload, dict):
             raise ValueError("Preferences must be an object keyed by node UUID.")
@@ -1305,6 +2672,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                     f"Unsupported preference field(s): {', '.join(sorted(unknown_fields))}"
                 )
             preferences.update(incoming_preferences)
+            apply_role_fields(preferences, node_uuid)
+            merged_preferences[node_uuid] = preferences
+            node_defaults = dict(DEFAULT_NODE_PREFERENCES)
+            genesis_nic = blueprint.get("genesisNic")
+            if isinstance(genesis_nic, str) and genesis_nic.strip():
+                node_defaults["singleNic"] = genesis_nic.strip()
+            for key, value in node_defaults.items():
+                preferences.setdefault(key, value)
             if not is_placeholder and not serial_number:
                 source_name = "Redfish BMC" if row["source"] == "redfish" else "IPA report"
                 raise ValueError(
@@ -1335,9 +2710,35 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "node_preferences": {
                     key: value
                     for key, value in preferences.items()
-                    if key in PREFERENCE_FIELDS and key != "ansibleHost"
+                    if key in PREFERENCE_FIELDS and key not in _HOST_LEVEL_PREFERENCES
                 },
             }
+            roles = preferences.get("roles") or []
+            if roles:
+                variables["roles"] = roles
+            role = preferences.get("role") or ""
+            if role:
+                variables["role"] = role
+            if "rendezvous" in preferences:
+                variables["rendezvous"] = normalize_rendezvous(
+                    preferences.get("rendezvous"), node_uuid
+                )
+            octet = ""
+            if "ipv4LastOctet" in preferences:
+                octet = optional_octet(
+                    preferences.get("ipv4LastOctet"),
+                    f"Last octet for {ansible_host}",
+                )
+                if octet:
+                    variables["ipv4LastOctet"] = octet
+            current_ip = ""
+            if not is_placeholder:
+                inventory = json.loads(row["inventory_json"])
+                if isinstance(inventory, dict):
+                    current_ip = inventory.get("current_ip") or ""
+            address = published_ipv4(octet, blueprint.get("machineNetworkCidr"), current_ip)
+            if address:
+                variables["ipv4_ip"] = address
             if is_placeholder:
                 variables["node_status"] = "awaiting_ipa"
             else:
@@ -1356,6 +2757,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 variables[inventory_key] = json.loads(row["inventory_json"])
             host_vars[ansible_host] = variables
+
+        validate_node_roles(merged_preferences)
+
+        for hostname, octet_field in _MGMT_HOSTS:
+            if hostname in seen_hosts:
+                raise ValueError(f"{hostname} is reserved for the management DNS host.")
+            seen_hosts.add(hostname)
+            inventory_groups.setdefault(_MGMT_GROUP, {})[hostname] = {}
+            host_vars[hostname] = {"ipv4LastOctet": blueprint[octet_field]}
 
         return blueprint, inventory_groups, host_vars
 
@@ -1382,6 +2792,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             node_uuid = normalized_uuid(node_uuid)
             if not isinstance(preferences, dict):
                 raise ValueError(f"Preferences for {node_uuid} must be an object.")
+            if "roles" in preferences or "role" in preferences:
+                apply_role_fields(preferences, node_uuid)
             normalized_preferences[node_uuid] = json.dumps(preferences, ensure_ascii=False)
 
         with connect_database() as connection:
@@ -1393,15 +2805,23 @@ class ApiHandler(BaseHTTPRequestHandler):
         if missing:
             raise ValueError(f"Unknown node UUID(s): {', '.join(sorted(missing))}")
 
-        files = self.build_ansible_files(payload)
-        blueprint = {
-            **DEFAULT_BLUEPRINT,
-            **{
-                key: value
-                for key, value in payload["blueprint"].items()
-                if key in BLUEPRINT_FIELDS
-            },
-        }
+        blueprint, inventory_groups, host_vars = self.prepare_ansible_files(payload)
+        files = self.ansible_file_map(blueprint, inventory_groups, host_vars)
+        pull_secret, ssh_key = stored_install_material(destination_path)
+        try:
+            preview = config_preview(
+                blueprint,
+                inventory_groups,
+                host_vars,
+                pull_secret=pull_secret,
+                ssh_key=ssh_key,
+            )
+        except Exception:
+            preview = {
+                "installConfig": "",
+                "agentConfig": "",
+                "configPreviewError": "Install preview failed.",
+            }
         output_candidate = destination_path / ANSIBLE_OUTPUT_SUBDIR
         if output_candidate.is_symlink():
             raise ValueError("Generated output directory cannot be a symbolic link.")
@@ -1428,6 +2848,31 @@ class ApiHandler(BaseHTTPRequestHandler):
                 temporary_path.replace(target)
             finally:
                 temporary_path.unlink(missing_ok=True)
+        remove_replaced_host_vars(output_root, set(files))
+
+        install_config_file = ""
+        agent_config_file = ""
+        install_files_message = ""
+        ready_to_write = (
+            not preview["configPreviewError"]
+            and preview["installConfig"]
+            and preview["agentConfig"]
+            and _PREVIEW_SUPPLIED_LATER not in preview["installConfig"]
+        )
+        if ready_to_write and pull_secret and ssh_key:
+            install_path, agent_path = write_install_configs(
+                destination_path,
+                preview["installConfig"],
+                preview["agentConfig"],
+            )
+            install_config_file = str(install_path)
+            agent_config_file = str(agent_path)
+        else:
+            remove_install_configs(destination_path)
+            if not preview["configPreviewError"] and preview["installConfig"]:
+                install_files_message = install_files_gap_message(
+                    pull_secret, ssh_key, destination_path
+                )
 
         with connect_database() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1453,6 +2898,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "outputDirectory": str(output_root),
                 "files": sorted(files),
                 "inventoryFile": str(output_root / "inventory.yml"),
+                "installConfig": preview["installConfig"],
+                "agentConfig": preview["agentConfig"],
+                "configPreviewError": preview["configPreviewError"],
+                "installConfigFile": install_config_file,
+                "agentConfigFile": agent_config_file,
+                "installFilesMessage": install_files_message,
             },
         )
 
@@ -1492,7 +2943,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     os.umask(0o002)
     initialize_database()
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.environ.get("PORT", "3003"))
     host = os.environ.get("HOST", "0.0.0.0")
     if bool(TLS_CERT_FILE) != bool(TLS_KEY_FILE):
         raise RuntimeError("TLS_CERT_FILE and TLS_KEY_FILE must be configured together.")
@@ -1505,6 +2956,6 @@ if __name__ == "__main__":
         protocol = "HTTPS"
     print(
         f"Serving OCP Metal UI on {protocol} {host}:{port}; "
-        f"SQLite database: {DATABASE_PATH}"
+        f"database: {database_log_target()}"
     )
     httpd.serve_forever()

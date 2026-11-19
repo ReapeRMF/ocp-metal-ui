@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-https://127.0.0.1:8080}"
+BASE_URL="${BASE_URL:-https://127.0.0.1:3003}"
 TLS_CA_FILE="${TLS_CA_FILE:-}"
 CHROME_BIN="${CHROME_BIN:-google-chrome}"
 BROWSER_TIMEOUT="${BROWSER_TIMEOUT:-30}"

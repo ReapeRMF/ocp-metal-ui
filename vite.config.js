@@ -7,7 +7,7 @@ export default defineConfig({
     host: true, // Exposes the server on the local network automatically
     port: 5173,
     proxy: {
-      '/api': 'http://localhost:8080'
+      '/api': 'http://localhost:3003'
     },
     fs: { strict: false }
   },

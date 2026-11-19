@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "========================================================="
-echo "🔴 Disconnected Phase: Deploying ocp-metal-UI with SQLite"
+echo "🔴 Disconnected Phase: Deploying the airgap UI"
 echo "========================================================="
 
 if command -v podman &> /dev/null; then ENGINE="podman";
@@ -54,11 +54,16 @@ else
       echo "❌ Error: openssl is required to create the default HTTPS certificate." >&2
       exit 1
     fi
+    san="DNS:localhost,DNS:${TLS_HOSTNAME},IP:127.0.0.1"
+    if [[ "${BIND_ADDRESS:-}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
+      && [ "$BIND_ADDRESS" != "0.0.0.0" ] && [ "$BIND_ADDRESS" != "127.0.0.1" ]; then
+      san="${san},IP:${BIND_ADDRESS}"
+    fi
     openssl req -x509 -newkey rsa:3072 -sha256 -days 365 -nodes \
       -keyout "$TLS_KEY_HOST_FILE" \
       -out "$TLS_CERT_HOST_FILE" \
       -subj "/CN=$TLS_HOSTNAME" \
-      -addext "subjectAltName=DNS:localhost,DNS:$TLS_HOSTNAME,IP:127.0.0.1" \
+      -addext "subjectAltName=${san}" \
       -addext "basicConstraints=critical,CA:TRUE" \
       -addext "keyUsage=critical,digitalSignature,keyCertSign,cRLSign" \
       -addext "extendedKeyUsage=serverAuth"
@@ -106,17 +111,161 @@ TLS_ARGS=(
   -e TLS_KEY_FILE=/tls/tls.key
 )
 
-# 1. Load the pre-baked application image directly into local storage
+# 1. Load the pre-baked application image directly into local storage.
+# The connected build stores the tar under container_images/ and this
+# script at the payload root. A tar beside the script still wins.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+BUNDLE_FILE=""
+for candidate in \
+  "$SCRIPT_DIR/ocp-metal-ui-engine-bundle.tar" \
+  "$SCRIPT_DIR/container_images/ocp-metal-ui-engine-bundle.tar" \
+  "${PWD}/ocp-metal-ui-engine-bundle.tar"
+do
+  if [ -f "$candidate" ]; then
+    BUNDLE_FILE="$candidate"
+    break
+  fi
+done
+if [ -z "$BUNDLE_FILE" ]; then
+  echo "❌ Error: ocp-metal-ui-engine-bundle.tar was not found beside this script or in container_images/." >&2
+  exit 1
+fi
 echo "⚙️ Ingesting pre-baked application image matrix..."
-$ENGINE load -i ocp-metal-ui-engine-bundle.tar
+$ENGINE load -i "$BUNDLE_FILE"
+
+# The UI starts before the edge play, so this script loads the same
+# PostgreSQL image Quay will use and starts a second container. Quay
+# keeps port 5432 and the quay database. This container publishes
+# 127.0.0.1:5433 only.
+start_ui_database() {
+  local image_tar image data_dir init_dir credentials publish
+  local db_host db_port ready state ui_env app_password admin_password
+  image_tar="${POSTGRES_IMAGE_TAR:-/var/lib/edge-images/postgresql/postgresql.tar}"
+  image="${POSTGRES_IMAGE:-registry.access.redhat.com/hi/postgresql:latest}"
+  data_dir="${UI_DB_DIR:-/var/lib/ocp-metal-ui/postgres}"
+  init_dir="${UI_DB_INIT_DIR:-/var/lib/ocp-metal-ui/db-init}"
+  credentials="${UI_DB_CREDENTIALS:-/var/lib/ocp-metal-ui/db.env}"
+  publish="${UI_DB_PUBLISH:-127.0.0.1:5433}"
+  ui_env="$(dirname "$credentials")/ui.env"
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "❌ Error: start the UI database as root. $data_dir is owned by uid 999." >&2
+    exit 1
+  fi
+  if ! $ENGINE image exists "$image"; then
+    if ! $ENGINE image exists registry.access.redhat.com/hi/postgresql:latest; then
+      if [ ! -s "$image_tar" ]; then
+        echo "❌ Error: PostgreSQL image $image is not loaded and $image_tar is missing." >&2
+        exit 1
+      fi
+      echo "⚙️ Loading PostgreSQL image from $image_tar"
+      $ENGINE load -i "$image_tar"
+    fi
+    if $ENGINE image exists registry.access.redhat.com/hi/postgresql:latest \
+      && [ "$image" != "registry.access.redhat.com/hi/postgresql:latest" ]; then
+      $ENGINE tag registry.access.redhat.com/hi/postgresql:latest "$image"
+    fi
+  fi
+  if ! $ENGINE image exists "$image"; then
+    echo "❌ Error: PostgreSQL image $image is not available." >&2
+    exit 1
+  fi
+  install -d -o root -g root -m 755 "$(dirname "$credentials")" "$init_dir"
+  install -d -o 999 -g 999 -m 700 "$data_dir"
+  if [ ! -f "$credentials" ]; then
+    if [ -s "$data_dir/PG_VERSION" ]; then
+      echo "❌ Error: the UI database is initialized but $credentials is missing." >&2
+      exit 1
+    fi
+    app_password="$(openssl rand -hex 24)"
+    admin_password="$(openssl rand -hex 24)"
+    umask 077
+    printf 'UI_DB_PASSWORD=%s\nPOSTGRES_PASSWORD=%s\n' "$app_password" "$admin_password" > "$credentials"
+    chmod 600 "$credentials"
+    unset app_password admin_password
+  fi
+  # shellcheck disable=SC1090
+  set -a
+  . "$credentials"
+  set +a
+  if [ -z "${UI_DB_PASSWORD:-}" ] || [ -z "${POSTGRES_PASSWORD:-}" ]; then
+    echo "❌ Error: $credentials must set UI_DB_PASSWORD and POSTGRES_PASSWORD." >&2
+    exit 1
+  fi
+  cat > "$init_dir/01-ocp-metal-ui.sh" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ -z "${UI_DB_PASSWORD:-}" ]; then
+  echo "UI_DB_PASSWORD is required." >&2
+  exit 1
+fi
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-postgres}" --dbname postgres << SQL
+CREATE ROLE ocp_metal_ui LOGIN PASSWORD '${UI_DB_PASSWORD}' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+CREATE DATABASE ocp_metal_ui OWNER ocp_metal_ui;
+REVOKE ALL ON DATABASE ocp_metal_ui FROM PUBLIC;
+GRANT CONNECT, TEMPORARY ON DATABASE ocp_metal_ui TO ocp_metal_ui;
+SQL
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER:-postgres}" --dbname ocp_metal_ui << 'SQL'
+GRANT ALL ON SCHEMA public TO ocp_metal_ui;
+SQL
+EOF
+  chmod 755 "$init_dir/01-ocp-metal-ui.sh"
+  if $ENGINE container exists ocp-metal-ui-db; then
+    state="$($ENGINE inspect -f '{{.State.Status}}' ocp-metal-ui-db)"
+    if [ "$state" != "running" ] && [ ! -s "$data_dir/PG_VERSION" ]; then
+      $ENGINE rm -f ocp-metal-ui-db >/dev/null
+    fi
+  fi
+  if $ENGINE container exists ocp-metal-ui-db; then
+    $ENGINE start ocp-metal-ui-db >/dev/null
+  else
+    $ENGINE run -d \
+      --name ocp-metal-ui-db \
+      --restart unless-stopped \
+      -p "${publish}:5432" \
+      -v "${data_dir}:/var/lib/postgresql/data:Z" \
+      -v "${init_dir}:/docker-entrypoint-initdb.d:ro,Z" \
+      --env-file "$credentials" \
+      "$image"
+  fi
+  db_host="${publish%:*}"
+  db_port="${publish##*:}"
+  ready=0
+  for _ in $(seq 1 90); do
+    if $ENGINE exec -e PGPASSWORD="$UI_DB_PASSWORD" ocp-metal-ui-db \
+      psql -h 127.0.0.1 -U ocp_metal_ui -d ocp_metal_ui -c 'SELECT 1' >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    state="$($ENGINE inspect -f '{{.State.Status}}' ocp-metal-ui-db 2>/dev/null || true)"
+    if [ "$state" = "exited" ] || [ "$state" = "dead" ]; then
+      break
+    fi
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "❌ Error: ocp-metal-ui-db did not accept connections on ${publish}." >&2
+    echo "   If this data directory is only partly initialized, remove ${data_dir} and start again." >&2
+    echo "   Keep ${credentials}. It holds the passwords from the first attempt." >&2
+    $ENGINE logs ocp-metal-ui-db >&2 || true
+    exit 1
+  fi
+  umask 077
+  printf 'DATABASE_URL=%s\n' \
+    "postgresql://ocp_metal_ui:${UI_DB_PASSWORD}@${db_host}:${db_port}/ocp_metal_ui?sslmode=disable" \
+    > "$ui_env"
+  chmod 600 "$ui_env"
+  unset UI_DB_PASSWORD POSTGRES_PASSWORD
+  UI_DATABASE_ENV_FILE="$ui_env"
+  UI_DB_DATA_DIR="$data_dir"
+  UI_DB_CREDENTIALS_FILE="$credentials"
+  UI_DB_PUBLISH_ADDRESS="$publish"
+}
+
+start_ui_database
 
 # 2. Clean up any existing instances running on the port
 echo "🛑 Tearing down old instances if present..."
 $ENGINE rm -f ocp-metal-ui || true
-
-# 3. Keep SQLite data outside the replaceable application container
-DATA_VOLUME="ocp-metal-ui-data"
-$ENGINE volume create "$DATA_VOLUME" >/dev/null
 
 ANSIBLE_HOST_DIR="${ANSIBLE_HOST_DIR:-$PWD/ansible-workspace}"
 mkdir -p "$ANSIBLE_HOST_DIR"
@@ -125,38 +274,89 @@ if [ "$ANSIBLE_HOST_DIR" = "/" ]; then
   echo "❌ Error: ANSIBLE_HOST_DIR must be a dedicated workspace, not /."
   exit 1
 fi
+case "$ANSIBLE_HOST_DIR" in
+  /var/ocp-config|/var/ocp-config/*|/opt/ocp|/opt/ocp/*|/etc/ansible|/etc/ansible/*)
+    echo "❌ Error: ANSIBLE_HOST_DIR is inside the configurator install ($ANSIBLE_HOST_DIR)." >&2
+    echo "   The configurator keeps /var/ocp-config, /opt/ocp, and /etc/ansible." >&2
+    echo "   Choose a separate workspace, for example /var/lib/ocp-metal-ui or ./ansible-workspace." >&2
+    exit 1
+    ;;
+esac
 chmod g+rwx,g+s "$ANSIBLE_HOST_DIR"
 ANSIBLE_HOST_GID="$(stat -c '%g' "$ANSIBLE_HOST_DIR")"
-if [ "$ENGINE" = "podman" ]; then
+if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -ne 0 ]; then
   USER_NAMESPACE_ARGS=(--userns=keep-id:uid=10001,gid=10001)
   GROUP_ARGS=()
+elif [ "$ENGINE" = "podman" ]; then
+  # A root systemd service cannot use keep-id. Container create then
+  # fails with OCI permission denied. The image runs as uid 10001.
+  USER_NAMESPACE_ARGS=()
+  GROUP_ARGS=()
+  chown 10001:10001 "$ANSIBLE_HOST_DIR"
+  chmod 0750 "$ANSIBLE_HOST_DIR"
+  tls_dir=$(dirname "$TLS_CERT_HOST_FILE")
+  chown 10001:10001 "$tls_dir" "$TLS_CERT_HOST_FILE" "$TLS_KEY_HOST_FILE"
+  chmod 0750 "$tls_dir"
+  chmod 0440 "$TLS_CERT_HOST_FILE" "$TLS_KEY_HOST_FILE"
 else
   USER_NAMESPACE_ARGS=()
   GROUP_ARGS=(--group-add "$ANSIBLE_HOST_GID")
 fi
 
-# 4. Start the application with persistent database and Ansible workspace
-echo "🚀 Starting the offline UI and SQLite API..."
+VAULT_PASSWORD_HOST_FILE="${VAULT_PASSWORD_FILE:-/root/.vault_pass}"
+VAULT_ARGS=()
+if [ -f "$VAULT_PASSWORD_HOST_FILE" ]; then
+  VAULT_PASSWORD_HOST_FILE="$(cd "$(dirname "$VAULT_PASSWORD_HOST_FILE")" && pwd -P)/$(basename "$VAULT_PASSWORD_HOST_FILE")"
+  vault_mount_opts=ro
+  if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -eq 0 ]; then
+    install -o 10001 -g 10001 -m 0400 "$VAULT_PASSWORD_HOST_FILE" "$SCRIPT_DIR/vault.password"
+    VAULT_PASSWORD_HOST_FILE="$SCRIPT_DIR/vault.password"
+    vault_mount_opts=ro,Z
+  fi
+  VAULT_ARGS=(
+    -v "$VAULT_PASSWORD_HOST_FILE:/vault/password:${vault_mount_opts}"
+    -e VAULT_PASSWORD_FILE=/vault/password
+  )
+else
+  echo "⚠️  Vault password file not found at $VAULT_PASSWORD_HOST_FILE." >&2
+  echo "   The pull secret built into the image stays locked until that file is mounted." >&2
+fi
+
+# 3. Start the application. The image still declares /data; the database
+# is the PostgreSQL container, so that mount stays empty.
+install -d -o 10001 -g 10001 -m 755 "$(dirname "$UI_DATABASE_ENV_FILE")/empty"
+echo "🚀 Starting the offline UI..."
 $ENGINE run -d \
   "${USER_NAMESPACE_ARGS[@]}" \
   "${GROUP_ARGS[@]}" \
   --name ocp-metal-ui \
   --restart unless-stopped \
-  -p "${HOST_PORT:-8080}:8080" \
-  -v "$DATA_VOLUME:/data:Z" \
+  --network host \
+  --env-file "$UI_DATABASE_ENV_FILE" \
+  -e "HOST=${BIND_ADDRESS:-0.0.0.0}" \
+  -e "PORT=${HOST_PORT:-3003}" \
+  -v "$(dirname "$UI_DATABASE_ENV_FILE")/empty:/data:Z" \
   -v "$ANSIBLE_HOST_DIR:/ansible:Z" \
   -e ANSIBLE_WORKING_DIR=/ansible \
   "${TLS_ARGS[@]}" \
+  "${VAULT_ARGS[@]}" \
   localhost/ocp-metal-ui-engine:latest
 
 echo "========================================================="
 echo "✅ Operational Success! The wizard is live completely offline."
-echo "👉 Point your browser to: https://${TLS_HOSTNAME}:${HOST_PORT:-8080}"
-if openssl x509 -in "$TLS_CERT_HOST_FILE" -noout -checkip 127.0.0.1 >/dev/null 2>&1; then
-  echo "👉 On the container host, use: https://127.0.0.1:${HOST_PORT:-8080}"
-fi
+echo "👉 Point your browser to: https://${TLS_HOSTNAME}:${HOST_PORT:-3003}"
+echo "👉 Listening on ${BIND_ADDRESS:-0.0.0.0}:${HOST_PORT:-3003}."
+case "${BIND_ADDRESS:-0.0.0.0}" in
+  127.0.0.1|0.0.0.0)
+    if openssl x509 -in "$TLS_CERT_HOST_FILE" -noout -checkip 127.0.0.1 >/dev/null 2>&1; then
+      echo "👉 On the container host, use: https://127.0.0.1:${HOST_PORT:-3003}"
+    fi
+    ;;
+esac
 echo "   HTTPS is enabled. A self-signed certificate requires browser trust/acceptance."
-echo "💾 SQLite persists in container volume: $DATA_VOLUME"
+echo "💾 PostgreSQL data directory: ${UI_DB_DATA_DIR}"
+echo "   Database ocp_metal_ui listens on ${UI_DB_PUBLISH_ADDRESS}."
+echo "   Credentials: ${UI_DB_CREDENTIALS_FILE}"
 echo "📂 Ansible workspace is mounted from: $ANSIBLE_HOST_DIR"
 echo "   Set ANSIBLE_HOST_DIR before deployment to use another host directory."
 echo "   Ensure the container user (UID 10001) can write to that directory."
