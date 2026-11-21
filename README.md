@@ -24,7 +24,7 @@ HOST_PORT=18080 ./airgap-deploy-bundle.sh
 ## Data flow
 
 1. An inspection client sends a node UUID and `inventory` JSON to `POST /api/v1/inspections`, or to `POST /api/v1/inspections/{uuid}`.
-2. The API creates a node from the first report for a UUID. A later report for that UUID is stored as another revision and does not change the node, its inventory, or its preferences.
+2. The API creates a node from the first report for a UUID. A later report refreshes that node's BMC address, serial number, and inventory, and is stored as another revision. A blank serial number keeps the serial already stored. Preferences and other operator settings stay as they are.
 3. The UI polls `GET /api/v1/nodes` every 15 seconds.
 4. The operator can create named placeholder hosts before reports arrive, then link each name to a discovered node. The inventory group is set in application configuration.
 5. **Review and confirm** lists discovered nodes and named placeholders. The operator can refresh before confirming.
@@ -94,10 +94,10 @@ The API stores the report. It does not configure IPA or replace an Ironic conduc
 The collector is not in this repository. `hw-interrogator` in `build-the-builder` posts hardware reports and does not need a credential.
 
 1. `POST` the inspection JSON to `https://<address>:3003/api/v1/inspections` or `https://<address>:3003/api/v1/inspections/{uuid}`. The deploy serves HTTPS. Use the UI certificate. Do not post to plain HTTP. The address may be `127.0.0.1` or another IP of the UI host.
-2. Do not send an API token. If a `Authorization: Bearer` header is still present, the intake routes ignore it and still accept the report. `Content-Type` is also ignored: the body is parsed as JSON even when the header is missing or is not `application/json`. These routes are open to a cross-site simple POST. That request can only add a report revision. It cannot read inventory, change an existing node, or call any other API.
+2. Do not send an API token. If a `Authorization: Bearer` header is still present, the intake routes ignore it and still accept the report. `Content-Type` is also ignored: the body is parsed as JSON even when the header is missing or is not `application/json`. These routes are open to a cross-site simple POST. That request can add a report revision and overwrite the BMC address, serial number, and inventory of an existing node. It cannot read inventory or call any other API. See [Security model / accepted risks](#security-model--accepted-risks).
 3. These two routes do not check the `Host` header. Every other route does. That exemption is what lets a collector post by IP even when that IP was not listed in `API_ALLOWED_HOSTS` or `hostname -I`.
 4. The body must be a JSON object with an `inventory` object, and a UUID in the body or the URL. The UUID must be a canonical UUID. Reports larger than 2 MiB are rejected. The response is `{"status":"accepted"}` and does not include the stored node.
-5. The first report for a UUID creates the node. Another report for the same UUID is kept as a revision and does not change that node. A retry is not an error.
+5. The first report for a UUID creates the node. Another report for the same UUID refreshes the BMC address, serial number, and inventory from that report and is kept as a revision. A blank serial number keeps the stored serial. Preferences are left unchanged. A retry is not an error.
 6. Do not call any other `/api/` path. Those routes require the admin token from `/var/lib/ocp-metal-ui/api.token`.
 
 ```sh
@@ -106,6 +106,19 @@ curl --cacert /etc/ipa/ocp-metal-ui.crt \
   -H 'Content-Type: application/json' \
   --data-binary @inspection-report.json
 ```
+
+## Security model / accepted risks
+
+Inspection intake, `POST /api/v1/inspections` and `POST /api/v1/inspections/{uuid}`, is unauthenticated. That is the owner's decision: a hardware collector posts a report with no token.
+
+Anyone who can reach the server can submit a report that overwrites an existing node's BMC address, serial number, and inventory. **Generate Ansible Files** writes those hardware facts into the Ansible inventory and host vars. Intake does not change preferences or other operator settings.
+
+Two residuals remain:
+
+- `Content-Type` is not checked. The body is parsed as JSON even when the header is missing or is not `application/json`, so a browser on the network can send a cross-site simple POST that refreshes those hardware facts.
+- Each new UUID creates a node and stores report revisions. Flooding intake with made-up node IDs can still use disk. Old revisions for one node are pruned, and that prune does not cap the number of distinct UUIDs.
+
+Firewall port 3003 so only the provisioning network can reach it. Leave `BIND_ADDRESS` on `127.0.0.1` unless collectors on other hosts must post to this UI.
 
 ## Generated files
 
@@ -343,6 +356,6 @@ npm run test:backend
 | `PUT` | `/api/v1/configuration` | Save the blueprint, workspace destination, and node preferences |
 | `POST` | `/api/v1/ansible-files` | Write the reviewed inventory and variables into the workspace |
 
-Every `/api/` route except `GET /api/v1/health` and inspection intake requires the admin bearer token. Inspection intake accepts reports with no token and does not check `Host`. HTTPS protects credentials in transit. The `Host` header is checked on every other route so a DNS-rebinding name cannot call the API. Keep the service on a network you control.
+Every `/api/` route except `GET /api/v1/health` and inspection intake requires the admin bearer token. Inspection intake accepts reports with no token and does not check `Host`. A later report overwrites that node's BMC address, serial number, and inventory. HTTPS protects credentials in transit. The `Host` header is checked on every other route so a DNS-rebinding name cannot call the API. Firewall the UI port to the provisioning network. See [Security model / accepted risks](#security-model--accepted-risks).
 
 Generated host vars contain hardware inventory. Handle that data under your organization's policy. Keep secrets in Ansible Vault. Redfish credentials are not written to disk.

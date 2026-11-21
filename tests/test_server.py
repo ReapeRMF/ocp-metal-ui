@@ -131,17 +131,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"saved": 1})
 
         updated_report = self.report(bmc_address="192.0.2.99")
+        updated_report["inventory"]["cpu"]["model_name"] = "Refreshed CPU"
+        updated_report["inventory"]["system_vendor"]["serial_number"] = "REFRESHED-SERIAL"
         status, body, _ = self.request("POST", f"/api/v1/inspections/{NODE_UUID}", updated_report)
         self.assertEqual(status, 202)
         self.assertEqual(json.loads(body), {"status": "accepted"})
         status, body, _ = self.request("GET", "/api/v1/nodes")
         self.assertEqual(status, 200)
         node = json.loads(body)[0]
-        self.assertEqual(node["bmc_address"], "192.0.2.21")
-        self.assertEqual(node["serial_number"], "NODE-SERIAL-01")
-        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Example CPU")
+        self.assertEqual(node["bmc_address"], "192.0.2.99")
+        self.assertEqual(node["serial_number"], "REFRESHED-SERIAL")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Refreshed CPU")
         self.assertEqual(node["inventory"]["interfaces"][0]["state"], "up")
         self.assertEqual(node["preferences"]["rootDisk"], "/dev/sda")
+        self.assertEqual(node["preferences"]["netType"], "single")
 
     def test_configuration_commit_saves_blueprint_and_preferences_without_exporting(self):
         self.request(
@@ -2345,7 +2348,7 @@ class ApiTests(unittest.TestCase):
         conflicts = {"count": 0}
 
         def fail_once(connection, sql, params=None):
-            if "ON CONFLICT(uuid) DO NOTHING" in sql:
+            if "ON CONFLICT(uuid) DO UPDATE" in sql:
                 conflicts["count"] += 1
                 if conflicts["count"] == 1:
                     raise server.psycopg.errors.LockNotAvailable(
@@ -2421,6 +2424,84 @@ class ApiTests(unittest.TestCase):
             "POST", "/api/v1/inspections", self.report(), token=None
         )
         self.assertEqual(status, 202, response_body)
+
+    def test_reinspection_refreshes_hardware_and_keeps_preferences(self):
+        status, _, _ = self.request("POST", "/api/v1/inspections", self.report(), token=None)
+        self.assertEqual(status, 202)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        created = json.loads(body)[0]
+        status, _, _ = self.request(
+            "PUT",
+            "/api/v1/nodes/preferences",
+            {"preferences": {NODE_UUID: {"rootDisk": "/dev/sda", "ansibleHost": "server-01"}}},
+        )
+        self.assertEqual(status, 200)
+        with server.connect_database() as connection:
+            connection.execute(
+                "UPDATE nodes SET is_placeholder = 1, source = 'manual' WHERE uuid = ?",
+                (NODE_UUID,),
+            )
+
+        refreshed = self.report(bmc_address="192.0.2.99")
+        refreshed["inventory"]["cpu"]["model_name"] = "Refreshed CPU"
+        refreshed["inventory"]["system_vendor"]["serial_number"] = "REFRESHED-SERIAL"
+        status, body, _ = self.request(
+            "POST", f"/api/v1/inspections/{NODE_UUID}", refreshed, token=None
+        )
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.99")
+        self.assertEqual(node["serial_number"], "REFRESHED-SERIAL")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Refreshed CPU")
+        self.assertEqual(node["preferences"]["rootDisk"], "/dev/sda")
+        self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
+        self.assertEqual(node["source"], "manual")
+        self.assertTrue(node["is_placeholder"])
+        self.assertEqual(node["first_seen"], created["first_seen"])
+
+        blank_serial = self.report(bmc_address="192.0.2.98")
+        blank_serial["inventory"] = {
+            "cpu": {"count": 8, "model_name": "Blank serial CPU"},
+            "system_vendor": {},
+            "disks": [],
+            "interfaces": [],
+        }
+        status, body, _ = self.request("POST", "/api/v1/inspections", blank_serial, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["serial_number"], "REFRESHED-SERIAL")
+        self.assertEqual(node["bmc_address"], "192.0.2.98")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Blank serial CPU")
+        self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
+        self.assertEqual(node["source"], "manual")
+        self.assertEqual(node["first_seen"], created["first_seen"])
+
+    def test_concurrent_inspections_of_one_node_are_accepted(self):
+        results = []
+
+        def post(index):
+            report = self.report(bmc_address=f"192.0.2.{30 + index}")
+            report["inventory"]["cpu"]["model_name"] = f"CPU-{index}"
+            report["inventory"]["system_vendor"]["serial_number"] = f"SERIAL-{index}"
+            status, body, _ = self.request("POST", "/api/v1/inspections", report, token=None)
+            results.append((status, body))
+
+        threads = [threading.Thread(target=post, args=(index,)) for index in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 6)
+        for status, body in results:
+            self.assertEqual(status, 202, body)
+            self.assertEqual(json.loads(body), {"status": "accepted"})
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertIn(node["bmc_address"], {f"192.0.2.{30 + index}" for index in range(6)})
+        self.assertIn(node["serial_number"], {f"SERIAL-{index}" for index in range(6)})
+        self.assertIn(node["inventory"]["cpu"]["model_name"], {f"CPU-{index}" for index in range(6)})
 
     def test_chunked_and_untyped_inspection_reports_are_accepted(self):
         plain = self.report()
@@ -2527,7 +2608,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(stored, ["KEEP-MID", "KEEP-NEW"])
         status, body, _ = self.request("GET", "/api/v1/nodes")
         node = {item["uuid"]: item for item in json.loads(body)}[report["uuid"]]
-        self.assertEqual(node["serial_number"], "KEEP-OLD")
+        self.assertEqual(node["serial_number"], "KEEP-NEW")
+        self.assertEqual(node["inventory"]["system_vendor"]["serial_number"], "KEEP-NEW")
 
 
 class RedfishClientTests(unittest.TestCase):

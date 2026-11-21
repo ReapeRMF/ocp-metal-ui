@@ -2616,7 +2616,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                         INSERT INTO nodes
                             (uuid, bmc_address, serial_number, inventory_json, source, first_seen, updated_at)
                         VALUES (?, ?, ?, ?, 'ipa', ?, ?)
-                        ON CONFLICT(uuid) DO NOTHING
+                        ON CONFLICT(uuid) DO UPDATE SET
+                            bmc_address = excluded.bmc_address,
+                            serial_number = CASE
+                                WHEN excluded.serial_number = '' THEN nodes.serial_number
+                                ELSE excluded.serial_number
+                            END,
+                            inventory_json = excluded.inventory_json,
+                            updated_at = excluded.updated_at
                         """,
                         (
                             node_uuid,
