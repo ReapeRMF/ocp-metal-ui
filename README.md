@@ -79,6 +79,8 @@ A top-level serial is also accepted:
 On the installed host, post the report to port 3003. The DNS name in the URL must match `TLS_HOSTNAME`. Copy the server certificate to the client, or use a certificate from a CA the client already trusts.
 
 ```sh
+BIND_ADDRESS=192.0.2.35 TLS_HOSTNAME=edge.example.com ./airgap-deploy-bundle.sh
+
 curl --cacert /etc/ipa/ocp-metal-ui.crt \
   --config /var/lib/ocp-metal-ui/inspection.curl \
   -X POST https://edge.example.com:3003/api/v1/inspections \
@@ -230,7 +232,7 @@ The first deploy writes two token files outside the git checkout, mode 0400, own
 
 The container reads the admin token from `/run/secrets/api-token` and the inspection token from `/run/secrets/inspection-token`. Delete a file before the next deploy to rotate that token. Set `API_TOKEN_FILE` or `INSPECTION_TOKEN_FILE` to use different paths.
 
-Every `/api/` route except `GET /api/v1/health` requires the admin token. The inspection token is accepted only for `POST /api/v1/inspections` and `POST /api/v1/inspections/{uuid}`. It cannot read config or nodes, and it cannot download the SSH private key. The `Host` header must be `localhost`, `127.0.0.1`, `::1`, `TLS_HOSTNAME`, or a name in `API_ALLOWED_HOSTS`. Leave the bind on `127.0.0.1`. `BIND_ADDRESS` still overrides it. Binding any other address without TLS prints a warning.
+Every `/api/` route except `GET /api/v1/health` requires the admin token. The inspection token is accepted only for `POST /api/v1/inspections` and `POST /api/v1/inspections/{uuid}`. It cannot read config or nodes, and it cannot download the SSH private key. The `Host` header must be `localhost`, `127.0.0.1`, `::1`, `TLS_HOSTNAME`, or a name in `API_ALLOWED_HOSTS`. The deploy forwards `API_ALLOWED_HOSTS` into the container. When `BIND_ADDRESS` is `0.0.0.0` or `::`, it also allows the addresses from `hostname -I`, so the UI can be opened by the host IP. Leave the bind on `127.0.0.1` unless that is what you want. `BIND_ADDRESS` still overrides it. Binding any other address without TLS prints a warning.
 
 To mount a different workspace directory:
 

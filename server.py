@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import html
 import importlib.util
 import json
 import http.client
@@ -1243,9 +1244,9 @@ def configured_inspection_token():
 def bearer_matches(header_value, expected):
     presented = b""
     if isinstance(header_value, str):
-        scheme, separator, rest = header_value.partition(" ")
-        if separator and scheme.lower() == "bearer":
-            presented = rest.encode("utf-8")
+        parts = header_value.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            presented = parts[1].strip().encode("utf-8")
     if not expected:
         return False
     return hmac.compare_digest(
@@ -1270,9 +1271,19 @@ def request_hostname(host_header):
         return ""
     if host.startswith("["):
         end = host.find("]")
-        return host[1:end] if end > 1 else ""
-    if host.count(":") == 1:
-        host = host.split(":", 1)[0]
+        if end < 2:
+            return ""
+        remainder = host[end + 1:]
+        if remainder and not re.fullmatch(r":[0-9]+", remainder):
+            return ""
+        return host[1:end]
+    if host.count(":") > 1:
+        return ""
+    if ":" in host:
+        name, port = host.split(":", 1)
+        if not port.isdigit():
+            return ""
+        return name.rstrip(".")
     return host.rstrip(".")
 
 
@@ -1302,7 +1313,8 @@ def authorize_api(method, path, authorization):
     Every /api/ path except health requires the admin token. An inspection
     token is accepted only for inspection posts.
     """
-    if not path.startswith("/api/") or path == "/api/v1/health":
+    normalized_path = path.lower()
+    if not normalized_path.startswith("/api/") or normalized_path == "/api/v1/health":
         return None
     admin = configured_admin_token()
     if admin is None:
@@ -1312,7 +1324,7 @@ def authorize_api(method, path, authorization):
     inspection = configured_inspection_token()
     if (
         inspection
-        and is_inspection_post(method, path)
+        and is_inspection_post(method, normalized_path)
         and bearer_matches(authorization, inspection)
     ):
         return None
@@ -1940,6 +1952,33 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
 
+    def send_error(self, code, message=None, explain=None):
+        try:
+            shortmsg, longmsg = self.responses[code]
+        except KeyError:
+            shortmsg, longmsg = "???", "???"
+        if message is None:
+            message = shortmsg
+        if explain is None:
+            explain = longmsg
+        self.log_error("code %d, message %s", code, message)
+        self.send_response(code, message)
+        self.send_header("Connection", "close")
+        body = None
+        if code >= 200 and code not in (204, 205, 304):
+            content = self.error_message_format % {
+                "code": code,
+                "message": html.escape(message, quote=False),
+                "explain": html.escape(explain, quote=False),
+            }
+            body = content.encode("UTF-8", "replace")
+            self.send_header("Content-Type", self.error_content_type)
+            self.send_header("Content-Length", str(len(body)))
+        self.add_security_headers()
+        self.end_headers()
+        if self.command != "HEAD" and body:
+            self.wfile.write(body)
+
     def send_json(self, status, value):
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -1970,7 +2009,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def guard_request(self, method):
         path = urlparse(self.path).path
-        if not host_is_allowed(self.headers.get("Host", "")):
+        host_values = self.headers.get_all("Host") or []
+        if len(host_values) != 1 or not host_is_allowed(host_values[0]):
             if method in {"POST", "PUT", "PATCH"}:
                 self.discard_body()
             self.send_json(421, {"error": "Host is not allowed."})

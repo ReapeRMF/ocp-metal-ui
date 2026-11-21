@@ -414,15 +414,9 @@ write_private_token "$API_TOKEN_FILE"
 write_private_token "$INSPECTION_TOKEN_FILE"
 previous_umask="$(umask)"
 umask 077
-python3 - "$INSPECTION_TOKEN_FILE" "$INSPECTION_CURL_CONFIG" << 'PY'
-import sys
-from pathlib import Path
-token = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
-Path(sys.argv[2]).write_text(
-    'header = "Authorization: Bearer %s"\n' % token,
-    encoding="utf-8",
-)
-PY
+inspection_token_value="$(tr -d '[:space:]' < "$INSPECTION_TOKEN_FILE")"
+printf 'header = "Authorization: Bearer %s"\n' "$inspection_token_value" > "$INSPECTION_CURL_CONFIG"
+unset inspection_token_value
 chmod 600 "$INSPECTION_CURL_CONFIG"
 umask "$previous_umask"
 if [ "$(id -u)" -eq 0 ]; then
@@ -430,6 +424,17 @@ if [ "$(id -u)" -eq 0 ]; then
   chmod 0400 "$INSPECTION_CURL_CONFIG"
 fi
 install -d -o 10001 -g 10001 -m 755 "$(dirname "$UI_DATABASE_ENV_FILE")/empty"
+BIND_ADDRESS="${BIND_ADDRESS:-127.0.0.1}"
+API_ALLOWED_HOSTS_VALUE="${API_ALLOWED_HOSTS:-}"
+if [ "$BIND_ADDRESS" = "0.0.0.0" ] || [ "$BIND_ADDRESS" = "::" ]; then
+  for host_ip in $(hostname -I 2>/dev/null || true); do
+    if [ -n "$API_ALLOWED_HOSTS_VALUE" ]; then
+      API_ALLOWED_HOSTS_VALUE="${API_ALLOWED_HOSTS_VALUE},${host_ip}"
+    else
+      API_ALLOWED_HOSTS_VALUE="$host_ip"
+    fi
+  done
+fi
 echo "🚀 Starting the offline UI..."
 $ENGINE run -d \
   "${USER_NAMESPACE_ARGS[@]}" \
@@ -438,9 +443,10 @@ $ENGINE run -d \
   --restart unless-stopped \
   --network host \
   --env-file "$UI_DATABASE_ENV_FILE" \
-  -e "HOST=${BIND_ADDRESS:-127.0.0.1}" \
+  -e "HOST=${BIND_ADDRESS}" \
   -e "PORT=${HOST_PORT:-3003}" \
   -e "TLS_HOSTNAME=${TLS_HOSTNAME}" \
+  -e "API_ALLOWED_HOSTS=${API_ALLOWED_HOSTS_VALUE}" \
   -e API_TOKEN_FILE=/run/secrets/api-token \
   -e INSPECTION_TOKEN_FILE=/run/secrets/inspection-token \
   -v "${API_TOKEN_FILE}:/run/secrets/api-token:ro,Z" \

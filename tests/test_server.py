@@ -2202,7 +2202,7 @@ class ApiTests(unittest.TestCase):
         missing = Path(self.temp_dir.name) / "missing-api-token"
         with patch.dict(
             os.environ,
-            {"API_TOKEN": "", "API_TOKEN_FILE": str(missing)},
+            {"API_TOKEN": self.api_token, "API_TOKEN_FILE": str(missing)},
             clear=False,
         ):
             status, body, _ = self.request("GET", "/api/v1/config", token=None)
@@ -2216,8 +2216,40 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 421, body)
         status, body, _ = self.request("GET", "/api/v1/config", host="evil.example")
         self.assertEqual(status, 421, body)
+        status, body, _ = self.request("GET", "/api/v1/health", token=None, host="[::1]junk")
+        self.assertEqual(status, 421, body)
+        status, body, _ = self.request("GET", "/api/v1/health", token=None, host="[::1]")
+        self.assertEqual(status, 200, body)
         status, body, _ = self.request("GET", "/api/v1/health", token=None, host="localhost")
         self.assertEqual(status, 200, body)
+        status, body, _ = self.request("GET", "/API/v1/config", token=None)
+        self.assertEqual(status, 401, body)
+        status, body, _ = self.request("GET", "/API/v1/health", token=None)
+        self.assertEqual(status, 200, body)
+        status, body, _ = self.request(
+            "GET", "/api/v1/config", authorization=f"Bearer   {self.api_token}  "
+        )
+        self.assertEqual(status, 200, body)
+        connection = http.client.HTTPConnection(*self.httpd.server_address)
+        connection.putrequest("GET", "/api/v1/health")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Host", "evil.example")
+        connection.endheaders()
+        duplicated = connection.getresponse()
+        self.assertEqual(duplicated.status, 421)
+        duplicated.read()
+        connection.close()
+        with patch.object(server, "DIST_DIR", Path(self.temp_dir.name) / "empty-dist"):
+            connection = http.client.HTTPConnection(*self.httpd.server_address)
+            connection.request("GET", "/no-such-page")
+            missing_page = connection.getresponse()
+            self.assertEqual(missing_page.status, 503)
+            self.assertIn(
+                "default-src 'self'",
+                missing_page.getheader("Content-Security-Policy", ""),
+            )
+            missing_page.read()
+            connection.close()
         status, _, _ = self.request("POST", "/api/v1/nodes", {"ansibleHost": "control-01"})
         self.assertEqual(status, 201)
 
