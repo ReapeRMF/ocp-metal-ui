@@ -206,9 +206,11 @@ start_ui_database() {
     fi
     app_password="$(openssl rand -hex 24)"
     admin_password="$(openssl rand -hex 24)"
+    previous_umask="$(umask)"
     umask 077
     printf 'UI_DB_PASSWORD=%s\nPOSTGRES_PASSWORD=%s\n' "$app_password" "$admin_password" > "$credentials"
     chmod 600 "$credentials"
+    umask "$previous_umask"
     unset app_password admin_password
   fi
   set -a
@@ -277,11 +279,13 @@ EOF
     $ENGINE logs ocp-metal-ui-db >&2 || true
     exit 1
   fi
+  previous_umask="$(umask)"
   umask 077
   printf 'DATABASE_URL=%s\n' \
     "postgresql://ocp_metal_ui:${UI_DB_PASSWORD}@${db_host}:${db_port}/ocp_metal_ui?sslmode=disable" \
     > "$ui_env"
   chmod 600 "$ui_env"
+  umask "$previous_umask"
   unset UI_DB_PASSWORD POSTGRES_PASSWORD
   UI_DATABASE_ENV_FILE="$ui_env"
   UI_DB_DATA_DIR="$data_dir"
