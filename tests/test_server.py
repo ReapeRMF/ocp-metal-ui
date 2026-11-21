@@ -45,11 +45,7 @@ class ApiTests(unittest.TestCase):
         with server.connect_database() as connection:
             connection.execute("TRUNCATE TABLE nodes, app_settings, inspection_reports")
         self.api_token = "test-api-token"
-        self.inspection_token = "test-inspection-token"
-        self._api_token_env = patch.dict(
-            os.environ,
-            {"API_TOKEN": self.api_token, "INSPECTION_TOKEN": self.inspection_token},
-        )
+        self._api_token_env = patch.dict(os.environ, {"API_TOKEN": self.api_token})
         self._api_token_env.start()
         self.addCleanup(self._api_token_env.stop)
         server.initialize_database()
@@ -2135,7 +2131,6 @@ class ApiTests(unittest.TestCase):
                 status, body, _ = self.request(method, path, payload, token=None)
                 self.assertEqual(status, 401, body)
                 self.assertNotIn(self.api_token.encode(), body)
-                self.assertNotIn(self.inspection_token.encode(), body)
 
         status, body, _ = self.request(
             "GET", "/api/v1/config", authorization=f"bearer {self.api_token}"
@@ -2174,7 +2169,7 @@ class ApiTests(unittest.TestCase):
             ("/api/v1/install-secrets/ssh-key", {"outputDirectory": str(server.ANSIBLE_WORKING_DIR), "replace": False}),
         ):
             status, body, _ = self.request(
-                "POST", path, payload, token=self.inspection_token
+                "POST", path, payload, token="not-the-admin-token"
             )
             self.assertEqual(status, 401, body)
 
@@ -2315,6 +2310,113 @@ class ApiTests(unittest.TestCase):
             connection.close()
         status, _, _ = self.request("POST", "/api/v1/nodes", {"ansibleHost": "control-01"})
         self.assertEqual(status, 201)
+
+    def test_chunked_and_untyped_inspection_reports_are_accepted(self):
+        plain = self.report()
+        plain["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821031"
+        raw = json.dumps(plain).encode()
+        connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=5)
+        connection.putrequest("POST", "/api/v1/inspections")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Content-Type", "text/plain")
+        connection.putheader("Content-Length", str(len(raw)))
+        connection.endheaders()
+        connection.send(raw)
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        self.assertEqual(response.status, 202, body)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
+
+        chunked = self.report()
+        chunked["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821032"
+        raw = json.dumps(chunked).encode()
+        connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=5)
+        connection.putrequest("POST", "/api/v1/inspections")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Transfer-Encoding", "chunked")
+        connection.endheaders()
+        connection.send(f"{len(raw):x}\r\n".encode() + raw + b"\r\n")
+        connection.send(b"0\r\n\r\n")
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        self.assertEqual(response.status, 202, body)
+
+        connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=5)
+        connection.putrequest("POST", "/api/v1/inspections")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Transfer-Encoding", "chunked")
+        connection.endheaders()
+        connection.send(f"{server.INSPECTION_MAX_BYTES + 1:x}\r\n".encode())
+        response = connection.getresponse()
+        body = response.read()
+        self.assertEqual(response.status, 413, body)
+        self.assertEqual(response.getheader("Connection"), "close")
+        connection.close()
+
+    def test_intake_is_accepted_while_the_ui_lock_is_held(self):
+        started = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def hold_lock():
+            try:
+                with server.connect_database() as connection:
+                    started.set()
+                    while not release.is_set():
+                        connection.execute("SELECT 1")
+                        release.wait(0.05)
+            except Exception as error:
+                errors.append(error)
+                started.set()
+
+        thread = threading.Thread(target=hold_lock)
+        thread.start()
+        self.assertTrue(started.wait(5))
+        try:
+            report = self.report()
+            report["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821077"
+            raw = json.dumps(report).encode()
+            connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=3)
+            connection.request(
+                "POST",
+                "/api/v1/inspections",
+                body=raw,
+                headers={"Content-Type": "application/json", "Host": "127.0.0.1"},
+            )
+            response = connection.getresponse()
+            body = response.read()
+            connection.close()
+            self.assertEqual(response.status, 202, body)
+            self.assertEqual(json.loads(body), {"status": "accepted"})
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertEqual(errors, [])
+
+    def test_extra_inspection_revisions_are_pruned_and_still_accepted(self):
+        report = self.report()
+        report["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821041"
+        with patch.dict(os.environ, {"INSPECTION_REPORT_RETENTION": "2"}):
+            for serial in ("KEEP-OLD", "KEEP-MID", "KEEP-NEW"):
+                report["inventory"]["system_vendor"]["serial_number"] = serial
+                status, body, _ = self.request("POST", "/api/v1/inspections", report, token=None)
+                self.assertEqual(status, 202, body)
+                self.assertNotEqual(status, 429)
+        with server.connect_database() as connection:
+            rows = connection.execute(
+                """
+                SELECT report_json FROM inspection_reports
+                WHERE node_uuid = ? ORDER BY id
+                """,
+                (report["uuid"],),
+            ).fetchall()
+        stored = [json.loads(row["report_json"])["inventory"]["system_vendor"]["serial_number"] for row in rows]
+        self.assertEqual(stored, ["KEEP-MID", "KEEP-NEW"])
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = {item["uuid"]: item for item in json.loads(body)}[report["uuid"]]
+        self.assertEqual(node["serial_number"], "KEEP-OLD")
 
 
 class RedfishClientTests(unittest.TestCase):

@@ -26,10 +26,8 @@ pull-secret.vault
 vault.password
 
 # The admin token belongs outside the checkout, at
-# /var/lib/ocp-metal-ui/api.token. These names are ignored if a copy is left here.
+# /var/lib/ocp-metal-ui/api.token.
 api.token
-inspection.token
-inspection.curl
 
 # Ignore local editor swap notes and compiler footprints
 *~

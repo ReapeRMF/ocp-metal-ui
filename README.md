@@ -94,7 +94,7 @@ The API stores the report. It does not configure IPA or replace an Ironic conduc
 The collector is not in this repository. `hw-interrogator` in `build-the-builder` posts hardware reports and does not need a credential.
 
 1. `POST` the inspection JSON to `https://<address>:3003/api/v1/inspections` or `https://<address>:3003/api/v1/inspections/{uuid}`. The deploy serves HTTPS. Use the UI certificate. Do not post to plain HTTP. The address may be `127.0.0.1` or another IP of the UI host.
-2. Do not send an API token. If a `Authorization: Bearer` header is still present, the intake routes ignore it and still accept the report.
+2. Do not send an API token. If a `Authorization: Bearer` header is still present, the intake routes ignore it and still accept the report. `Content-Type` is also ignored: the body is parsed as JSON even when the header is missing or is not `application/json`. These routes are open to a cross-site simple POST. That request can only add a report revision. It cannot read inventory, change an existing node, or call any other API.
 3. These two routes do not check the `Host` header. Every other route does. That exemption is what lets a collector post by IP even when that IP was not listed in `API_ALLOWED_HOSTS` or `hostname -I`.
 4. The body must be a JSON object with an `inventory` object, and a UUID in the body or the URL. The UUID must be a canonical UUID. Reports larger than 2 MiB are rejected. The response is `{"status":"accepted"}` and does not include the stored node.
 5. The first report for a UUID creates the node. Another report for the same UUID is kept as a revision and does not change that node. A retry is not an error.

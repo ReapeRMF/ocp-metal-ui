@@ -44,6 +44,9 @@ MAX_REQUEST_BYTES = 5 * 1024 * 1024
 # Ironic-style inspection reports are usually tens or hundreds of kilobytes.
 # Two mebibytes covers a report with many disks, NICs, and LLDP neighbors.
 INSPECTION_MAX_BYTES = 2 * 1024 * 1024
+# Extra revisions are stored, then the oldest rows for that node are pruned.
+# A report is never rejected because of this limit.
+INSPECTION_REPORT_RETENTION = 20
 ANSIBLE_OUTPUT_SUBDIR = "ocp-metal-ui"
 ANSIBLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 PREFERENCE_FIELDS = {
@@ -1005,7 +1008,7 @@ def database_log_target():
 
 
 @contextmanager
-def connect_database():
+def connect_database(advisory_lock=True):
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is required.")
     connection = psycopg.connect(
@@ -1015,8 +1018,9 @@ def connect_database():
     )
     try:
         with connection:
-            connection.execute("SET lock_timeout = '10s'")
-            connection.execute("SELECT pg_advisory_xact_lock(%s)", (_UI_DB_LOCK,))
+            if advisory_lock:
+                connection.execute("SET lock_timeout = '10s'")
+                connection.execute("SELECT pg_advisory_xact_lock(%s)", (_UI_DB_LOCK,))
             yield DatabaseConnection(connection)
     finally:
         connection.close()
@@ -1047,6 +1051,12 @@ def initialize_database():
                 received_at TEXT NOT NULL,
                 report_json TEXT NOT NULL
             )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS inspection_reports_node_uuid_idx
+            ON inspection_reports (node_uuid, id)
             """
         )
         connection.execute(
@@ -1326,11 +1336,25 @@ def host_is_allowed(host_header):
     return request_hostname(host_header) in allowed_api_hosts()
 
 
+def inspection_report_retention():
+    raw = os.environ.get("INSPECTION_REPORT_RETENTION", "").strip()
+    if not raw:
+        return INSPECTION_REPORT_RETENTION
+    try:
+        value = int(raw)
+    except ValueError:
+        return INSPECTION_REPORT_RETENTION
+    if value < 1:
+        return INSPECTION_REPORT_RETENTION
+    return value
+
+
 def authorize_api(method, path, authorization):
     """Return None when the request may proceed, or (status, error).
 
-    Every /api/ path except health requires the admin token. An inspection
-    token is accepted only for inspection posts.
+    GET /api/v1/health and the two inspection intake posts are public.
+    Every other /api/ path requires the admin token. A Bearer header on
+    intake is ignored.
     """
     normalized_path = path.lower()
     if not normalized_path.startswith("/api/"):
@@ -2004,6 +2028,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if status == 413:
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.add_security_headers()
         self.end_headers()
         self.wfile.write(body)
@@ -2469,17 +2496,65 @@ class ApiHandler(BaseHTTPRequestHandler):
             {"status": "saved", "savedNodes": len(normalized_preferences)},
         )
 
+    def read_exact(self, size):
+        remaining = size
+        chunks = []
+        while remaining:
+            piece = self.rfile.read(remaining)
+            if not piece:
+                raise InspectionRequestError(400, "Inspection report ended early.")
+            chunks.append(piece)
+            remaining -= len(piece)
+        return b"".join(chunks)
+
+    def read_chunked_inspection_body(self):
+        # Content-Type is ignored. Chunked collectors are accepted up to the
+        # same cap; only a body past that cap is rejected.
+        chunks = []
+        total = 0
+        while True:
+            line = self.rfile.readline(128)
+            if not line:
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.")
+            size_token = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_token, 16)
+            except ValueError as error:
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.") from error
+            if size < 0:
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.")
+            if size == 0:
+                while True:
+                    trailer = self.rfile.readline(8192)
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                break
+            if size > INSPECTION_MAX_BYTES or total + size > INSPECTION_MAX_BYTES:
+                raise InspectionRequestError(413, "Inspection report is too large.")
+            chunks.append(self.read_exact(size))
+            total += size
+            delimiter = self.rfile.readline(8)
+            if delimiter not in (b"\r\n", b"\n"):
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.")
+        return b"".join(chunks)
+
     def read_inspection_body(self):
+        # Any Content-Type is accepted. The body is parsed as JSON anyway.
+        transfer = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in transfer:
+            raw = self.read_chunked_inspection_body()
+        else:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as error:
+                raise InspectionRequestError(400, "Invalid Content-Length.") from error
+            if length <= 0:
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.")
+            if length > INSPECTION_MAX_BYTES:
+                raise InspectionRequestError(413, "Inspection report is too large.")
+            raw = self.read_exact(length)
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError as error:
-            raise InspectionRequestError(400, "Invalid Content-Length.") from error
-        if length <= 0:
-            raise InspectionRequestError(400, "Inspection report must be a JSON object.")
-        if length > INSPECTION_MAX_BYTES:
-            raise InspectionRequestError(413, "Inspection report is too large.")
-        try:
-            payload = json.loads(self.rfile.read(length))
+            payload = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise InspectionRequestError(400, "Inspection report must be a JSON object.") from error
         return payload
@@ -2492,7 +2567,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         node_uuid, bmc_address, serial_number, inventory = parse_inspection(payload, path_uuid)
         now = utc_now()
         report_json = json.dumps(payload, ensure_ascii=False)
-        with connect_database() as connection:
+        retention = inspection_report_retention()
+        with connect_database(advisory_lock=False) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
@@ -2516,6 +2592,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 VALUES (?, ?, ?)
                 """,
                 (node_uuid, now, report_json),
+            )
+            connection.execute(
+                """
+                DELETE FROM inspection_reports
+                WHERE node_uuid = ?
+                  AND id NOT IN (
+                      SELECT id FROM inspection_reports
+                      WHERE node_uuid = ?
+                      ORDER BY id DESC
+                      LIMIT ?
+                  )
+                """,
+                (node_uuid, node_uuid, retention),
             )
         self.send_json(202, {"status": "accepted"})
 
