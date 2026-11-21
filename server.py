@@ -1884,24 +1884,31 @@ def parse_inspection(payload, path_uuid=None):
     if not isinstance(inventory, dict):
         raise ValueError("Inspection report must contain an inventory object.")
 
-    bmc_address = payload.get("bmc_address") or inventory.get("bmc_address") or ""
-    if not isinstance(bmc_address, str):
-        raise ValueError("bmc_address must be a string.")
+    bmc_address = optional_inspection_text(payload.get("bmc_address"), "bmc_address")
+    if not bmc_address:
+        bmc_address = optional_inspection_text(inventory.get("bmc_address"), "bmc_address")
 
     system_vendor = inventory.get("system_vendor")
     system_serial = inventory.get("system")
-    serial_number = (
+    serial_number = optional_inspection_text(
         payload.get("serial_number")
         or inventory.get("serial_number")
         or (system_vendor.get("serial_number") if isinstance(system_vendor, dict) else None)
         or (system_vendor.get("serial") if isinstance(system_vendor, dict) else None)
-        or (system_serial.get("serial_number") if isinstance(system_serial, dict) else None)
-        or ""
+        or (system_serial.get("serial_number") if isinstance(system_serial, dict) else None),
+        "Node serial number",
     )
-    if not isinstance(serial_number, str):
-        raise ValueError("Node serial number must be a string.")
 
-    return node_uuid, bmc_address, serial_number.strip(), inventory
+    return node_uuid, bmc_address, serial_number, inventory
+
+
+def optional_inspection_text(value, label):
+    # JSON null and a missing field are blank. The upsert keeps the stored value.
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string.")
+    return value.strip()
 
 
 def safe_ansible_name(value, field, node_uuid):
@@ -2227,6 +2234,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json(error.status, {"error": str(error)})
             except ValueError as error:
                 self.send_json(400, {"error": str(error)})
+            except psycopg.errors.LockNotAvailable:
+                self.send_json(503, {"error": "The inspection store is busy."})
             except psycopg.Error:
                 self.send_json(500, {"error": "Database operation failed."})
             return
@@ -2617,9 +2626,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                             (uuid, bmc_address, serial_number, inventory_json, source, first_seen, updated_at)
                         VALUES (?, ?, ?, ?, 'ipa', ?, ?)
                         ON CONFLICT(uuid) DO UPDATE SET
-                            bmc_address = excluded.bmc_address,
+                            bmc_address = CASE
+                                WHEN excluded.bmc_address IS NULL OR excluded.bmc_address = ''
+                                    THEN nodes.bmc_address
+                                ELSE excluded.bmc_address
+                            END,
                             serial_number = CASE
-                                WHEN excluded.serial_number = '' THEN nodes.serial_number
+                                WHEN excluded.serial_number IS NULL OR excluded.serial_number = ''
+                                    THEN nodes.serial_number
                                 ELSE excluded.serial_number
                             END,
                             inventory_json = excluded.inventory_json,

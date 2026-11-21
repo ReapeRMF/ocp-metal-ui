@@ -2369,6 +2369,23 @@ class ApiTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(stored["count"], 1)
 
+        def fail_until_retries_run_out(connection, sql, params=None):
+            if "ON CONFLICT(uuid) DO UPDATE" in sql:
+                raise server.psycopg.errors.LockNotAvailable(
+                    "canceling statement due to lock timeout"
+                )
+            return original(connection, sql, params)
+
+        with patch.object(server.DatabaseConnection, "execute", fail_until_retries_run_out):
+            status, body, _ = self.request(
+                "POST", "/api/v1/inspections", self.report(bmc_address="192.0.2.55"), token=None
+            )
+        self.assertEqual(status, 503, body)
+        self.assertIn(b"inspection store is busy", body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.21")
+
     def test_chunk_trailers_are_capped_and_a_stalled_read_closes(self):
         self.assertEqual(server.ApiHandler.timeout, 60)
 
@@ -2424,6 +2441,54 @@ class ApiTests(unittest.TestCase):
             "POST", "/api/v1/inspections", self.report(), token=None
         )
         self.assertEqual(status, 202, response_body)
+
+    def test_blank_or_missing_bmc_keeps_the_stored_address(self):
+        first = self.report(bmc_address="192.0.2.77")
+        status, _, _ = self.request("POST", "/api/v1/inspections", first, token=None)
+        self.assertEqual(status, 202)
+
+        missing = self.report()
+        missing.pop("bmc_address", None)
+        missing["inventory"].pop("bmc_address", None)
+        missing["inventory"]["cpu"]["model_name"] = "Missing BMC"
+        status, body, _ = self.request("POST", "/api/v1/inspections", missing, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.77")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Missing BMC")
+
+        blank = self.report(bmc_address="")
+        blank["inventory"]["cpu"]["model_name"] = "Blank BMC"
+        status, body, _ = self.request("POST", "/api/v1/inspections", blank, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.77")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Blank BMC")
+
+        null_address = self.report(bmc_address=None)
+        null_address["inventory"]["bmc_address"] = None
+        null_address["inventory"]["cpu"]["model_name"] = "Null BMC"
+        null_address["serial_number"] = None
+        null_address["inventory"]["system_vendor"]["serial_number"] = None
+        status, body, _ = self.request("POST", "/api/v1/inspections", null_address, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.77")
+        self.assertEqual(node["serial_number"], "NODE-SERIAL-01")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Null BMC")
+
+        replaced = self.report(bmc_address="192.0.2.88")
+        replaced["inventory"]["cpu"]["model_name"] = "New BMC"
+        status, body, _ = self.request("POST", "/api/v1/inspections", replaced, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.88")
+        self.assertEqual(node["serial_number"], "NODE-SERIAL-01")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "New BMC")
 
     def test_reinspection_refreshes_hardware_and_keeps_preferences(self):
         status, _, _ = self.request("POST", "/api/v1/inspections", self.report(), token=None)

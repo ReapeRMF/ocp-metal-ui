@@ -24,7 +24,7 @@ HOST_PORT=18080 ./airgap-deploy-bundle.sh
 ## Data flow
 
 1. An inspection client sends a node UUID and `inventory` JSON to `POST /api/v1/inspections`, or to `POST /api/v1/inspections/{uuid}`.
-2. The API creates a node from the first report for a UUID. A later report refreshes that node's BMC address, serial number, and inventory, and is stored as another revision. A blank serial number keeps the serial already stored. Preferences and other operator settings stay as they are.
+2. The API creates a node from the first report for a UUID. A later report refreshes that node's BMC address, serial number, and inventory, and is stored as another revision. A blank or missing serial number or BMC address keeps the stored value. A non-blank value overwrites it. Preferences and other operator settings stay as they are.
 3. The UI polls `GET /api/v1/nodes` every 15 seconds.
 4. The operator can create named placeholder hosts before reports arrive, then link each name to a discovered node. The inventory group is set in application configuration.
 5. **Review and confirm** lists discovered nodes and named placeholders. The operator can refresh before confirming.
@@ -35,7 +35,7 @@ The home page links to the cluster blueprint and to BMC profiles. Blueprint, inv
 
 ## Inspection reports
 
-The body matches an Ironic inspection report: a JSON object with an `inventory` object and a node `uuid`. The UUID may be in the URL instead. `bmc_address` is optional.
+The body matches an Ironic inspection report: a JSON object with an `inventory` object and a node `uuid`. The UUID may be in the URL instead. `bmc_address` is optional. On a later report, a blank or missing BMC address or serial number keeps the stored value, and a non-blank one overwrites it.
 
 The serial number is read from, in order:
 
@@ -97,7 +97,7 @@ The collector is not in this repository. `hw-interrogator` in `build-the-builder
 2. Do not send an API token. If a `Authorization: Bearer` header is still present, the intake routes ignore it and still accept the report. `Content-Type` is also ignored: the body is parsed as JSON even when the header is missing or is not `application/json`. These routes are open to a cross-site simple POST. That request can add a report revision and overwrite the BMC address, serial number, and inventory of an existing node. It cannot read inventory or call any other API. See [Security model / accepted risks](#security-model--accepted-risks).
 3. These two routes do not check the `Host` header. Every other route does. That exemption is what lets a collector post by IP even when that IP was not listed in `API_ALLOWED_HOSTS` or `hostname -I`.
 4. The body must be a JSON object with an `inventory` object, and a UUID in the body or the URL. The UUID must be a canonical UUID. Reports larger than 2 MiB are rejected. The response is `{"status":"accepted"}` and does not include the stored node.
-5. The first report for a UUID creates the node. Another report for the same UUID refreshes the BMC address, serial number, and inventory from that report and is kept as a revision. A blank serial number keeps the stored serial. Preferences are left unchanged. A retry is not an error.
+5. The first report for a UUID creates the node. Another report for the same UUID refreshes the BMC address, serial number, and inventory from that report and is kept as a revision. A blank or missing serial number or BMC address keeps the stored value. A non-blank one overwrites it. Preferences are left unchanged. A retry is not an error.
 6. Do not call any other `/api/` path. Those routes require the admin token from `/var/lib/ocp-metal-ui/api.token`.
 
 ```sh
@@ -111,7 +111,7 @@ curl --cacert /etc/ipa/ocp-metal-ui.crt \
 
 Inspection intake, `POST /api/v1/inspections` and `POST /api/v1/inspections/{uuid}`, is unauthenticated. That is the owner's decision: a hardware collector posts a report with no token.
 
-Anyone who can reach the server can submit a report that overwrites an existing node's BMC address, serial number, and inventory. **Generate Ansible Files** writes those hardware facts into the Ansible inventory and host vars. Intake does not change preferences or other operator settings.
+Anyone who can reach the server can submit a report that overwrites an existing node's BMC address, serial number, and inventory. A non-blank BMC address or serial number replaces the stored value. A blank or missing one keeps the value already stored. **Generate Ansible Files** writes those hardware facts into the Ansible inventory and host vars. Intake does not change preferences or other operator settings.
 
 Two residuals remain:
 
@@ -356,6 +356,6 @@ npm run test:backend
 | `PUT` | `/api/v1/configuration` | Save the blueprint, workspace destination, and node preferences |
 | `POST` | `/api/v1/ansible-files` | Write the reviewed inventory and variables into the workspace |
 
-Every `/api/` route except `GET /api/v1/health` and inspection intake requires the admin bearer token. Inspection intake accepts reports with no token and does not check `Host`. A later report overwrites that node's BMC address, serial number, and inventory. HTTPS protects credentials in transit. The `Host` header is checked on every other route so a DNS-rebinding name cannot call the API. Firewall the UI port to the provisioning network. See [Security model / accepted risks](#security-model--accepted-risks).
+Every `/api/` route except `GET /api/v1/health` and inspection intake requires the admin bearer token. Inspection intake accepts reports with no token and does not check `Host`. A later report overwrites that node's BMC address and serial number when the new value is non-blank, and refreshes inventory. A blank or missing serial or BMC address keeps the stored value. HTTPS protects credentials in transit. The `Host` header is checked on every other route so a DNS-rebinding name cannot call the API. Firewall the UI port to the provisioning network. See [Security model / accepted risks](#security-model--accepted-risks).
 
 Generated host vars contain hardware inventory. Handle that data under your organization's policy. Keep secrets in Ansible Vault. Redfish credentials are not written to disk.
