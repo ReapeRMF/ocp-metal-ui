@@ -1287,9 +1287,19 @@ def request_hostname(host_header):
     return host.rstrip(".")
 
 
+def normalize_allowed_name(value):
+    name = value.strip().lower()
+    if not name:
+        return ""
+    # [2001:db8::1] and [2001:db8::1]:443 are the same host as the bare address.
+    if name.startswith("["):
+        return request_hostname(name)
+    return name.rstrip(".")
+
+
 def allowed_api_hosts():
     names = {"localhost", "127.0.0.1", "::1"}
-    bind = os.environ.get("HOST", "127.0.0.1").strip().lower()
+    bind = normalize_allowed_name(os.environ.get("HOST", "127.0.0.1"))
     if bind and bind not in {"0.0.0.0", "::"}:
         names.add(bind)
     for source in (
@@ -1297,7 +1307,7 @@ def allowed_api_hosts():
         os.environ.get("API_ALLOWED_HOSTS", ""),
     ):
         for item in source.split(","):
-            name = item.strip().lower().rstrip(".")
+            name = normalize_allowed_name(item)
             if name:
                 names.add(name)
     return names
@@ -1314,7 +1324,10 @@ def authorize_api(method, path, authorization):
     token is accepted only for inspection posts.
     """
     normalized_path = path.lower()
-    if not normalized_path.startswith("/api/") or normalized_path == "/api/v1/health":
+    if not normalized_path.startswith("/api/"):
+        return None
+    # Only the exact health path is public. /api/v1/HEALTH is not that route.
+    if path == "/api/v1/health":
         return None
     admin = configured_admin_token()
     if admin is None:

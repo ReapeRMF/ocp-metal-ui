@@ -481,6 +481,17 @@ echo "   Both files stay outside the git checkout. Delete a file before the next
 echo "📂 Ansible workspace is mounted from: $ANSIBLE_HOST_DIR"
 echo "   Set ANSIBLE_HOST_DIR before deployment to use another host directory."
 echo "   Ensure the container user (UID 10001) can write to that directory."
+host_allowlist="localhost 127.0.0.1 ::1"
+if [ "$BIND_ADDRESS" != "0.0.0.0" ] && [ "$BIND_ADDRESS" != "::" ]; then
+  host_allowlist="${host_allowlist} ${BIND_ADDRESS}"
+fi
+if [ -n "${TLS_HOSTNAME:-}" ]; then
+  host_allowlist="${host_allowlist} ${TLS_HOSTNAME}"
+fi
+if [ -n "$API_ALLOWED_HOSTS_VALUE" ]; then
+  host_allowlist="${host_allowlist} ${API_ALLOWED_HOSTS_VALUE//,/ }"
+fi
+echo "👉 Host allowlist: ${host_allowlist}"
 echo "⚠️  The default bind is 127.0.0.1. Set BIND_ADDRESS only for a network you trust."
 echo "   Every /api/ route except /api/v1/health requires the admin token."
 echo "   POST /api/v1/inspections also accepts the inspection token and nothing else."

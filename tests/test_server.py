@@ -2225,7 +2225,15 @@ class ApiTests(unittest.TestCase):
         status, body, _ = self.request("GET", "/API/v1/config", token=None)
         self.assertEqual(status, 401, body)
         status, body, _ = self.request("GET", "/API/v1/health", token=None)
-        self.assertEqual(status, 200, body)
+        self.assertEqual(status, 401, body)
+        status, body, _ = self.request("GET", "/api/v1/HEALTH", token=None)
+        self.assertEqual(status, 401, body)
+        self.assertIn(b"Authentication is required.", body)
+        with patch.dict(os.environ, {"API_ALLOWED_HOSTS": "[2001:db8::20]"}, clear=False):
+            status, body, _ = self.request(
+                "GET", "/api/v1/health", token=None, host="[2001:db8::20]"
+            )
+            self.assertEqual(status, 200, body)
         status, body, _ = self.request(
             "GET", "/api/v1/config", authorization=f"Bearer   {self.api_token}  "
         )
