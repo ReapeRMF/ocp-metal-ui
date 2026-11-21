@@ -28,7 +28,9 @@ printf 'real-password\n' > "$operator"
 chmod 600 "$operator"
 
 staged="$TMP/staged-vault.password"
+hardlink="$TMP/hardlink-source"
 printf 'staged-copy\n' > "$staged"
+ln "$staged" "$hardlink"
 "${AS_ROOT[@]}" chown 10001:10001 "$staged"
 "${AS_ROOT[@]}" chmod 0400 "$staged"
 
@@ -49,8 +51,10 @@ fail() {
 [ "$(decide "$operator" "$operator")" = "keep" ] || fail "configured source was removed"
 [ "$(decide "$staged" "$operator")" = "remove" ] || fail "old staged copy was kept"
 [ "$(decide "$staged" "$staged")" = "keep" ] || fail "staged file used as the source was removed"
+[ "$(decide "$staged" "$hardlink")" = "keep" ] || fail "hardlinked source was removed"
 [ "$(decide "$other" "$operator")" = "keep" ] || fail "operator-owned file was removed"
 [ "$(decide "$root_owned" "$operator")" = "keep" ] || fail "root-owned mode 0400 file was removed"
 [ "$(decide "$TMP/missing" "$operator")" = "keep" ] || fail "missing file was treated as removable"
+[ "$(decide "$staged" "$TMP/missing-source")" = "keep" ] || fail "staged copy was removed while the source was missing"
 
 echo "vault cleanup decisions: pass"
