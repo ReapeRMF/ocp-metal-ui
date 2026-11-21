@@ -41,6 +41,9 @@ VAULT_PASSWORD_FILE = Path(os.environ.get("VAULT_PASSWORD_FILE", "/vault/passwor
 TLS_CERT_FILE = os.environ.get("TLS_CERT_FILE")
 TLS_KEY_FILE = os.environ.get("TLS_KEY_FILE")
 MAX_REQUEST_BYTES = 5 * 1024 * 1024
+# Ironic-style inspection reports are usually tens or hundreds of kilobytes.
+# Two mebibytes covers a report with many disks, NICs, and LLDP neighbors.
+INSPECTION_MAX_BYTES = 2 * 1024 * 1024
 ANSIBLE_OUTPUT_SUBDIR = "ocp-metal-ui"
 ANSIBLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 PREFERENCE_FIELDS = {
@@ -105,6 +108,12 @@ class RedfishError(ValueError):
 
 class InstallSecretError(ValueError):
     def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+class InspectionRequestError(Exception):
+    def __init__(self, status, message):
         super().__init__(message)
         self.status = status
 
@@ -1032,6 +1041,16 @@ def initialize_database():
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS inspection_reports (
+                id BIGSERIAL PRIMARY KEY,
+                node_uuid TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                report_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value_json TEXT NOT NULL
@@ -1232,15 +1251,6 @@ def configured_admin_token():
     return token or None
 
 
-def configured_inspection_token():
-    file_name = os.environ.get("INSPECTION_TOKEN_FILE", "").strip()
-    if file_name:
-        token = _token_from_file(file_name)
-        return token or None
-    token = os.environ.get("INSPECTION_TOKEN", "").encode("utf-8").strip()
-    return token or None
-
-
 def bearer_matches(header_value, expected):
     presented = b""
     if isinstance(header_value, str):
@@ -1255,9 +1265,8 @@ def bearer_matches(header_value, expected):
     )
 
 
-def is_inspection_post(method, path):
-    if method != "POST":
-        return False
+def is_inspection_intake(path):
+    """Exact intake routes. Case variants stay behind the admin token."""
     if path == "/api/v1/inspections":
         return True
     return re.fullmatch(r"/api/v1/inspections/[^/]+", path) is not None
@@ -1329,17 +1338,14 @@ def authorize_api(method, path, authorization):
     # Only the exact health path is public. /api/v1/HEALTH is not that route.
     if path == "/api/v1/health":
         return None
+    # Hardware reports are unauthenticated intake. A Bearer header, including
+    # a stale inspection token from an older collector, is ignored.
+    if method == "POST" and is_inspection_intake(path):
+        return None
     admin = configured_admin_token()
     if admin is None:
         return 503, "The API token is not configured."
     if bearer_matches(authorization, admin):
-        return None
-    inspection = configured_inspection_token()
-    if (
-        inspection
-        and is_inspection_post(method, normalized_path)
-        and bearer_matches(authorization, inspection)
-    ):
         return None
     return 401, "Authentication is required."
 
@@ -2022,12 +2028,16 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def guard_request(self, method):
         path = urlparse(self.path).path
-        host_values = self.headers.get_all("Host") or []
-        if len(host_values) != 1 or not host_is_allowed(host_values[0]):
-            if method in {"POST", "PUT", "PATCH"}:
-                self.discard_body()
-            self.send_json(421, {"error": "Host is not allowed."})
-            return False
+        # Intake is exempt from the Host allowlist. The collector posts to
+        # whichever address reaches this process, and a missed IP would drop
+        # the report. Every other route, including the UI, still checks Host.
+        if not (method == "POST" and is_inspection_intake(path)):
+            host_values = self.headers.get_all("Host") or []
+            if len(host_values) != 1 or not host_is_allowed(host_values[0]):
+                if method in {"POST", "PUT", "PATCH"}:
+                    self.discard_body()
+                self.send_json(421, {"error": "Host is not allowed."})
+                return False
         decision = authorize_api(method, path, self.headers.get("Authorization", ""))
         if decision is None:
             return True
@@ -2161,14 +2171,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 {"error": "Pull secrets and SSH keys are accepted only over HTTPS."},
             )
             return
+        if is_inspection_intake(path):
+            try:
+                self.accept_inspection(path)
+            except InspectionRequestError as error:
+                self.send_json(error.status, {"error": str(error)})
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+            except psycopg.Error:
+                self.send_json(500, {"error": "Database operation failed."})
+            return
         try:
             payload = self.read_json()
-            if path == "/api/v1/inspections":
-                self.store_inspection(payload)
-            elif re.fullmatch(r"/api/v1/inspections/[^/]+", path):
-                path_uuid = unquote(path.rsplit("/", 1)[1])
-                self.store_inspection(payload, path_uuid)
-            elif path == "/api/v1/ansible-files":
+            if path == "/api/v1/ansible-files":
                 self.commit_ansible_files(payload)
             elif path == "/api/v1/nodes":
                 self.create_named_node(payload)
@@ -2454,24 +2469,37 @@ class ApiHandler(BaseHTTPRequestHandler):
             {"status": "saved", "savedNodes": len(normalized_preferences)},
         )
 
-    def store_inspection(self, payload, path_uuid=None):
+    def read_inspection_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise InspectionRequestError(400, "Invalid Content-Length.") from error
+        if length <= 0:
+            raise InspectionRequestError(400, "Inspection report must be a JSON object.")
+        if length > INSPECTION_MAX_BYTES:
+            raise InspectionRequestError(413, "Inspection report is too large.")
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise InspectionRequestError(400, "Inspection report must be a JSON object.") from error
+        return payload
+
+    def accept_inspection(self, path):
+        path_uuid = None
+        if path != "/api/v1/inspections":
+            path_uuid = unquote(path.rsplit("/", 1)[1])
+        payload = self.read_inspection_body()
         node_uuid, bmc_address, serial_number, inventory = parse_inspection(payload, path_uuid)
         now = utc_now()
+        report_json = json.dumps(payload, ensure_ascii=False)
         with connect_database() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 INSERT INTO nodes
                     (uuid, bmc_address, serial_number, inventory_json, source, first_seen, updated_at)
                 VALUES (?, ?, ?, ?, 'ipa', ?, ?)
-                ON CONFLICT(uuid) DO UPDATE SET
-                    bmc_address = excluded.bmc_address,
-                    serial_number = CASE
-                        WHEN excluded.serial_number = '' THEN nodes.serial_number
-                        ELSE excluded.serial_number
-                    END,
-                    inventory_json = excluded.inventory_json,
-                    source = 'ipa',
-                    updated_at = excluded.updated_at
+                ON CONFLICT(uuid) DO NOTHING
                 """,
                 (
                     node_uuid,
@@ -2482,7 +2510,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                     now,
                 ),
             )
-        self.send_json(202, {"uuid": node_uuid, "status": "stored"})
+            connection.execute(
+                """
+                INSERT INTO inspection_reports (node_uuid, received_at, report_json)
+                VALUES (?, ?, ?)
+                """,
+                (node_uuid, now, report_json),
+            )
+        self.send_json(202, {"status": "accepted"})
 
     def create_named_node(self, payload):
         if not isinstance(payload, dict):

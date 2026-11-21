@@ -392,9 +392,7 @@ fi
 # 3. Start the application. The image still declares /data; the database
 # is the PostgreSQL container, so that mount stays empty.
 API_TOKEN_FILE="${API_TOKEN_FILE:-/var/lib/ocp-metal-ui/api.token}"
-INSPECTION_TOKEN_FILE="${INSPECTION_TOKEN_FILE:-/var/lib/ocp-metal-ui/inspection.token}"
-INSPECTION_CURL_CONFIG="${INSPECTION_CURL_CONFIG:-/var/lib/ocp-metal-ui/inspection.curl}"
-install -d -o root -g root -m 755 "$(dirname "$API_TOKEN_FILE")" "$(dirname "$INSPECTION_TOKEN_FILE")"
+install -d -o root -g root -m 755 "$(dirname "$API_TOKEN_FILE")"
 write_private_token() {
   local path="$1"
   local previous_umask
@@ -411,18 +409,6 @@ write_private_token() {
   fi
 }
 write_private_token "$API_TOKEN_FILE"
-write_private_token "$INSPECTION_TOKEN_FILE"
-previous_umask="$(umask)"
-umask 077
-inspection_token_value="$(tr -d '[:space:]' < "$INSPECTION_TOKEN_FILE")"
-printf 'header = "Authorization: Bearer %s"\n' "$inspection_token_value" > "$INSPECTION_CURL_CONFIG"
-unset inspection_token_value
-chmod 600 "$INSPECTION_CURL_CONFIG"
-umask "$previous_umask"
-if [ "$(id -u)" -eq 0 ]; then
-  chown 10001:10001 "$INSPECTION_CURL_CONFIG"
-  chmod 0400 "$INSPECTION_CURL_CONFIG"
-fi
 install -d -o 10001 -g 10001 -m 755 "$(dirname "$UI_DATABASE_ENV_FILE")/empty"
 BIND_ADDRESS="${BIND_ADDRESS:-127.0.0.1}"
 API_ALLOWED_HOSTS_VALUE="${API_ALLOWED_HOSTS:-}"
@@ -448,9 +434,7 @@ $ENGINE run -d \
   -e "TLS_HOSTNAME=${TLS_HOSTNAME}" \
   -e "API_ALLOWED_HOSTS=${API_ALLOWED_HOSTS_VALUE}" \
   -e API_TOKEN_FILE=/run/secrets/api-token \
-  -e INSPECTION_TOKEN_FILE=/run/secrets/inspection-token \
   -v "${API_TOKEN_FILE}:/run/secrets/api-token:ro,Z" \
-  -v "${INSPECTION_TOKEN_FILE}:/run/secrets/inspection-token:ro,Z" \
   -v "$(dirname "$UI_DATABASE_ENV_FILE")/empty:/data:Z" \
   -v "$ANSIBLE_HOST_DIR:/ansible:Z" \
   -e ANSIBLE_WORKING_DIR=/ansible \
@@ -474,10 +458,9 @@ echo "💾 PostgreSQL data directory: ${UI_DB_DATA_DIR}"
 echo "   Database ocp_metal_ui listens on ${UI_DB_PUBLISH_ADDRESS}."
 echo "   Credentials: ${UI_DB_CREDENTIALS_FILE}"
 echo "🔑 Admin API token file: ${API_TOKEN_FILE}"
-echo "   Paste that token into the UI. It authorizes every /api/ route except health."
-echo "🔑 Inspection token file: ${INSPECTION_TOKEN_FILE}"
-echo "   The collector uses only this token. Curl config: ${INSPECTION_CURL_CONFIG}"
-echo "   Both files stay outside the git checkout. Delete a file before the next deploy to rotate it."
+echo "   Paste that token into the UI. It authorizes every /api/ route except health and inspection intake."
+echo "   The file stays outside the git checkout. Delete it before the next deploy to rotate it."
+echo "   Hardware reports need no token. POST /api/v1/inspections ignores Host and any Bearer header."
 echo "📂 Ansible workspace is mounted from: $ANSIBLE_HOST_DIR"
 echo "   Set ANSIBLE_HOST_DIR before deployment to use another host directory."
 echo "   Ensure the container user (UID 10001) can write to that directory."
@@ -493,6 +476,5 @@ if [ -n "$API_ALLOWED_HOSTS_VALUE" ]; then
 fi
 echo "👉 Host allowlist: ${host_allowlist}"
 echo "⚠️  The default bind is 127.0.0.1. Set BIND_ADDRESS only for a network you trust."
-echo "   Every /api/ route except /api/v1/health requires the admin token."
-echo "   POST /api/v1/inspections also accepts the inspection token and nothing else."
+echo "   Every /api/ route except /api/v1/health and inspection intake requires the admin token."
 echo "========================================================="

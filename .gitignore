@@ -25,8 +25,8 @@ pull-secret.vault
 # ignored so an old staged copy is not committed.
 vault.password
 
-# Tokens belong outside the checkout. The deploy writes
-# /var/lib/ocp-metal-ui/api.token and inspection.token.
+# The admin token belongs outside the checkout, at
+# /var/lib/ocp-metal-ui/api.token. These names are ignored if a copy is left here.
 api.token
 inspection.token
 inspection.curl

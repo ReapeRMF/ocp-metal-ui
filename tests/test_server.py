@@ -43,7 +43,7 @@ class ApiTests(unittest.TestCase):
         server.ANSIBLE_WORKING_DIR.mkdir()
         server.initialize_database()
         with server.connect_database() as connection:
-            connection.execute("TRUNCATE TABLE nodes, app_settings")
+            connection.execute("TRUNCATE TABLE nodes, app_settings, inspection_reports")
         self.api_token = "test-api-token"
         self.inspection_token = "test-inspection-token"
         self._api_token_env = patch.dict(
@@ -135,12 +135,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"saved": 1})
 
         updated_report = self.report(bmc_address="192.0.2.99")
-        status, _, _ = self.request("POST", f"/api/v1/inspections/{NODE_UUID}", updated_report)
+        status, body, _ = self.request("POST", f"/api/v1/inspections/{NODE_UUID}", updated_report)
         self.assertEqual(status, 202)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
         status, body, _ = self.request("GET", "/api/v1/nodes")
         self.assertEqual(status, 200)
         node = json.loads(body)[0]
-        self.assertEqual(node["bmc_address"], "192.0.2.99")
+        self.assertEqual(node["bmc_address"], "192.0.2.21")
         self.assertEqual(node["serial_number"], "NODE-SERIAL-01")
         self.assertEqual(node["inventory"]["cpu"]["model_name"], "Example CPU")
         self.assertEqual(node["inventory"]["interfaces"][0]["state"], "up")
@@ -2177,26 +2178,80 @@ class ApiTests(unittest.TestCase):
             )
             self.assertEqual(status, 401, body)
 
-        status, body, _ = self.request(
-            "POST", "/api/v1/inspections", self.report(), token=self.inspection_token
-        )
+        fresh = self.report()
+        fresh["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821011"
+        fresh["inventory"]["system_vendor"]["serial_number"] = "INTAKE-01"
+        status, body, _ = self.request("POST", "/api/v1/inspections", fresh, token=None)
         self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
+        self.assertNotIn(b"INTAKE-01", body)
         status, body, _ = self.request(
             "POST",
-            f"/api/v1/inspections/{NODE_UUID}",
-            self.report(),
-            token=self.inspection_token,
+            "/api/v1/inspections",
+            fresh,
+            authorization="Bearer stale-collector-token",
         )
         self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections",
+            fresh,
+            host="192.0.2.35",
+            token=None,
+        )
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        stored = {node["uuid"]: node for node in json.loads(body)}
+        self.assertEqual(stored[fresh["uuid"]]["bmc_address"], "192.0.2.21")
+        with server.connect_database() as connection:
+            revisions = connection.execute(
+                "SELECT COUNT(*) AS count FROM inspection_reports WHERE node_uuid = ?",
+                (fresh["uuid"],),
+            ).fetchone()["count"]
+        self.assertEqual(revisions, 3)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections",
+            {"inventory": {}},
+            token=None,
+        )
+        self.assertEqual(status, 400, body)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections/not-a-uuid",
+            fresh,
+            token=None,
+        )
+        self.assertEqual(status, 400, body)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections",
+            ["not", "an", "object"],
+            token=None,
+        )
+        self.assertEqual(status, 400, body)
+        connection = http.client.HTTPConnection(*self.httpd.server_address)
+        connection.putrequest("POST", "/api/v1/inspections")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(server.INSPECTION_MAX_BYTES + 1))
+        connection.endheaders()
+        oversized = connection.getresponse()
+        self.assertEqual(oversized.status, 413)
+        oversized.read()
+        connection.close()
+
         for method, path in (
             ("GET", "/api/v1/config"),
             ("GET", "/api/v1/nodes"),
             ("GET", f"/api/v1/install-secrets/ssh-private-key?outputDirectory={destination}"),
             ("POST", "/api/v1/ansible-files"),
+            ("POST", "/API/v1/inspections"),
         ):
-            with self.subTest(inspection=path):
-                payload = {"outputDirectory": str(server.ANSIBLE_WORKING_DIR)} if method == "POST" else None
-                status, body, _ = self.request(method, path, payload, token=self.inspection_token)
+            with self.subTest(protected=path):
+                payload = fresh if method == "POST" else None
+                status, body, _ = self.request(method, path, payload, token=None)
                 self.assertEqual(status, 401, body)
 
         missing = Path(self.temp_dir.name) / "missing-api-token"
@@ -2207,8 +2262,8 @@ class ApiTests(unittest.TestCase):
         ):
             status, body, _ = self.request("GET", "/api/v1/config", token=None)
             self.assertEqual(status, 503, body)
-            status, body, _ = self.request("POST", "/api/v1/inspections", self.report(), token=None)
-            self.assertEqual(status, 503, body)
+            status, body, _ = self.request("POST", "/api/v1/inspections", fresh, token=None)
+            self.assertEqual(status, 202, body)
             status, _, _ = self.request("GET", "/api/v1/health", token=None)
             self.assertEqual(status, 200)
 

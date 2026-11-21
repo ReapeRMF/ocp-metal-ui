@@ -11,7 +11,7 @@ One container serves the PatternFly UI and its API. The operator reviews discove
 | Example installed host (`genesisIp`) | `192.0.2.35` | `3003` |
 | This workstation | `127.0.0.1` | `18080` |
 
-Port 3003 is the UI on the installed host. Semaphore on that host uses port 3000. The hardware collector on that host uses port 5000 and posts inspection reports to `https://127.0.0.1:3003` with the inspection token. It does not use the admin token. Boot files are served by httpd on port 80. See [Inspection client contract](#inspection-client-contract).
+Port 3003 is the UI on the installed host. Semaphore on that host uses port 3000. The hardware collector on that host uses port 5000 and posts inspection reports to `https://127.0.0.1:3003` with no token. Boot files are served by httpd on port 80. See [Inspection client contract](#inspection-client-contract).
 
 The workstation container is a separate process. Open it at `https://edge.example.com:18080` when the certificate was issued for that name.
 
@@ -24,7 +24,7 @@ HOST_PORT=18080 ./airgap-deploy-bundle.sh
 ## Data flow
 
 1. An inspection client sends a node UUID and `inventory` JSON to `POST /api/v1/inspections`, or to `POST /api/v1/inspections/{uuid}`.
-2. The API upserts the report in PostgreSQL. A later report for the same UUID refreshes inventory and keeps the operator's preferences.
+2. The API creates a node from the first report for a UUID. A later report for that UUID is stored as another revision and does not change the node, its inventory, or its preferences.
 3. The UI polls `GET /api/v1/nodes` every 15 seconds.
 4. The operator can create named placeholder hosts before reports arrive, then link each name to a discovered node. The inventory group is set in application configuration.
 5. **Review and confirm** lists discovered nodes and named placeholders. The operator can refresh before confirming.
@@ -82,27 +82,26 @@ On the installed host, post the report to port 3003. The DNS name in the URL mus
 BIND_ADDRESS=192.0.2.35 TLS_HOSTNAME=edge.example.com ./airgap-deploy-bundle.sh
 
 curl --cacert /etc/ipa/ocp-metal-ui.crt \
-  --config /var/lib/ocp-metal-ui/inspection.curl \
   -X POST https://edge.example.com:3003/api/v1/inspections \
   -H 'Content-Type: application/json' \
   --data-binary @inspection-report.json
 ```
 
-The API stores the report. It does not configure IPA or replace an Ironic conductor. Point the existing inspection workflow at this URL and give it the inspection token. Do not give it the admin token.
+The API stores the report. It does not configure IPA or replace an Ironic conductor. Point the existing inspection workflow at this URL. No token is required. A `Bearer` header, if an older collector still sends one, is ignored.
 
 ## Inspection client contract
 
-The collector is not in this repository. `hw-interrogator` in `build-the-builder` has to do the following before discovery will succeed:
+The collector is not in this repository. `hw-interrogator` in `build-the-builder` posts hardware reports and does not need a credential.
 
-1. Read the token from the file named by `INSPECTION_TOKEN_FILE`. When that variable is unset, the path is `/var/lib/ocp-metal-ui/inspection.token`. If the file is missing, use the `INSPECTION_TOKEN` environment variable. Do not read `API_TOKEN`, `API_TOKEN_FILE`, or `/var/lib/ocp-metal-ui/api.token`.
-2. `POST` the inspection JSON to `https://127.0.0.1:3003/api/v1/inspections` or `https://127.0.0.1:3003/api/v1/inspections/{uuid}`. The deploy serves HTTPS. Use the UI certificate. Do not post to plain HTTP.
-3. Set the header `Authorization: Bearer <inspection token>` in the HTTP client. The scheme is case-insensitive. Do not expand the token into a shell command line. A curl client can pass `--config /var/lib/ocp-metal-ui/inspection.curl` instead.
-4. Send `Host: 127.0.0.1`, `Host: localhost`, or `Host` set to `TLS_HOSTNAME`. Other names need `API_ALLOWED_HOSTS` on the UI.
-5. Do not call any other `/api/` path with this token. Config, nodes, install secrets, and the SSH private key reject it.
+1. `POST` the inspection JSON to `https://<address>:3003/api/v1/inspections` or `https://<address>:3003/api/v1/inspections/{uuid}`. The deploy serves HTTPS. Use the UI certificate. Do not post to plain HTTP. The address may be `127.0.0.1` or another IP of the UI host.
+2. Do not send an API token. If a `Authorization: Bearer` header is still present, the intake routes ignore it and still accept the report.
+3. These two routes do not check the `Host` header. Every other route does. That exemption is what lets a collector post by IP even when that IP was not listed in `API_ALLOWED_HOSTS` or `hostname -I`.
+4. The body must be a JSON object with an `inventory` object, and a UUID in the body or the URL. The UUID must be a canonical UUID. Reports larger than 2 MiB are rejected. The response is `{"status":"accepted"}` and does not include the stored node.
+5. The first report for a UUID creates the node. Another report for the same UUID is kept as a revision and does not change that node. A retry is not an error.
+6. Do not call any other `/api/` path. Those routes require the admin token from `/var/lib/ocp-metal-ui/api.token`.
 
 ```sh
 curl --cacert /etc/ipa/ocp-metal-ui.crt \
-  --config /var/lib/ocp-metal-ui/inspection.curl \
   -X POST https://127.0.0.1:3003/api/v1/inspections \
   -H 'Content-Type: application/json' \
   --data-binary @inspection-report.json
@@ -227,12 +226,10 @@ The first deploy writes two token files outside the git checkout, mode 0400, own
 | File | Use |
 | --- | --- |
 | `/var/lib/ocp-metal-ui/api.token` | Admin token. Paste it into the UI **API token** field and choose **Use token**. The browser keeps it in `sessionStorage` for the tab. |
-| `/var/lib/ocp-metal-ui/inspection.token` | Inspection token. Only the hardware collector uses it. |
-| `/var/lib/ocp-metal-ui/inspection.curl` | curl config whose `header` line carries the inspection token. `curl --config` reads it, so the token is not placed on the command line. |
 
-The container reads the admin token from `/run/secrets/api-token` and the inspection token from `/run/secrets/inspection-token`. Delete a file before the next deploy to rotate that token. Set `API_TOKEN_FILE` or `INSPECTION_TOKEN_FILE` to use different paths.
+The container reads the admin token from `/run/secrets/api-token`. Delete the file before the next deploy to rotate it. Set `API_TOKEN_FILE` to use a different path. Hardware inspection posts do not use this token.
 
-Every `/api/` route except `GET /api/v1/health` requires the admin token. The inspection token is accepted only for `POST /api/v1/inspections` and `POST /api/v1/inspections/{uuid}`. It cannot read config or nodes, and it cannot download the SSH private key. The `Host` header must be `localhost`, `127.0.0.1`, `::1`, `TLS_HOSTNAME`, or a name in `API_ALLOWED_HOSTS`. The deploy forwards `API_ALLOWED_HOSTS` into the container. When `BIND_ADDRESS` is `0.0.0.0` or `::`, it also allows the addresses from `hostname -I`, so the UI can be opened by the host IP. Leave the bind on `127.0.0.1` unless that is what you want. `BIND_ADDRESS` still overrides it. Binding any other address without TLS prints a warning.
+Every `/api/` route except `GET /api/v1/health` and the two inspection intake routes requires the admin token. The `Host` header must be `localhost`, `127.0.0.1`, `::1`, `TLS_HOSTNAME`, or a name in `API_ALLOWED_HOSTS`, except on inspection intake, which does not check `Host`. The deploy forwards `API_ALLOWED_HOSTS` into the container and prints the allowlist. When `BIND_ADDRESS` is `0.0.0.0` or `::`, it also allows the addresses from `hostname -I`, so the UI can be opened by the host IP. Leave the bind on `127.0.0.1` unless that is what you want. `BIND_ADDRESS` still overrides it. Binding any other address without TLS prints a warning.
 
 To mount a different workspace directory:
 
@@ -315,12 +312,11 @@ Start the API and the UI in two terminals:
 DATABASE_URL='postgresql://ocp_metal_ui:PASSWORD@127.0.0.1:5433/ocp_metal_ui?sslmode=disable' \
 ANSIBLE_WORKING_DIR=./ansible-workspace \
 API_TOKEN='local-dev-token' \
-INSPECTION_TOKEN='local-inspection-token' \
 python3 server.py
 npm run dev
 ```
 
-`python3 server.py` listens on `127.0.0.1` and port 3003 unless `HOST` or `PORT` is set. Set `API_TOKEN`, or `API_TOKEN_FILE` to a mode 0600 file outside the checkout. Paste the admin token into the UI. A missing or unreadable admin token file fails closed: protected routes return 503. `INSPECTION_TOKEN` or `INSPECTION_TOKEN_FILE` is only for inspection posts. This process uses HTTP unless TLS certificate files are configured. The container deployment uses HTTPS. Vite proxies `/api` to `http://localhost:3003`.
+`python3 server.py` listens on `127.0.0.1` and port 3003 unless `HOST` or `PORT` is set. Set `API_TOKEN`, or `API_TOKEN_FILE` to a mode 0600 file outside the checkout. Paste the admin token into the UI. A missing or unreadable admin token file fails closed: protected routes return 503. Inspection posts do not need a token. This process uses HTTP unless TLS certificate files are configured. The container deployment uses HTTPS. Vite proxies `/api` to `http://localhost:3003`.
 
 ```sh
 npm run lint
@@ -347,6 +343,6 @@ npm run test:backend
 | `PUT` | `/api/v1/configuration` | Save the blueprint, workspace destination, and node preferences |
 | `POST` | `/api/v1/ansible-files` | Write the reviewed inventory and variables into the workspace |
 
-Every `/api/` route except health requires the admin bearer token. The inspection token is a separate credential and only posts inspections. HTTPS protects credentials in transit. The `Host` header is checked so a DNS-rebinding name cannot call the API. Keep the service on a network you control.
+Every `/api/` route except `GET /api/v1/health` and inspection intake requires the admin bearer token. Inspection intake accepts reports with no token and does not check `Host`. HTTPS protects credentials in transit. The `Host` header is checked on every other route so a DNS-rebinding name cannot call the API. Keep the service on a network you control.
 
 Generated host vars contain hardware inventory. Handle that data under your organization's policy. Keep secrets in Ansible Vault. Redfish credentials are not written to disk.
