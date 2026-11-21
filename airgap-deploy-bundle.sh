@@ -6,16 +6,17 @@ set -euo pipefail
 checkout_vault_copy_should_be_removed() {
   local target="$1"
   local source="${2:-}"
-  local target_real source_real uid mode
+  local uid mode
   if [ ! -f "$target" ]; then
     return 1
   fi
-  if [ -n "$source" ] && [ -e "$source" ]; then
-    target_real="$(readlink -f "$target")"
-    source_real="$(readlink -f "$source")"
-    if [ "$target_real" = "$source_real" ]; then
-      return 1
-    fi
+  # A missing configured source is not proof that this file is disposable.
+  if [ -z "$source" ] || [ ! -e "$source" ]; then
+    return 1
+  fi
+  # Same file, including a hard link of the configured source.
+  if [ "$target" -ef "$source" ]; then
+    return 1
   fi
   uid="$(stat -c '%u' "$target")"
   mode="$(stat -c '%a' "$target")"
@@ -359,7 +360,7 @@ cleanup_vault_material() {
   # when that path is the configured vault password.
   if [ -n "${SCRIPT_DIR:-}" ] && checkout_vault_copy_should_be_removed \
     "$SCRIPT_DIR/vault.password" "${VAULT_PASSWORD_SOURCE:-}"; then
-    remove_secret_file "$SCRIPT_DIR/vault.password"
+    rm -f -- "$SCRIPT_DIR/vault.password"
   fi
 }
 trap cleanup_vault_material EXIT
