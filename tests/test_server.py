@@ -2311,6 +2311,117 @@ class ApiTests(unittest.TestCase):
         status, _, _ = self.request("POST", "/api/v1/nodes", {"ansibleHost": "control-01"})
         self.assertEqual(status, 201)
 
+    def test_failed_retention_prune_keeps_the_accepted_report(self):
+        original = server.DatabaseConnection.execute
+
+        def fail_prune(connection, sql, params=None):
+            if "DELETE FROM inspection_reports" in sql:
+                raise server.psycopg.OperationalError("prune failed")
+            return original(connection, sql, params)
+
+        with patch.object(server.ApiHandler, "log_error") as logged:
+            with patch.object(server.DatabaseConnection, "execute", fail_prune):
+                status, body, _ = self.request(
+                    "POST", "/api/v1/inspections", self.report(), token=None
+                )
+        self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
+        self.assertTrue(logged.called)
+        self.assertIn("prune failed", " ".join(str(call) for call in logged.call_args_list))
+        with server.connect_database() as connection:
+            stored = connection.execute(
+                "SELECT COUNT(*) AS count FROM inspection_reports WHERE node_uuid = ?",
+                (NODE_UUID,),
+            ).fetchone()
+            node = connection.execute(
+                "SELECT inventory_json FROM nodes WHERE uuid = ?",
+                (NODE_UUID,),
+            ).fetchone()
+        self.assertEqual(stored["count"], 1)
+        self.assertIn("Example CPU", node["inventory_json"])
+
+    def test_intake_retries_a_row_lock_timeout(self):
+        original = server.DatabaseConnection.execute
+        conflicts = {"count": 0}
+
+        def fail_once(connection, sql, params=None):
+            if "ON CONFLICT(uuid) DO NOTHING" in sql:
+                conflicts["count"] += 1
+                if conflicts["count"] == 1:
+                    raise server.psycopg.errors.LockNotAvailable(
+                        "canceling statement due to lock timeout"
+                    )
+            return original(connection, sql, params)
+
+        with patch.object(server.DatabaseConnection, "execute", fail_once):
+            status, body, _ = self.request(
+                "POST", "/api/v1/inspections", self.report(), token=None
+            )
+        self.assertEqual(status, 202, body)
+        self.assertGreaterEqual(conflicts["count"], 2)
+        with server.connect_database() as connection:
+            stored = connection.execute(
+                "SELECT COUNT(*) AS count FROM inspection_reports WHERE node_uuid = ?",
+                (NODE_UUID,),
+            ).fetchone()
+        self.assertEqual(stored["count"], 1)
+
+    def test_chunk_trailers_are_capped_and_a_stalled_read_closes(self):
+        self.assertEqual(server.ApiHandler.timeout, 60)
+
+        def post_chunks(*chunks):
+            client = http.client.HTTPConnection(*self.httpd.server_address, timeout=5)
+            client.putrequest("POST", "/api/v1/inspections")
+            client.putheader("Host", "127.0.0.1")
+            client.putheader("Transfer-Encoding", "chunked")
+            client.endheaders()
+            for chunk in chunks:
+                client.send(chunk)
+            response = client.getresponse()
+            body = response.read()
+            status = response.status
+            client.close()
+            return status, body
+
+        body = b"{}"
+        prefix = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n"
+        trailers = b"".join(f"X-Trailer-{index}: v\r\n".encode() for index in range(20))
+        status, response_body = post_chunks(prefix, trailers, b"\r\n")
+        self.assertEqual(status, 400, response_body)
+        self.assertIn(b"trailers are too large", response_body)
+
+        oversized = b"X-Pad: " + (b"a" * (server._CHUNK_TRAILER_MAX_BYTES + 32)) + b"\r\n"
+        status, response_body = post_chunks(prefix, oversized)
+        self.assertEqual(status, 400, response_body)
+        self.assertIn(b"trailers are too large", response_body)
+        with server.connect_database() as connection:
+            stored = connection.execute(
+                "SELECT COUNT(*) AS count FROM inspection_reports"
+            ).fetchone()
+        self.assertEqual(stored["count"], 0)
+
+        with patch.object(server.ApiHandler, "timeout", 0.3):
+            client = http.client.HTTPConnection(*self.httpd.server_address, timeout=2)
+            client.putrequest("POST", "/api/v1/inspections")
+            client.putheader("Host", "127.0.0.1")
+            client.putheader("Transfer-Encoding", "chunked")
+            client.endheaders()
+            client.send(b"1\r\n")
+            with self.assertRaises(
+                (
+                    ConnectionResetError,
+                    http.client.RemoteDisconnected,
+                    http.client.BadStatusLine,
+                )
+            ):
+                stalled = client.getresponse()
+                stalled.read()
+            client.close()
+        status, response_body, _ = self.request(
+            "POST", "/api/v1/inspections", self.report(), token=None
+        )
+        self.assertEqual(status, 202, response_body)
+
     def test_chunked_and_untyped_inspection_reports_are_accepted(self):
         plain = self.report()
         plain["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821031"

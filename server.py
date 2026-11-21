@@ -11,6 +11,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from binascii import hexlify, unhexlify
 
@@ -47,6 +48,19 @@ INSPECTION_MAX_BYTES = 2 * 1024 * 1024
 # Extra revisions are stored, then the oldest rows for that node are pruned.
 # A report is never rejected because of this limit.
 INSPECTION_REPORT_RETENTION = 20
+# Intake does not take the UI advisory lock. A row lock waits this long, then
+# the write is retried, so a UI update cannot stall a report forever.
+_INTAKE_LOCK_TIMEOUT = "2s"
+_INTAKE_WRITE_ATTEMPTS = 3
+_INTAKE_RETRYABLE = (
+    psycopg.errors.SerializationFailure,
+    psycopg.errors.DeadlockDetected,
+    psycopg.errors.LockNotAvailable,
+)
+# Chunked trailers are not part of the report. Cap them so a client cannot
+# hold the socket open after the terminating chunk.
+_CHUNK_TRAILER_MAX_LINES = 16
+_CHUNK_TRAILER_MAX_BYTES = 8 * 1024
 ANSIBLE_OUTPUT_SUBDIR = "ocp-metal-ui"
 ANSIBLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 PREFERENCE_FIELDS = {
@@ -1008,7 +1022,7 @@ def database_log_target():
 
 
 @contextmanager
-def connect_database(advisory_lock=True):
+def connect_database(advisory_lock=True, lock_timeout=None):
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is required.")
     connection = psycopg.connect(
@@ -1021,6 +1035,11 @@ def connect_database(advisory_lock=True):
             if advisory_lock:
                 connection.execute("SET lock_timeout = '10s'")
                 connection.execute("SELECT pg_advisory_xact_lock(%s)", (_UI_DB_LOCK,))
+            elif lock_timeout:
+                connection.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    (lock_timeout,),
+                )
             yield DatabaseConnection(connection)
     finally:
         connection.close()
@@ -1986,6 +2005,9 @@ def remove_replaced_host_vars(output_root, generated_files):
 
 class ApiHandler(BaseHTTPRequestHandler):
     server_version = "OcpMetalUI/1.0"
+    # Bound every socket read, including a chunked body that never finishes.
+    # A timed-out read raises TimeoutError; handle_one_request closes it.
+    timeout = 60
 
     def log_message(self, format_string, *args):
         print(f"{self.address_string()} - {format_string % args}")
@@ -2524,10 +2546,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if size < 0:
                 raise InspectionRequestError(400, "Inspection report must be a JSON object.")
             if size == 0:
-                while True:
-                    trailer = self.rfile.readline(8192)
-                    if trailer in (b"\r\n", b"\n", b""):
-                        break
+                self.read_chunk_trailers()
                 break
             if size > INSPECTION_MAX_BYTES or total + size > INSPECTION_MAX_BYTES:
                 raise InspectionRequestError(413, "Inspection report is too large.")
@@ -2537,6 +2556,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             if delimiter not in (b"\r\n", b"\n"):
                 raise InspectionRequestError(400, "Inspection report must be a JSON object.")
         return b"".join(chunks)
+
+    def read_chunk_trailers(self):
+        lines = 0
+        total = 0
+        while True:
+            trailer = self.rfile.readline(_CHUNK_TRAILER_MAX_BYTES + 1)
+            if trailer in (b"\r\n", b"\n", b""):
+                return
+            lines += 1
+            total += len(trailer)
+            if (
+                lines > _CHUNK_TRAILER_MAX_LINES
+                or total > _CHUNK_TRAILER_MAX_BYTES
+                or len(trailer) > _CHUNK_TRAILER_MAX_BYTES
+                or not trailer.endswith(b"\n")
+            ):
+                raise InspectionRequestError(400, "Inspection report trailers are too large.")
 
     def read_inspection_body(self):
         # Any Content-Type is accepted. The body is parsed as JSON anyway.
@@ -2568,45 +2604,65 @@ class ApiHandler(BaseHTTPRequestHandler):
         now = utc_now()
         report_json = json.dumps(payload, ensure_ascii=False)
         retention = inspection_report_retention()
-        with connect_database(advisory_lock=False) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                INSERT INTO nodes
-                    (uuid, bmc_address, serial_number, inventory_json, source, first_seen, updated_at)
-                VALUES (?, ?, ?, ?, 'ipa', ?, ?)
-                ON CONFLICT(uuid) DO NOTHING
-                """,
-                (
-                    node_uuid,
-                    bmc_address,
-                    serial_number,
-                    json.dumps(inventory, ensure_ascii=False),
-                    now,
-                    now,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO inspection_reports (node_uuid, received_at, report_json)
-                VALUES (?, ?, ?)
-                """,
-                (node_uuid, now, report_json),
-            )
-            connection.execute(
-                """
-                DELETE FROM inspection_reports
-                WHERE node_uuid = ?
-                  AND id NOT IN (
-                      SELECT id FROM inspection_reports
-                      WHERE node_uuid = ?
-                      ORDER BY id DESC
-                      LIMIT ?
-                  )
-                """,
-                (node_uuid, node_uuid, retention),
-            )
+        inventory_json = json.dumps(inventory, ensure_ascii=False)
+        for attempt in range(_INTAKE_WRITE_ATTEMPTS):
+            try:
+                with connect_database(
+                    advisory_lock=False, lock_timeout=_INTAKE_LOCK_TIMEOUT
+                ) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        """
+                        INSERT INTO nodes
+                            (uuid, bmc_address, serial_number, inventory_json, source, first_seen, updated_at)
+                        VALUES (?, ?, ?, ?, 'ipa', ?, ?)
+                        ON CONFLICT(uuid) DO NOTHING
+                        """,
+                        (
+                            node_uuid,
+                            bmc_address,
+                            serial_number,
+                            inventory_json,
+                            now,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO inspection_reports (node_uuid, received_at, report_json)
+                        VALUES (?, ?, ?)
+                        """,
+                        (node_uuid, now, report_json),
+                    )
+                break
+            except _INTAKE_RETRYABLE:
+                if attempt + 1 == _INTAKE_WRITE_ATTEMPTS:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        self.prune_inspection_reports(node_uuid, retention)
         self.send_json(202, {"status": "accepted"})
+
+    def prune_inspection_reports(self, node_uuid, retention):
+        # The report is already committed. A prune failure must not drop it.
+        try:
+            with connect_database(
+                advisory_lock=False, lock_timeout=_INTAKE_LOCK_TIMEOUT
+            ) as connection:
+                connection.execute(
+                    """
+                    DELETE FROM inspection_reports
+                    WHERE node_uuid = ?
+                      AND id NOT IN (
+                          SELECT id FROM inspection_reports
+                          WHERE node_uuid = ?
+                          ORDER BY id DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (node_uuid, node_uuid, retention),
+                )
+        except psycopg.Error as error:
+            self.log_error("Inspection report retention prune failed: %s", error)
 
     def create_named_node(self, payload):
         if not isinstance(payload, dict):
