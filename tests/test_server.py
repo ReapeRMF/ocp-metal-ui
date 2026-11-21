@@ -2490,6 +2490,82 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(node["serial_number"], "NODE-SERIAL-01")
         self.assertEqual(node["inventory"]["cpu"]["model_name"], "New BMC")
 
+    def test_pxe_report_wins_over_a_redfish_node(self):
+        endpoint = {
+            "id": "bmc-1",
+            "name": "Control node 1",
+            "baseUrl": "https://192.0.2.20",
+        }
+        status, _, _ = self.request(
+            "PUT", "/api/v1/redfish/endpoints", {"endpoints": [endpoint]}
+        )
+        self.assertEqual(status, 200)
+        report = {
+            "uuid": NODE_UUID,
+            "serial_number": "RF-SERIAL-01",
+            "inventory": {
+                "system": {"uuid": NODE_UUID},
+                "cpus": {"count": 2, "model": "Redfish CPU"},
+                "memory": {"total": 4096},
+                "disks": [],
+                "interfaces": [],
+            },
+            "warnings": [],
+        }
+
+        class FakeTLSConnection:
+            pass
+
+        handler = object.__new__(server.ApiHandler)
+        handler.connection = FakeTLSConnection()
+        handler.send_json = lambda status, value: None
+        with (
+            patch.object(server.ssl, "SSLSocket", FakeTLSConnection),
+            patch.object(server, "RedfishClient") as redfish_client,
+        ):
+            redfish_client.return_value.retrieve.return_value = report
+            handler.retrieve_redfish_endpoint(
+                {
+                    "endpointId": "bmc-1",
+                    "username": "operator",
+                    "password": "transient-secret",
+                    "allowUntrustedTls": False,
+                }
+            )
+        status, _, _ = self.request(
+            "PUT",
+            "/api/v1/nodes/preferences",
+            {"preferences": {NODE_UUID: {"rootDisk": "/dev/sda", "ansibleHost": "server-01"}}},
+        )
+        self.assertEqual(status, 200)
+
+        blank_bmc = self.report(bmc_address="")
+        blank_bmc["inventory"]["cpu"]["model_name"] = "PXE CPU"
+        blank_bmc["inventory"]["system_vendor"]["serial_number"] = "PXE-SERIAL"
+        status, body, _ = self.request("POST", "/api/v1/inspections", blank_bmc, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = next(item for item in json.loads(body) if item["uuid"] == NODE_UUID)
+        self.assertEqual(node["source"], "ipa")
+        self.assertEqual(node["bmc_address"], "https://192.0.2.20")
+        self.assertEqual(node["serial_number"], "PXE-SERIAL")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "PXE CPU")
+        self.assertEqual(node["preferences"]["rootDisk"], "/dev/sda")
+        self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
+        self.assertFalse(node["is_placeholder"])
+
+        replaced = self.report(bmc_address="192.0.2.99")
+        replaced["inventory"]["cpu"]["model_name"] = "PXE CPU 2"
+        status, body, _ = self.request("POST", "/api/v1/inspections", replaced, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = next(item for item in json.loads(body) if item["uuid"] == NODE_UUID)
+        self.assertEqual(node["source"], "ipa")
+        self.assertEqual(node["bmc_address"], "192.0.2.99")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "PXE CPU 2")
+        self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
+        self.assertFalse(node["is_placeholder"])
+
     def test_reinspection_refreshes_hardware_and_keeps_preferences(self):
         status, _, _ = self.request("POST", "/api/v1/inspections", self.report(), token=None)
         self.assertEqual(status, 202)
@@ -2521,7 +2597,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(node["inventory"]["cpu"]["model_name"], "Refreshed CPU")
         self.assertEqual(node["preferences"]["rootDisk"], "/dev/sda")
         self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
-        self.assertEqual(node["source"], "manual")
+        self.assertEqual(node["source"], "ipa")
         self.assertTrue(node["is_placeholder"])
         self.assertEqual(node["first_seen"], created["first_seen"])
 
@@ -2540,7 +2616,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(node["bmc_address"], "192.0.2.98")
         self.assertEqual(node["inventory"]["cpu"]["model_name"], "Blank serial CPU")
         self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
-        self.assertEqual(node["source"], "manual")
+        self.assertEqual(node["source"], "ipa")
         self.assertEqual(node["first_seen"], created["first_seen"])
 
     def test_concurrent_inspections_of_one_node_are_accepted(self):

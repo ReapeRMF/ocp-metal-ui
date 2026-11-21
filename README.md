@@ -29,7 +29,7 @@ HOST_PORT=18080 ./airgap-deploy-bundle.sh
 4. The operator can create named placeholder hosts before reports arrive, then link each name to a discovered node. The inventory group is set in application configuration.
 5. **Review and confirm** lists discovered nodes and named placeholders. The operator can refresh before confirming.
 6. Blueprint and Inventory Config can each save the current configuration to PostgreSQL and continue. **Generate Ansible Files** on Review writes the inventory and variables. It does not run Ansible.
-7. If PXE or IPA is unavailable, the operator can enter BMC HTTPS URLs and retrieve inventory from HPE iLO, Dell iDRAC, Supermicro, or another Redfish BMC. Those systems are stored in the same inventory and use the same assignment workflow.
+7. PXE inspection and BMC retrieval are separate. If PXE or IPA is unavailable, the operator starts a BMC retrieval from the UI, enters the credentials for that request, and reads inventory from HPE iLO, Dell iDRAC, Supermicro, or another Redfish BMC. Both methods update the same node when the system UUID matches, and the last report wins.
 
 The home page links to the cluster blueprint and to BMC profiles. Blueprint, inventory, and review are separate URLs. Browser Back and Forward move among those pages.
 
@@ -187,7 +187,7 @@ Hosts created before a hardware report have an empty inventory mapping and `node
 
 ## Discovered nodes
 
-IPA reports and Redfish retrievals are both discovered nodes. A Redfish profile is a name and a BMC URL. It does not assign an Ansible host.
+IPA reports and Redfish retrievals are both discovered nodes, and they stay separate paths. A PXE collector posts to inspection intake with no token. A BMC retrieval is started manually from the UI; the operator enters the username and password for that request, and those credentials are not stored. A Redfish profile is a name and a BMC URL. It does not assign an Ansible host. When both reports carry the same system UUID, they update that one node, and the last report wins. A PXE report marks the node `ipa`. A BMC retrieval marks it `redfish`. A blank BMC address on a later PXE report keeps the stored URL.
 
 On **Discovered Nodes**, link a discovered node to an inventory name or enter a new host name. Links can be staged, unlinked, and saved together. Unlinking returns the inventory name to the available list. Duplicate host names and duplicate node assignments are rejected. Unused names and mistaken discoveries can be deleted. Assignment changes are one database transaction.
 
@@ -201,7 +201,7 @@ The install preview shows the pull secret after the vault password can open it. 
 
 ## Redfish
 
-BMC usernames and passwords are entered for a retrieval, sent only over HTTPS, and are not stored or logged. The retrieval reads system, processor, memory, storage, drive, and Ethernet-interface details. Missing optional resources are warnings. A missing system serial blocks export of that node until the serial is present.
+BMC usernames and passwords are entered for a retrieval, sent only over HTTPS, and are not stored or logged. The operator starts that retrieval from the UI. It is not the PXE intake path. The retrieval reads system, processor, memory, storage, drive, and Ethernet-interface details. Missing optional resources are warnings. A missing system serial blocks export of that node until the serial is present. A later PXE report for the same system UUID replaces the BMC inventory, and a later BMC retrieval replaces the PXE inventory. The last report wins.
 
 Generated files stay in the `ocp-metal-ui` directory under the selected workspace. The API checks that the path remains under `/ansible`.
 

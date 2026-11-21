@@ -2637,6 +2637,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                                 ELSE excluded.serial_number
                             END,
                             inventory_json = excluded.inventory_json,
+                            source = 'ipa',
                             updated_at = excluded.updated_at
                         """,
                         (
