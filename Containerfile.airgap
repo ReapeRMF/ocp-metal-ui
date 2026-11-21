@@ -1,4 +1,5 @@
-FROM docker.io/library/python:3.13-alpine
+# python:3.13-alpine manifest list, 2026-11-19
+FROM docker.io/library/python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -6,6 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# openssh-keygen tracks python:3.13-alpine. An exact apk pin breaks when that tag is rebuilt.
+# hadolint ignore=DL3018
 RUN apk add --no-cache openssh-keygen \
     && addgroup -S -g 10001 app \
     && adduser -S -D -H -u 10001 -G app app \
@@ -17,15 +20,17 @@ RUN pip install --no-cache-dir "cryptography==50.0.0" "psycopg[binary]==3.3.8"
 COPY --chown=10001:10001 server.py /app/server.py
 COPY --chown=10001:10001 agent_install.py /app/agent_install.py
 COPY --chown=10001:10001 dist/ /app/dist/
-# Vaulted cluster pull secret. The vault password is mounted at run time.
-# A paste on the Blueprint page stores a different vault file for one workspace.
+# Vaulted cluster pull secret, written by airgap-build-bundle.sh from
+# pull-secret.json. It is not stored in git. The vault password is mounted
+# at run time. A paste on the Blueprint page stores a different vault file
+# for one workspace.
 COPY --chown=10001:10001 pull-secret.vault /app/pull-secret.vault
 RUN chmod 600 /app/pull-secret.vault \
     && mkdir -p /vault \
     && chown 10001:10001 /vault /app/pull-secret.vault
 
 VOLUME ["/data", "/ansible"]
-EXPOSE 8080
+EXPOSE 3003
 USER 10001:10001
 
 CMD ["python3", "/app/server.py"]

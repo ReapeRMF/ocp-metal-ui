@@ -7,14 +7,6 @@ dist/
 __pycache__/
 *.py[cod]
 data/
-*.sqlite3
-*.sqlite3-shm
-*.sqlite3-wal
-*.sqlite3-journal
-*.sqlite
-*.sqlite-journal
-*.db
-*.db-*
 
 # Local Ansible workspace contents generated during development/deployment
 /ansible-workspace/
@@ -23,9 +15,19 @@ data/
 *.tar
 *.tar.gz
 
-# Plaintext cluster pull secret. The build vaults it into pull-secret.vault,
-# which is committed. The vault password is not in this repository.
+# Cluster pull secret. Place plaintext at pull-secret.json before building.
+# airgap-build-bundle.sh writes pull-secret.vault for the image. Neither file
+# is committed. The vault password is not in this repository.
 pull-secret.json
+pull-secret.vault
+# Do not keep the vault password in the checkout. Set VAULT_PASSWORD_FILE
+# to a path outside it (the default is /root/.vault_pass). This name is
+# ignored so an old staged copy is not committed.
+vault.password
+
+# The admin token belongs outside the checkout, at
+# /var/lib/ocp-metal-ui/api.token.
+api.token
 
 # Ignore local editor swap notes and compiler footprints
 *~

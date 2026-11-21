@@ -95,8 +95,6 @@ password = password_path.read_bytes().strip()
 if not password:
     sys.exit("The vault password file is empty.")
 text = Path("pull-secret.json").read_text(encoding="utf-8")
-if any(marker in text for marker in ("a8c2744b", "e9bd34f4")):
-    sys.exit("That pull secret is not accepted.")
 try:
     normalized = server.normalize_pull_secret(text)
 except ValueError as exc:

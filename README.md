@@ -1,6 +1,6 @@
 # OpenShift Bare-Metal Builder
 
-Author: David Stratfor, assisted by AI.
+Author: David Stratford, assisted by AI.
 
 One container serves the PatternFly UI and its API. The operator reviews discovered hardware, sets disk and network choices, and writes Ansible files to a mounted workspace. The UI reads blueprint defaults, named hosts, and discovered hardware from PostgreSQL. It does not ship sample inventory. The node serial number is the hardware identifier that links a discovered system to its Ansible host.
 
@@ -8,34 +8,34 @@ One container serves the PatternFly UI and its API. The operator reviews discove
 
 | Where | Address | Port |
 | --- | --- | --- |
-| Host installed from the external boot drive | `205.28.113.35` (`genesisIp`) | `3003` |
+| Example installed host (`genesisIp`) | `192.0.2.35` | `3003` |
 | This workstation | `127.0.0.1` | `18080` |
 
-Port 3003 is the UI on the installed host. Semaphore on that host uses port 3000. The hardware collector on that host uses port 5000 and forwards reports to `http://127.0.0.1:3003`. Boot files are served by httpd on port 80.
+Port 3003 is the UI on the installed host. Semaphore on that host uses port 3000. The hardware collector on that host uses port 5000 and posts inspection reports to `https://127.0.0.1:3003` with no token. Boot files are served by httpd on port 80. See [Inspection client contract](#inspection-client-contract).
 
-The workstation container is a separate process. Open it at `https://edge.ocp.internal:18080`. The certificate name is `edge.ocp.internal`.
+The workstation container is a separate process. Open it at `https://edge.example.com:18080` when the certificate was issued for that name.
 
-`./airgap-deploy-bundle.sh` defaults to the installed host: bind `205.28.113.35`, port `3003`. For the workstation:
+`./airgap-deploy-bundle.sh` listens on `BIND_ADDRESS` (default `127.0.0.1`) and port `3003`. Set `BIND_ADDRESS` to publish another address, for example `192.0.2.35`. For the workstation, change only the port:
 
 ```sh
-BIND_ADDRESS=127.0.0.1 HOST_PORT=18080 ./airgap-deploy-bundle.sh
+HOST_PORT=18080 ./airgap-deploy-bundle.sh
 ```
 
 ## Data flow
 
 1. An inspection client sends a node UUID and `inventory` JSON to `POST /api/v1/inspections`, or to `POST /api/v1/inspections/{uuid}`.
-2. The API upserts the report in PostgreSQL. A later report for the same UUID refreshes inventory and keeps the operator's preferences.
+2. The API creates a node from the first report for a UUID. A later report refreshes that node's BMC address, serial number, and inventory, and is stored as another revision. A blank or missing serial number or BMC address keeps the stored value. A non-blank value overwrites it. Preferences and other operator settings stay as they are.
 3. The UI polls `GET /api/v1/nodes` every 15 seconds.
 4. The operator can create named placeholder hosts before reports arrive, then link each name to a discovered node. The inventory group is set in application configuration.
 5. **Review and confirm** lists discovered nodes and named placeholders. The operator can refresh before confirming.
 6. Blueprint and Inventory Config can each save the current configuration to PostgreSQL and continue. **Generate Ansible Files** on Review writes the inventory and variables. It does not run Ansible.
-7. If PXE or IPA is unavailable, the operator can enter BMC HTTPS URLs and retrieve inventory from HPE iLO, Dell iDRAC, Supermicro, or another Redfish BMC. Those systems are stored in the same inventory and use the same assignment workflow.
+7. PXE inspection and BMC retrieval are separate. If PXE or IPA is unavailable, the operator starts a BMC retrieval from the UI, enters the credentials for that request, and reads inventory from HPE iLO, Dell iDRAC, Supermicro, or another Redfish BMC. Both methods update the same node when the system UUID matches, and the last report wins.
 
 The home page links to the cluster blueprint and to BMC profiles. Blueprint, inventory, and review are separate URLs. Browser Back and Forward move among those pages.
 
 ## Inspection reports
 
-The body matches an Ironic inspection report: a JSON object with an `inventory` object and a node `uuid`. The UUID may be in the URL instead. `bmc_address` is optional.
+The body matches an Ironic inspection report: a JSON object with an `inventory` object and a node `uuid`. The UUID may be in the URL instead. `bmc_address` is optional. On a later report, a blank or missing BMC address or serial number keeps the stored value, and a non-blank one overwrites it.
 
 The serial number is read from, in order:
 
@@ -49,7 +49,7 @@ A discovered node needs a serial number before it can be written to the Ansible 
 ```json
 {
   "uuid": "8a4f91c2-38d1-4bda-912c-bbfa47821001",
-  "bmc_address": "10.10.50.21",
+  "bmc_address": "192.0.2.21",
   "inventory": {
     "system_vendor": { "serial_number": "NODE-SERIAL-01" },
     "cpu": { "count": 64, "model_name": "Example CPU" },
@@ -79,13 +79,46 @@ A top-level serial is also accepted:
 On the installed host, post the report to port 3003. The DNS name in the URL must match `TLS_HOSTNAME`. Copy the server certificate to the client, or use a certificate from a CA the client already trusts.
 
 ```sh
+BIND_ADDRESS=192.0.2.35 TLS_HOSTNAME=edge.example.com ./airgap-deploy-bundle.sh
+
 curl --cacert /etc/ipa/ocp-metal-ui.crt \
-  -X POST https://edge.ocp.internal:3003/api/v1/inspections \
+  -X POST https://edge.example.com:3003/api/v1/inspections \
   -H 'Content-Type: application/json' \
   --data-binary @inspection-report.json
 ```
 
-The API stores the report. It does not configure IPA or replace an Ironic conductor. Point the existing inspection workflow at this URL.
+The API stores the report. It does not configure IPA or replace an Ironic conductor. Point the existing inspection workflow at this URL. No token is required. A `Bearer` header, if an older collector still sends one, is ignored.
+
+## Inspection client contract
+
+The collector is not in this repository. `hw-interrogator` in `build-the-builder` posts hardware reports and does not need a credential.
+
+1. `POST` the inspection JSON to `https://<address>:3003/api/v1/inspections` or `https://<address>:3003/api/v1/inspections/{uuid}`. The deploy serves HTTPS. Use the UI certificate. Do not post to plain HTTP. The address may be `127.0.0.1` or another IP of the UI host.
+2. Do not send an API token. If a `Authorization: Bearer` header is still present, the intake routes ignore it and still accept the report. `Content-Type` is also ignored: the body is parsed as JSON even when the header is missing or is not `application/json`. These routes are open to a cross-site simple POST. That request can add a report revision and overwrite the BMC address, serial number, and inventory of an existing node. It cannot read inventory or call any other API. See [Security model / accepted risks](#security-model--accepted-risks).
+3. These two routes do not check the `Host` header. Every other route does. That exemption is what lets a collector post by IP even when that IP was not listed in `API_ALLOWED_HOSTS` or `hostname -I`.
+4. The body must be a JSON object with an `inventory` object, and a UUID in the body or the URL. The UUID must be a canonical UUID. Reports larger than 2 MiB are rejected. The response is `{"status":"accepted"}` and does not include the stored node.
+5. The first report for a UUID creates the node. Another report for the same UUID refreshes the BMC address, serial number, and inventory from that report and is kept as a revision. A blank or missing serial number or BMC address keeps the stored value. A non-blank one overwrites it. Preferences are left unchanged. A retry is not an error.
+6. Do not call any other `/api/` path. Those routes require the admin token from `/var/lib/ocp-metal-ui/api.token`.
+
+```sh
+curl --cacert /etc/ipa/ocp-metal-ui.crt \
+  -X POST https://127.0.0.1:3003/api/v1/inspections \
+  -H 'Content-Type: application/json' \
+  --data-binary @inspection-report.json
+```
+
+## Security model / accepted risks
+
+Inspection intake, `POST /api/v1/inspections` and `POST /api/v1/inspections/{uuid}`, is unauthenticated. That is the owner's decision: a hardware collector posts a report with no token.
+
+Anyone who can reach the server can submit a report that overwrites an existing node's BMC address, serial number, and inventory. A non-blank BMC address or serial number replaces the stored value. A blank or missing one keeps the value already stored. **Generate Ansible Files** writes those hardware facts into the Ansible inventory and host vars. Intake does not change preferences or other operator settings.
+
+Two residuals remain:
+
+- `Content-Type` is not checked. The body is parsed as JSON even when the header is missing or is not `application/json`, so a browser on the network can send a cross-site simple POST that refreshes those hardware facts.
+- Each new UUID creates a node and stores report revisions. Flooding intake with made-up node IDs can still use disk. Old revisions for one node are pruned, and that prune does not cap the number of distinct UUIDs.
+
+Firewall port 3003 so only the provisioning network can reach it. Leave `BIND_ADDRESS` on `127.0.0.1` unless collectors on other hosts must post to this UI.
 
 ## Generated files
 
@@ -137,24 +170,24 @@ Initial defaults, written when the database is first created:
 | --- | --- |
 | `clusterName` | `ocp-baremetal` |
 | `baseDomain` | `ocp.internal` |
-| `machineNetworkCidr` | `205.28.113.0/24` |
-| `networkGateway` | `205.28.113.1` |
-| `dnsServers` | `205.28.113.35` |
+| `machineNetworkCidr` | `192.0.2.0/24` |
+| `networkGateway` | `192.0.2.1` |
+| `dnsServers` | `192.0.2.35` |
 | `genesisHostname` | `edge` |
-| `genesisIp` | `205.28.113.35` |
+| `genesisIp` | `192.0.2.35` |
 | `genesisNic` | `eno5` |
-| `mgmtNetworkCidr` | `205.28.114.0/24` |
+| `mgmtNetworkCidr` | `198.51.100.0/24` |
 | `mgmtVlan` | `280` |
 | `mgmtDc01Octet` | `6` |
 | `mgmtDc02Octet` | `7` |
 
-The blueprint stores `edge`. The installed host name is `edge.ocp.internal`. `genesis` is an alias.
+The blueprint stores `edge`. The installed host name is that short name plus the base domain (`edge.ocp.internal` with the defaults above). `genesis` is an alias.
 
 Hosts created before a hardware report have an empty inventory mapping and `node_status: awaiting_ipa`. Linking a placeholder to a discovered node keeps the Ansible host name and replaces the placeholder with that node. Every node uses `DEFAULT_ANSIBLE_GROUP` from `server.py`. The operator does not pick the group.
 
 ## Discovered nodes
 
-IPA reports and Redfish retrievals are both discovered nodes. A Redfish profile is a name and a BMC URL. It does not assign an Ansible host.
+IPA reports and Redfish retrievals are both discovered nodes, and they stay separate paths. A PXE collector posts to inspection intake with no token. A BMC retrieval is started manually from the UI; the operator enters the username and password for that request, and those credentials are not stored. A Redfish profile is a name and a BMC URL. It does not assign an Ansible host. When both reports carry the same system UUID, they update that one node, and the last report wins. A PXE report marks the node `ipa`. A BMC retrieval marks it `redfish`. A blank BMC address on a later PXE report keeps the stored URL.
 
 On **Discovered Nodes**, link a discovered node to an inventory name or enter a new host name. Links can be staged, unlinked, and saved together. Unlinking returns the inventory name to the available list. Duplicate host names and duplicate node assignments are rejected. Unused names and mistaken discoveries can be deleted. Assignment changes are one database transaction.
 
@@ -162,13 +195,13 @@ After linking, both sources use the same controls for disk, NIC, bond, and VLAN.
 
 ## Pull secret and SSH key
 
-The image build copies an Ansible vault file to `/app/pull-secret.vault`, mode 0600. The vault password is mounted at `/vault/password` and is not in the image. On the Blueprint page, paste a pull secret or choose a file to store one for this workspace, or create an SSH key. The saved vault file is `cluster-install/pull-secret.vault`. Leave the field blank to keep the pull secret built into the image.
+The image build copies an Ansible vault file to `/app/pull-secret.vault`, mode 0600. That file is produced on the build machine and is not stored in git. The vault password is mounted at `/vault/password` and is not in the image. On the Blueprint page, paste a pull secret or choose a file to store one for this workspace, or create an SSH key. The saved vault file is `cluster-install/pull-secret.vault`. Leave the field blank to keep the pull secret built into the image.
 
 The install preview shows the pull secret after the vault password can open it. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
 
 ## Redfish
 
-BMC usernames and passwords are entered for a retrieval, sent only over HTTPS, and are not stored or logged. The retrieval reads system, processor, memory, storage, drive, and Ethernet-interface details. Missing optional resources are warnings. A missing system serial blocks export of that node until the serial is present.
+BMC usernames and passwords are entered for a retrieval, sent only over HTTPS, and are not stored or logged. The operator starts that retrieval from the UI. It is not the PXE intake path. The retrieval reads system, processor, memory, storage, drive, and Ethernet-interface details. Missing optional resources are warnings. A missing system serial blocks export of that node until the serial is present. A later PXE report for the same system UUID replaces the BMC inventory, and a later BMC retrieval replaces the PXE inventory. The last report wins.
 
 Generated files stay in the `ocp-metal-ui` directory under the selected workspace. The API checks that the path remains under `/ansible`.
 
@@ -178,13 +211,13 @@ BMC certificates are verified by default. For an untrusted BMC certificate, the 
 
 Build on a connected machine with Node.js 22, npm, and Podman or Docker. The image contains the built UI and the Python runtime. It does not need network access after it is built.
 
-`pull-secret.vault` in this directory is the committed cluster pull secret. It is an Ansible vault variable, `ocp_pre_install_pull_secret_contents`. The vault password is not in this repository. Mount that password at `/vault/password` when the container starts.
+The cluster pull secret is not in this repository. On the build machine, place the plaintext pull secret at `pull-secret.json` in this directory and set `VAULT_PASSWORD_FILE` to the Ansible vault password file. Neither file is committed. `airgap-build-bundle.sh` writes `pull-secret.vault` beside them, mode 0600, as the Ansible vault variable `ocp_pre_install_pull_secret_contents`. That vault file is gitignored. The image copies it to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image.
 
-To replace the secret, place the new plaintext at `pull-secret.json` and set `VAULT_PASSWORD_FILE` to the vault password file. The build writes `pull-secret.vault` again, and the image copies that file to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image. `pull-secret.json` is not committed.
+Mount the same password file at `/vault/password` when the container starts. `VAULT_PASSWORD_FILE` defaults to `/root/.vault_pass`. Keep that file outside the git checkout. When the deploy runs as root under Podman, it copies that file to `/var/lib/ocp-metal-ui/vault.password`, mode 0400, owned by uid 10001, and mounts that copy. A failed deploy shreds a partial copy under `/var/lib/ocp-metal-ui`. A file named `vault.password` in the checkout is removed only when it is the old staged copy (uid 10001, mode 0400) and it is not `VAULT_PASSWORD_FILE`. To use a different secret later, paste it on the Blueprint page or replace `pull-secret.json` and build again. A secret saved from the UI is `cluster-install/pull-secret.vault` in the Ansible workspace, and it overrides the copy in the image for that workspace.
 
 ```sh
 npm ci
-./airgap-build-bundle.sh
+VAULT_PASSWORD_FILE=/path/to/vault-password ./airgap-build-bundle.sh
 ```
 
 The script compiles `dist/`, vaults `pull-secret.json`, builds `Containerfile.airgap`, and writes `ocp-metal-ui-engine-bundle.tar`. Copy that tarball and `airgap-deploy-bundle.sh` to the disconnected host. `package-lock.json` pins the JavaScript dependencies. For a byte-for-byte image rebuild, also pin the Python base image by digest in `Containerfile.airgap`.
@@ -199,7 +232,17 @@ The script loads the UI image. It also loads `postgresql:latest` from `/var/www/
 
 Replacing the UI container does not delete `/var/lib/ocp-metal-ui/postgres` or `db.env`. Back those up together. A newer major version of `postgresql.tar` has to match the `PG_VERSION` file in that directory. Keep the tar that initialized it. The host directory `ansible-workspace` is mounted at `/ansible`. The operator can keep that directory or choose another absolute path inside the mount.
 
-The database holds nodes, placeholders, preferences, blueprint settings, and Redfish profile names. It does not hold BMC passwords. No sample BMC profiles are loaded. The UI listens on the address in `BIND_ADDRESS` (default `0.0.0.0`) and port `3003`.
+The database holds nodes, placeholders, preferences, blueprint settings, and Redfish profile names. It does not hold BMC passwords. No sample BMC profiles are loaded. The UI listens on `BIND_ADDRESS` (default `127.0.0.1`) and port `3003`.
+
+The first deploy writes two token files outside the git checkout, mode 0400, owned by uid 10001:
+
+| File | Use |
+| --- | --- |
+| `/var/lib/ocp-metal-ui/api.token` | Admin token. Paste it into the UI **API token** field and choose **Use token**. The browser keeps it in `sessionStorage` for the tab. |
+
+The container reads the admin token from `/run/secrets/api-token`. Delete the file before the next deploy to rotate it. Set `API_TOKEN_FILE` to use a different path. Hardware inspection posts do not use this token.
+
+Every `/api/` route except `GET /api/v1/health` and the two inspection intake routes requires the admin token. The `Host` header must be `localhost`, `127.0.0.1`, `::1`, `TLS_HOSTNAME`, or a name in `API_ALLOWED_HOSTS`, except on inspection intake, which does not check `Host`. The deploy forwards `API_ALLOWED_HOSTS` into the container and prints the allowlist. When `BIND_ADDRESS` is `0.0.0.0` or `::`, it also allows the addresses from `hostname -I`, so the UI can be opened by the host IP. Leave the bind on `127.0.0.1` unless that is what you want. `BIND_ADDRESS` still overrides it. Binding any other address without TLS prints a warning.
 
 To mount a different workspace directory:
 
@@ -217,7 +260,7 @@ The script prepares `/var/lib/ocp-metal-ui/postgres` and starts the database con
 BIND_ADDRESS=127.0.0.1 HOST_PORT=18080 ./airgap-deploy-bundle.sh
 ```
 
-Open `https://edge.ocp.internal:18080` when the certificate was issued for that name. Open `https://127.0.0.1:18080` when the certificate covers that address. Some systems resolve `localhost` to IPv6. The published port is IPv4.
+Open `https://edge.example.com:18080` when the certificate was issued for that name. Open `https://127.0.0.1:18080` when the certificate covers that address. Some systems resolve `localhost` to IPv6. The published port is IPv4.
 
 ## HTTPS
 
@@ -281,11 +324,12 @@ Start the API and the UI in two terminals:
 ```sh
 DATABASE_URL='postgresql://ocp_metal_ui:PASSWORD@127.0.0.1:5433/ocp_metal_ui?sslmode=disable' \
 ANSIBLE_WORKING_DIR=./ansible-workspace \
+API_TOKEN='local-dev-token' \
 python3 server.py
 npm run dev
 ```
 
-`python3 server.py` listens on port 3003 unless `PORT` is set. This process uses HTTP unless TLS certificate files are configured. The container deployment uses HTTPS. Vite proxies `/api` to `http://localhost:3003`.
+`python3 server.py` listens on `127.0.0.1` and port 3003 unless `HOST` or `PORT` is set. Set `API_TOKEN`, or `API_TOKEN_FILE` to a mode 0600 file outside the checkout. Paste the admin token into the UI. A missing or unreadable admin token file fails closed: protected routes return 503. Inspection posts do not need a token. This process uses HTTP unless TLS certificate files are configured. The container deployment uses HTTPS. Vite proxies `/api` to `http://localhost:3003`.
 
 ```sh
 npm run lint
@@ -312,6 +356,6 @@ npm run test:backend
 | `PUT` | `/api/v1/configuration` | Save the blueprint, workspace destination, and node preferences |
 | `POST` | `/api/v1/ansible-files` | Write the reviewed inventory and variables into the workspace |
 
-The API has no application login. HTTPS protects Redfish credentials in transit. It does not authenticate the operator. Keep the service on a network you control.
+Every `/api/` route except `GET /api/v1/health` and inspection intake requires the admin bearer token. Inspection intake accepts reports with no token and does not check `Host`. A later report overwrites that node's BMC address and serial number when the new value is non-blank, and refreshes inventory. A blank or missing serial or BMC address keeps the stored value. HTTPS protects credentials in transit. The `Host` header is checked on every other route so a DNS-rebinding name cannot call the API. Firewall the UI port to the provisioning network. See [Security model / accepted risks](#security-model--accepted-risks).
 
 Generated host vars contain hardware inventory. Handle that data under your organization's policy. Keep secrets in Ansible Vault. Redfish credentials are not written to disk.
