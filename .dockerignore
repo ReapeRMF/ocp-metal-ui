@@ -1,2 +1,8 @@
-# The build input is plaintext. The image receives pull-secret.vault only.
-pull-secret.json
+# Allowlist. The image only needs these paths. vault.password, pull-secret.json,
+# node_modules, and the Ansible workspace stay out of the build context.
+*
+!server.py
+!agent_install.py
+!pull-secret.vault
+!dist
+!dist/**

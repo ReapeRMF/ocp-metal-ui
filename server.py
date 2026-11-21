@@ -28,9 +28,10 @@ APP_DIR = Path(__file__).resolve().parent
 DIST_DIR = APP_DIR / "dist"
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ANSIBLE_WORKING_DIR = Path(os.environ.get("ANSIBLE_WORKING_DIR", "/ansible"))
-# The image build copies the vaulted pull secret here. Keep the default on
-# /app so a source tree that also holds the file is not read by unit tests.
-# The vault password file is mounted at run time and is not in the image.
+# The image build copies the operator-supplied vault here. The default stays
+# on /app so a checkout is not read by unit tests. pull-secret.vault is not
+# stored in git. The vault password file is mounted at run time and is not
+# in the image.
 BUNDLED_PULL_SECRET_FILE = Path(
     os.environ.get("BUNDLED_PULL_SECRET_FILE", "/app/pull-secret.vault")
 )
@@ -385,16 +386,16 @@ DEFAULT_BLUEPRINT = {
     "controlPlaneTopology": "Compact",
     "mirrorRegistries": ["registry.airgap.internal:5000"],
     "caCertBundle": "",
-    "machineNetworkCidr": "205.28.113.0/24",
-    "dnsServers": ["205.28.113.35"],
+    "machineNetworkCidr": "192.0.2.0/24",
+    "dnsServers": ["192.0.2.35"],
     "ntpServers": [],
     "genesisHostname": "edge",
-    "genesisIp": "205.28.113.35",
+    "genesisIp": "192.0.2.35",
     "genesisNic": "eno5",
     "genesisNics": ["eno5"],
     "genesisDisks": [],
-    "networkGateway": "205.28.113.1",
-    "mgmtNetworkCidr": "205.28.114.0/24",
+    "networkGateway": "192.0.2.1",
+    "mgmtNetworkCidr": "198.51.100.0/24",
     "mgmtVlan": "280",
     "mgmtDc01Octet": "6",
     "mgmtDc02Octet": "7",
