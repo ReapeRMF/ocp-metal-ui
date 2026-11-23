@@ -25,7 +25,10 @@ def playbook_root():
     Comparisons against that tree run only when OCP_ANSIBLE_PLAYBOOKS
     points at a playbooks directory. CI does not have that checkout.
     """
-    configured = os.environ.get("OCP_ANSIBLE_PLAYBOOKS", "").strip()
+    configured = (
+        os.environ.get("OCP_ANSIBLE_PLAYBOOKS_DIR", "").strip()
+        or os.environ.get("OCP_ANSIBLE_PLAYBOOKS", "").strip()
+    )
     if not configured:
         return None
     path = Path(configured)
@@ -1687,7 +1690,7 @@ class ApiTests(unittest.TestCase):
         playbooks = playbook_root()
         if playbooks is None:
             self.skipTest(
-                "Set OCP_ANSIBLE_PLAYBOOKS to an ocp-ansible-playbooks/playbooks "
+                "Set OCP_ANSIBLE_PLAYBOOKS_DIR to an ocp-ansible-playbooks/playbooks "
                 "checkout to compare the bundled filter."
             )
         bundled = Path(server.__file__).resolve().parent / "agent_install.py"
@@ -1698,7 +1701,7 @@ class ApiTests(unittest.TestCase):
         playbooks = playbook_root()
         if playbooks is None:
             self.skipTest(
-                "Set OCP_ANSIBLE_PLAYBOOKS to an ocp-ansible-playbooks/playbooks "
+                "Set OCP_ANSIBLE_PLAYBOOKS_DIR to an ocp-ansible-playbooks/playbooks "
                 "checkout to read render_agent_install.yml."
             )
         playbook = (playbooks / "render_agent_install.yml").read_text()
@@ -1835,9 +1838,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         published_preview = json.loads(body)
         self.assertEqual(published_preview["configPreviewError"], "")
-        loaded = yaml.safe_load(published_preview["installConfig"])
-        self.assertEqual(loaded["pullSecret"], secret)
-        self.assertEqual(loaded["sshKey"].strip(), server.install_secret_status(destination)["sshPublicKey"])
+        self.assertNotIn("dGVzdA==", published_preview["installConfig"])
+        self.assertIn("<redacted>", published_preview["installConfig"])
+        self.assertEqual(
+            yaml.safe_load(published_preview["installConfig"])["sshKey"].strip(),
+            server.install_secret_status(destination)["sshPublicKey"],
+        )
         self.assertNotIn("<supplied at install>", published_preview["installConfig"])
         self.assertNotIn("dGVzdA==", published_preview["agentConfig"])
         install_file = server.ANSIBLE_WORKING_DIR / "cluster-install" / "install-config.yaml"
@@ -1845,14 +1851,17 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(published_preview["installConfigFile"], str(install_file))
         self.assertEqual(published_preview["agentConfigFile"], str(agent_file))
         self.assertEqual(published_preview["installFilesMessage"], "")
-        self.assertEqual(install_file.read_text(), published_preview["installConfig"])
+        self.assertNotEqual(install_file.read_text(), published_preview["installConfig"])
         self.assertEqual(agent_file.read_text(), published_preview["agentConfig"])
         self.assertEqual(stat.S_IMODE(install_file.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(agent_file.stat().st_mode), 0o644)
         written_install = yaml.safe_load(install_file.read_text())
         written_agent = yaml.safe_load(agent_file.read_text())
         self.assertEqual(written_install["pullSecret"], secret)
-        self.assertEqual(written_install["sshKey"].strip(), loaded["sshKey"].strip())
+        self.assertEqual(
+            written_install["sshKey"].strip(),
+            server.install_secret_status(destination)["sshPublicKey"],
+        )
         self.assertEqual(written_install["platform"], {"none": {}})
         self.assertEqual(written_install["controlPlane"]["replicas"], 1)
         self.assertEqual(written_install["compute"][0]["replicas"], 0)
@@ -2046,17 +2055,235 @@ class ApiTests(unittest.TestCase):
             self.assertNotIn(b"dGVzdA==", body)
             self.assertIn("other.example", path.read_text())
 
+    def test_pull_secret_rejections_do_not_echo_the_secret(self):
+        cases = (
+            ("", "is empty"),
+            ("   ", "is empty"),
+            ("{not json", "not valid JSON"),
+            ('{"kind":"Secret"}', "auths object"),
+            ('{"auths":{}}', "at least one registry"),
+            ('{"auths":{"":{"auth":"dGVzdA=="}}}', "registry name"),
+            ('{"auths":{"example.com":{}}}', "username plus password"),
+            ('{"auths":{"example.com":{"auth":"!!!!"}}}', "valid base64"),
+        )
+        for text, expected in cases:
+            with self.subTest(expected=expected):
+                with self.assertRaises(ValueError) as caught:
+                    server.parse_pull_secret_text(text, "The pull secret")
+                message = str(caught.exception)
+                self.assertIn(expected, message)
+                if len(text) > 12:
+                    self.assertNotIn(text, message)
+        self.assertIn(
+            "example.com",
+            server.parse_pull_secret_text(
+                '{"auths":{"example.com":{"username":"user","password":"secret"}}}',
+                "The pull secret",
+            ),
+        )
+        self.assertIn(
+            "example.com",
+            server.parse_pull_secret_text(
+                '{"auths":{"example.com":{"token":"registry-token"}}}',
+                "The pull secret",
+            ),
+        )
+        oversized = (
+            '{"auths":{"example.com":{"auth":"'
+            + ("A" * (server._MAX_PULL_SECRET_CHARS + 1))
+            + '"}}}'
+        )
+        with self.assertRaises(ValueError) as caught:
+            server.parse_pull_secret_text(oversized, "The pull secret")
+        self.assertIn("too large", str(caught.exception))
+        self.assertNotIn("AAAA", str(caught.exception))
+
+    def test_pull_secret_save_refuses_a_symlink_and_cleans_up_a_failed_replace(self):
+        directory = Path(self.temp_dir.name) / "secret-dir"
+        directory.mkdir(mode=0o700)
+        target = directory / "pull-secret.json"
+        target.write_text(
+            '{"auths":{"example.com":{"auth":"dGVzdA=="}}}\n', encoding="utf-8"
+        )
+        target.chmod(0o600)
+        link = directory / "linked.json"
+        link.symlink_to(target)
+        with patch.dict(os.environ, {"OCP_METAL_UI_PULL_SECRET_FILE": str(link)}):
+            with self.assertRaises(ValueError) as caught:
+                server.save_host_pull_secret(
+                    '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
+                )
+            self.assertIn("symbolic link", str(caught.exception))
+        self.assertTrue(target.is_file())
+        loose = directory / "loose"
+        loose.mkdir(mode=0o755)
+        loose_file = loose / "pull-secret.json"
+        with patch.dict(os.environ, {"OCP_METAL_UI_PULL_SECRET_FILE": str(loose_file)}):
+            with self.assertRaises(ValueError) as caught:
+                server.save_host_pull_secret(
+                    '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
+                )
+            self.assertIn("must be mode 0700", str(caught.exception))
+        self.assertFalse(loose_file.exists())
+        with patch.dict(os.environ, {"OCP_METAL_UI_PULL_SECRET_FILE": str(target)}):
+            with patch("server.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaises(ValueError) as caught:
+                    server.save_host_pull_secret(
+                        '{"auths":{"other.example":{"auth":"bmV4dA=="}}}'
+                    )
+            self.assertIn("could not be saved", str(caught.exception))
+            self.assertNotIn("bmV4dA==", str(caught.exception))
+            self.assertEqual(list(directory.glob(".pull-secret.json.*")), [])
+            self.assertIn("example.com", target.read_text())
+            self.assertNotIn("other.example", target.read_text())
+
+    def test_pull_secret_save_route_requires_auth_and_https(self):
+        import ssl
+        import subprocess
+
+        secret = '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
+        path = Path(self.temp_dir.name) / "routed-secret" / "pull-secret.json"
+        env = {"OCP_METAL_UI_PULL_SECRET_FILE": str(path)}
+        with patch.dict(os.environ, env):
+            status, body, _ = self.request(
+                "POST",
+                "/api/v1/install-secrets/pull-secret",
+                {"pullSecret": secret},
+                token=None,
+            )
+            self.assertEqual(status, 401, body)
+            self.assertNotIn(b"dGVzdA==", body)
+            self.assertFalse(path.exists())
+            missing = Path(self.temp_dir.name) / "missing-api-token"
+            with patch.dict(os.environ, {"API_TOKEN_FILE": str(missing)}, clear=False):
+                status, body, _ = self.request(
+                    "POST",
+                    "/api/v1/install-secrets/pull-secret",
+                    {"pullSecret": secret},
+                )
+            self.assertEqual(status, 503, body)
+            self.assertNotIn(b"dGVzdA==", body)
+            status, body, _ = self.request(
+                "POST",
+                "/api/v1/install-secrets/pull-secret",
+                {"pullSecret": secret},
+            )
+            self.assertEqual(status, 426, body)
+            self.assertNotIn(b"dGVzdA==", body)
+            self.assertFalse(path.exists())
+
+        cert = Path(self.temp_dir.name) / "tls.crt"
+        key = Path(self.temp_dir.name) / "tls.key"
+        completed = subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key), "-out", str(cert), "-days", "1",
+                "-subj", "/CN=localhost",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.ApiHandler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        thread = threading.Thread(target=httpd.serve_forever)
+        thread.start()
+        try:
+            with patch.dict(os.environ, env):
+                connection = http.client.HTTPSConnection(
+                    *httpd.server_address,
+                    context=ssl._create_unverified_context(),
+                )
+                connection.request(
+                    "POST",
+                    "/api/v1/install-secrets/pull-secret",
+                    body=json.dumps({"pullSecret": secret}),
+                    headers={
+                        "Host": "127.0.0.1",
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.api_token}",
+                    },
+                )
+                response = connection.getresponse()
+                body = response.read()
+                connection.close()
+            self.assertEqual(response.status, 200, body)
+            saved = json.loads(body)
+            self.assertEqual(set(saved), {"saved", "path"})
+            self.assertEqual(saved["path"], str(path))
+            self.assertNotIn("dGVzdA==", body.decode())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            with patch.dict(os.environ, env):
+                self.assertEqual(
+                    json.loads(server.load_pull_secret())["auths"]["example.com"]["auth"],
+                    "dGVzdA==",
+                )
+                self._post_inspection(
+                    NODE_UUID,
+                    "NODE-SERIAL-01",
+                    [("eno5", "52:54:00:11:00:05")],
+                    [("/dev/nvme0n1", "NVME-C1")],
+                )
+                server.generate_cluster_ssh_key(str(server.ANSIBLE_WORKING_DIR), replace=False)
+                status, body, _ = self.request(
+                    "POST",
+                    "/api/v1/ansible-files",
+                    {
+                        "outputDirectory": str(server.ANSIBLE_WORKING_DIR),
+                        "preferences": {
+                            NODE_UUID: {
+                                "ansibleHost": "control-01",
+                                "role": "master",
+                                "rendezvous": True,
+                                "ipv4LastOctet": "11",
+                                "rootDisk": "NVME-C1",
+                                "netType": "single",
+                                "singleNic": "eno5",
+                                "singleVlanEnabled": False,
+                            }
+                        },
+                        "blueprint": {
+                            "clusterName": "ocp-baremetal",
+                            "baseDomain": "ocp.internal",
+                            "controlPlaneTopology": "SingleNode",
+                            "machineNetworkCidr": "192.0.2.0/24",
+                            "networkGateway": "192.0.2.1",
+                        },
+                    },
+                )
+            self.assertEqual(status, 200, body)
+            published = json.loads(body)
+            self.assertNotIn("dGVzdA==", published["installConfig"])
+            install_file = (
+                server.ANSIBLE_WORKING_DIR / "cluster-install" / "install-config.yaml"
+            )
+            self.assertIn("dGVzdA==", install_file.read_text())
+        finally:
+            httpd.shutdown()
+            thread.join()
+            httpd.server_close()
+
+    def test_deploy_script_mounts_the_pull_secret_directory(self):
+        script = (Path(server.__file__).resolve().parent / "airgap-deploy-bundle.sh").read_text()
+        self.assertIn('PULL_SECRET_OWNER="${OCP_METAL_UI_PULL_SECRET_OWNER:-10001}"', script)
+        self.assertIn('PULL_SECRET_GROUP="${OCP_METAL_UI_PULL_SECRET_GROUP:-10001}"', script)
+        self.assertIn('PULL_SECRET_MODE="${OCP_METAL_UI_PULL_SECRET_MODE:-0600}"', script)
+        self.assertIn('-v "${PULL_SECRET_DIR}:${PULL_SECRET_DIR}:Z"', script)
+        self.assertNotIn("pull-secret.json:ro", script)
+        self.assertNotIn("/vault/password", script)
 
     def test_pull_secret_rejection_compares_fragment_digests(self):
         digest = hmac.new(server._FRAGMENT_HMAC_KEY, b"testmark", hashlib.sha256).hexdigest()
-        rejected = '{"auths":{"example.com":{"auth":"xxxtestmark"}}}'
+        rejected = '{"auths":{"testmark.example":{"auth":"dGVzdA=="}}}'
         accepted = '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
         with patch.object(server, "_REJECTED_FRAGMENT_MACS", frozenset({digest})):
             with self.assertRaises(ValueError) as caught:
-                server.normalize_pull_secret(rejected)
+                server.parse_pull_secret_text(rejected, "The pull secret")
             self.assertIn("not accepted", str(caught.exception))
             self.assertEqual(
-                json.loads(server.normalize_pull_secret(accepted))["auths"]["example.com"]["auth"],
+                json.loads(server.parse_pull_secret_text(accepted, "The pull secret"))["auths"]["example.com"]["auth"],
                 "dGVzdA==",
             )
 
@@ -2103,7 +2330,8 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, body)
         reported = json.loads(body)
-        self.assertIn("pullSecretStored", reported)
+        self.assertIn("pullSecretReady", reported)
+        self.assertIn("pullSecretPath", reported)
         self.assertIn("sshPublicKey", reported)
         status, body, _ = self.request(
             "POST",

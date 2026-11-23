@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The pull-secret ownership model is not settled. David picks one of:
+#   (a) root:ocp-metal-ui mode 0640, with --group-add, read-only
+#   (b) uid 10001 owns the file, mode 0600, directory mode 0700
+#   (c) a podman secret
+# These variables are the only place that choice is recorded. The default
+# is (b) so the container user can read and replace the file.
+PULL_SECRET_DIR="${OCP_METAL_UI_PULL_SECRET_DIR:-/etc/ocp-metal-ui}"
+PULL_SECRET_FILE_NAME="${OCP_METAL_UI_PULL_SECRET_FILE_NAME:-pull-secret.json}"
+PULL_SECRET_OWNER="${OCP_METAL_UI_PULL_SECRET_OWNER:-10001}"
+PULL_SECRET_GROUP="${OCP_METAL_UI_PULL_SECRET_GROUP:-10001}"
+PULL_SECRET_MODE="${OCP_METAL_UI_PULL_SECRET_MODE:-0600}"
+PULL_SECRET_DIR_MODE="${OCP_METAL_UI_PULL_SECRET_DIR_MODE:-0700}"
+
 # Remove a checkout vault.password only when it is the old staged copy
 # (uid 10001, mode 0400) and it is not the configured password source.
 checkout_vault_copy_should_be_removed() {
@@ -336,22 +349,19 @@ else
   GROUP_ARGS=(--group-add "$ANSIBLE_HOST_GID")
 fi
 
-# Ownership of the host pull-secret file is not settled. Change these
-# three values when David picks root:ocp-metal-ui 0640, uid 10001 0600,
-# or a podman secret. The container always mounts the directory.
-PULL_SECRET_DIR="${OCP_METAL_UI_PULL_SECRET_DIR:-/etc/ocp-metal-ui}"
-PULL_SECRET_FILE_NAME="${OCP_METAL_UI_PULL_SECRET_FILE_NAME:-pull-secret.json}"
-PULL_SECRET_OWNER="${OCP_METAL_UI_PULL_SECRET_OWNER:-10001}"
-PULL_SECRET_GROUP="${OCP_METAL_UI_PULL_SECRET_GROUP:-10001}"
-PULL_SECRET_MODE="${OCP_METAL_UI_PULL_SECRET_MODE:-0600}"
-PULL_SECRET_DIR_MODE="${OCP_METAL_UI_PULL_SECRET_DIR_MODE:-0700}"
-
 PULL_SECRET_ARGS=()
-install -d -o "$PULL_SECRET_OWNER" -g "$PULL_SECRET_GROUP" -m "$PULL_SECRET_DIR_MODE" "$PULL_SECRET_DIR"
+if [ "$(id -u)" -eq 0 ]; then
+  install -d -o "$PULL_SECRET_OWNER" -g "$PULL_SECRET_GROUP" -m "$PULL_SECRET_DIR_MODE" "$PULL_SECRET_DIR"
+else
+  install -d -m "$PULL_SECRET_DIR_MODE" "$PULL_SECRET_DIR"
+fi
 PULL_SECRET_DIR="$(cd "$PULL_SECRET_DIR" && pwd -P)"
 PULL_SECRET_ARGS=(
   -v "${PULL_SECRET_DIR}:${PULL_SECRET_DIR}:Z"
   -e "OCP_METAL_UI_PULL_SECRET_FILE=${PULL_SECRET_DIR}/${PULL_SECRET_FILE_NAME}"
+  -e "OCP_METAL_UI_PULL_SECRET_OWNER=${PULL_SECRET_OWNER}"
+  -e "OCP_METAL_UI_PULL_SECRET_DIR_MODE=${PULL_SECRET_DIR_MODE}"
+  -e "OCP_METAL_UI_PULL_SECRET_MODE=${PULL_SECRET_MODE}"
 )
 
 # 3. Start the application. The image still declares /data; the database

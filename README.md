@@ -194,15 +194,21 @@ After linking, both sources use the same controls for disk, NIC, bond, and VLAN.
 
 ## Pull secret and SSH key
 
-The pull secret is a host file. The default path is `/etc/ocp-metal-ui/pull-secret.json`. Set `OCP_METAL_UI_PULL_SECRET_FILE` to use another path. The UI reads that file when it builds a preview or writes `install-config.yaml`. It does not cache the contents, so replacing the file takes effect on the next use. The image does not contain a pull secret.
+The pull secret is a host file. The default path is `/etc/ocp-metal-ui/pull-secret.json`. Set `OCP_METAL_UI_PULL_SECRET_FILE` to use another path. The UI reads that file when it builds a preview or writes `install-config.yaml`, and again after a save. It does not keep a copy in memory between those uses, so replacing the file takes effect on the next use. The image does not contain a pull secret.
 
-On first boot the host decrypts the pull secret once into that file and then shreds the password file. The pull secret is plaintext at rest on the host. That is the accepted risk, chosen so the UI can restart unattended.
+On first boot the host creates `/etc/ocp-metal-ui` and writes `pull-secret.json` there, then shreds the password file that decrypted it. To rotate the secret, replace that file or paste a new one on the Blueprint page and save it. The next preview or generate reads the replacement.
 
-If the file is missing, is not JSON, or has no `auths` object, the UI still starts. A startup log line names the path. The features that need the pull secret return that same error. The log and the error do not include the file contents. A startup log line also warns when the file is group- or world-readable.
+The container runs as uid 10001. It does not run as root. Who owns the file, and which mode it uses, is still open. The deploy script records the current placeholder in `PULL_SECRET_OWNER`, `PULL_SECRET_GROUP`, `PULL_SECRET_MODE`, and `PULL_SECRET_DIR_MODE`. The placeholder is uid `10001`, group `10001`, file mode `0600`, and directory mode `0700`, so this container user can read and replace the file. Changing those variables is the whole ownership change. The three choices still in front of David are a `root:ocp-metal-ui` mode `0640` file with `--group-add` and no save, uid `10001` owning a mode `0600` file in a mode `0700` directory, or a podman secret.
 
-The Blueprint page can paste a pull secret and save it to that same file. The save is accepted only over HTTPS, the same restriction as the other install-secret writes. It checks that the text is JSON with an `auths` object, then writes a temporary file in the same directory with mode `0600`, flushes it, and replaces the host file. The saved file is mode `0600` and owned by the service user. If the directory is missing, the save creates it with mode `0700`. The response says that the file was saved and names the path. It does not include the secret. The page does not show the saved secret. The Blueprint page also creates or accepts an SSH public key. The private key, when created here, is `cluster-install/id_ed25519`.
+The pull secret is plaintext at rest on the host. That is the accepted risk, chosen so the UI can restart unattended.
 
-The install preview shows the pull secret after the host file can be read. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
+If the file is missing, is not JSON, or has no usable `auths` object, the UI still starts. A startup log line names the path. The features that need the pull secret return that same error. The log and the error do not include the file contents. A startup log line also warns when the file is group- or world-readable beyond the configured mode.
+
+The Blueprint page can paste a pull secret and save it to that file. The save requires the admin bearer token and HTTPS. It checks that the text is JSON with a non-empty `auths` object. Each entry needs `auth`, or `username` plus `password`, or `token`. `auth` must be valid base64. An empty paste is rejected as empty. The save writes a temporary file in the same directory with mode `0600`, flushes it, replaces the host file, and flushes the directory. The response says that the file was saved and names the path. It does not include the secret. The page does not show the saved secret. The API response for generated install config redacts the pull secret. The file written under `cluster-install/` still contains it, because the installer reads that file.
+
+The Blueprint page also creates or accepts an SSH public key. The private key, when created here, is `cluster-install/id_ed25519`.
+
+The install preview uses the pull secret after the host file can be read. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
 
 ## Redfish
 

@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import html
@@ -1207,9 +1208,40 @@ def pull_secret_file():
     return Path(configured)
 
 
+def _octal_mode(name, default):
+    raw = os.environ.get(name, default).strip()
+    try:
+        return int(raw, 8)
+    except ValueError:
+        return int(default, 8)
+
+
+def _pull_secret_owner_uid():
+    raw = os.environ.get("OCP_METAL_UI_PULL_SECRET_OWNER", "").strip()
+    if not raw:
+        return os.geteuid()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        import pwd
+        return pwd.getpwnam(raw).pw_uid
+    except KeyError:
+        return os.geteuid()
+
+
+def _valid_base64(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        base64.b64decode(value, validate=True)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def parse_pull_secret_text(text, source_label):
     if not isinstance(text, str) or not text.strip():
-        raise ValueError(f"{source_label} is not valid JSON.")
+        raise ValueError(f"{source_label} is empty.")
     if len(text) > _MAX_PULL_SECRET_CHARS:
         raise ValueError(f"{source_label} is too large.")
     try:
@@ -1224,6 +1256,22 @@ def parse_pull_secret_text(text, source_label):
     for name, entry in auths.items():
         if not isinstance(name, str) or not name.strip() or not isinstance(entry, dict):
             raise ValueError("Each auths entry must be an object keyed by a registry name.")
+        auth = entry.get("auth")
+        username = entry.get("username")
+        password = entry.get("password")
+        token = entry.get("token")
+        has_auth = isinstance(auth, str) and bool(auth)
+        has_user = (
+            isinstance(username, str) and bool(username)
+            and isinstance(password, str) and bool(password)
+        )
+        has_token = isinstance(token, str) and bool(token)
+        if not (has_auth or has_user or has_token):
+            raise ValueError(
+                "Each auths entry needs auth, or username plus password, or a token."
+            )
+        if has_auth and not _valid_base64(auth):
+            raise ValueError("Each auths auth value must be valid base64.")
     normalized = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
     if pull_secret_contains_rejected_fragment(normalized):
         raise ValueError("That pull secret is not accepted.")
@@ -1257,21 +1305,36 @@ def save_host_pull_secret(pull_secret):
     """Write the host pull secret atomically. The result names the path and not the contents."""
     normalized = parse_pull_secret_text(pull_secret, "The pull secret")
     path = pull_secret_file()
-    if path.is_symlink():
-        raise ValueError(f"The pull secret file {path} is a symbolic link.")
     parent = path.parent
     if parent.is_symlink():
         raise ValueError(f"The pull secret directory {parent} is a symbolic link.")
-    if not parent.exists():
-        parent.mkdir(parents=True, mode=0o700)
-        os.chmod(parent, 0o700)
-    elif not parent.is_dir():
-        raise ValueError(f"The pull secret directory {parent} is not a directory.")
+    if path.is_symlink():
+        raise ValueError(f"The pull secret file {path} is a symbolic link.")
     data = normalized.encode("utf-8")
     temporary = parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     fd = None
+    dir_fd = None
     replaced = False
     try:
+        if not parent.exists():
+            try:
+                parent.mkdir(parents=True, mode=0o700)
+                os.chmod(parent, _octal_mode("OCP_METAL_UI_PULL_SECRET_DIR_MODE", "0700"))
+            except OSError:
+                raise ValueError(
+                    f"The pull secret directory {parent} could not be created."
+                ) from None
+        elif not parent.is_dir():
+            raise ValueError(f"The pull secret directory {parent} is not a directory.")
+        else:
+            info = parent.stat()
+            expected_mode = _octal_mode("OCP_METAL_UI_PULL_SECRET_DIR_MODE", "0700")
+            expected_uid = _pull_secret_owner_uid()
+            if stat.S_IMODE(info.st_mode) != expected_mode or info.st_uid != expected_uid:
+                raise ValueError(
+                    f"The pull secret directory {parent} must be mode {expected_mode:04o} "
+                    f"and owned by uid {expected_uid}."
+                )
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -1288,12 +1351,19 @@ def save_host_pull_secret(pull_secret):
         fd = None
         os.replace(temporary, path)
         replaced = True
-        os.chmod(path, 0o600)
+        dir_fd = os.open(parent, os.O_RDONLY)
+        os.fsync(dir_fd)
+        os.close(dir_fd)
+        dir_fd = None
+    except ValueError:
+        raise
     except OSError:
         raise ValueError(f"The pull secret file {path} could not be saved.") from None
     finally:
         if fd is not None:
             os.close(fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
         if not replaced:
             try:
                 temporary.unlink()
@@ -1310,12 +1380,20 @@ def pull_secret_permission_warning():
         mode = path.stat().st_mode
     except OSError:
         return ""
-    if mode & (stat.S_IRGRP | stat.S_IROTH):
+    expected = _octal_mode("OCP_METAL_UI_PULL_SECRET_MODE", "0600")
+    if mode & (stat.S_IRGRP | stat.S_IROTH) and not expected & (stat.S_IRGRP | stat.S_IROTH):
         return (
             f"The pull secret file {path} is group- or world-readable. "
-            "Expected mode 0600, owner root."
+            f"Expected mode {expected:04o}."
         )
     return ""
+
+
+def redact_install_config(text, pull_secret):
+    if not text or not pull_secret:
+        return text
+    escaped = pull_secret.replace("\\", "\\\\").replace('"', '\\"')
+    return text.replace(pull_secret, "<redacted>").replace(escaped, "<redacted>")
 
 
 def warn_about_pull_secret_file():
@@ -3228,7 +3306,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "outputDirectory": str(output_root),
                 "files": sorted(files),
                 "inventoryFile": str(output_root / "inventory.yml"),
-                "installConfig": preview["installConfig"],
+                "installConfig": redact_install_config(preview["installConfig"], pull_secret),
                 "agentConfig": preview["agentConfig"],
                 "configPreviewError": preview["configPreviewError"],
                 "installConfigFile": install_config_file,

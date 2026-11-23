@@ -1038,7 +1038,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
   const savePullSecret = async () => {
     const text = pullSecretText.trim();
     if (!text) {
-      setError('Paste the cluster pull secret, or choose the pull-secret.json file you downloaded.');
+      setError('The pull secret is empty.');
       return;
     }
     let parsed;
@@ -1056,7 +1056,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     setError('');
     setMessage('');
     try {
-      const response = await fetch('/api/v1/install-secrets/pull-secret', {
+      const response = await apiFetch('/api/v1/install-secrets/pull-secret', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pullSecret: text })
@@ -1066,7 +1066,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
       setPullSecretText('');
       if (fileInputRef.current) fileInputRef.current.value = '';
       setMessage(`Pull secret saved to ${result.path}.`);
-      const statusResponse = await fetch(
+      const statusResponse = await apiFetch(
         `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
       );
       const statusResult = await statusResponse.json();
