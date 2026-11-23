@@ -947,46 +947,44 @@ function StrategyLandingScreen({ onStart, onOpenBmc }) {
     </PageSection>
   );
 }
-const EMPTY_SECRET_STATUS = {
-  pullSecretStored: false,
-  pullSecretBuiltIn: false,
+const EMPTY_INSTALL_SECRET_STATUS = {
   pullSecretReady: false,
-  vaultPasswordAvailable: false,
+  pullSecretPath: '',
+  pullSecretError: '',
   privateKeyStored: false,
   sshPublicKey: ''
 };
 
 function InstallSecrets({ outputDirectory, httpsEnabled }) {
   const fileInputRef = useRef(null);
-  const [status, setStatus] = useState(EMPTY_SECRET_STATUS);
+  const [status, setStatus] = useState(EMPTY_INSTALL_SECRET_STATUS);
   const [pullSecretText, setPullSecretText] = useState('');
   const [publicKeyText, setPublicKeyText] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const canSave = Boolean(outputDirectory) && httpsEnabled && !busy;
+  const canSavePullSecret = httpsEnabled && !busy;
+  const canSaveSsh = Boolean(outputDirectory) && canSavePullSecret;
+  const installSecretsUrl = outputDirectory
+    ? `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
+    : '/api/v1/install-secrets';
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      if (!outputDirectory) {
-        setStatus(EMPTY_SECRET_STATUS);
-        return;
-      }
       try {
-        const response = await apiFetch(
-          `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
-        );
+        const response = await apiFetch(installSecretsUrl);
         const result = await response.json();
         if (!response.ok) {
           throw new Error(result.error || `Could not read install secret status (HTTP ${response.status}).`);
         }
         if (!cancelled) {
           setStatus({
-            pullSecretStored: Boolean(result.pullSecretStored),
-            pullSecretBuiltIn: Boolean(result.pullSecretBuiltIn),
             pullSecretReady: Boolean(result.pullSecretReady),
-            vaultPasswordAvailable: Boolean(result.vaultPasswordAvailable),
+            pullSecretPath: typeof result.pullSecretPath === 'string'
+              ? result.pullSecretPath
+              : EMPTY_INSTALL_SECRET_STATUS.pullSecretPath,
+            pullSecretError: typeof result.pullSecretError === 'string' ? result.pullSecretError : '',
             privateKeyStored: Boolean(result.privateKeyStored),
             sshPublicKey: typeof result.sshPublicKey === 'string' ? result.sshPublicKey : ''
           });
@@ -999,14 +997,15 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     return () => {
       cancelled = true;
     };
-  }, [outputDirectory]);
+  }, [installSecretsUrl]);
 
   const applyStatus = (result) => {
     setStatus({
-      pullSecretStored: Boolean(result.pullSecretStored),
-      pullSecretBuiltIn: Boolean(result.pullSecretBuiltIn),
       pullSecretReady: Boolean(result.pullSecretReady),
-      vaultPasswordAvailable: Boolean(result.vaultPasswordAvailable),
+      pullSecretPath: typeof result.pullSecretPath === 'string'
+        ? result.pullSecretPath
+        : EMPTY_INSTALL_SECRET_STATUS.pullSecretPath,
+      pullSecretError: typeof result.pullSecretError === 'string' ? result.pullSecretError : '',
       privateKeyStored: Boolean(result.privateKeyStored),
       sshPublicKey: typeof result.sshPublicKey === 'string' ? result.sshPublicKey : ''
     });
@@ -1034,6 +1033,47 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     }
   };
 
+  const savePullSecret = async () => {
+    const text = pullSecretText.trim();
+    if (!text) {
+      setError('The pull secret is empty.');
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      setError('The pull secret is not valid JSON.');
+      return;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !parsed.auths || typeof parsed.auths !== 'object' || Array.isArray(parsed.auths)) {
+      setError('The pull secret must contain an auths object.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      const response = await apiFetch('/api/v1/install-secrets/pull-secret', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pullSecret: text })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Request failed (HTTP ${response.status}).`);
+      setPullSecretText('');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      setMessage(`Pull secret saved to ${result.path}.`);
+      const statusResponse = await apiFetch(installSecretsUrl);
+      const statusResult = await statusResponse.json();
+      if (statusResponse.ok) applyStatus(statusResult);
+    } catch (saveError) {
+      setError(saveError.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onPullSecretFile = (event) => {
     const file = event.target.files && event.target.files[0];
     if (!file) return;
@@ -1041,43 +1081,10 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     reader.onload = () => {
       setPullSecretText(typeof reader.result === 'string' ? reader.result : '');
       setError('');
-      setMessage('Pull secret file loaded. Save it to keep it for this workspace.');
+      setMessage('Pull secret file loaded. Save it to write the host file.');
     };
     reader.onerror = () => setError('Could not read that file.');
     reader.readAsText(file);
-  };
-
-  const savePullSecret = async () => {
-    const text = pullSecretText.trim();
-    if (!text) {
-      setError(status.pullSecretBuiltIn
-        ? 'Paste a pull secret to replace the one in the vault. Leave it blank and skip Save to keep that one.'
-        : 'Paste the cluster pull secret, or choose the pull-secret.json file you downloaded.');
-      return;
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      setError('The pull secret must be the JSON you downloaded, with an auths object.');
-      return;
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !parsed.auths || typeof parsed.auths !== 'object' || Array.isArray(parsed.auths)) {
-      setError('The pull secret must be JSON with an auths object.');
-      return;
-    }
-    if (!Object.keys(parsed.auths).length) {
-      setError('The pull secret needs at least one registry under auths.');
-      return;
-    }
-    const saved = await postSecret('/api/v1/install-secrets/pull-secret', {
-      outputDirectory,
-      pullSecret: text
-    });
-    if (!saved) return;
-    setPullSecretText('');
-    if (fileInputRef.current) fileInputRef.current.value = '';
-    setMessage('Pull secret saved in the Ansible vault for this workspace. It is not in the inventory or the database.');
   };
 
   const createSshKey = async () => {
@@ -1165,9 +1172,10 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
         />
         <HelperText>
           <HelperTextItem>
-            {status.pullSecretBuiltIn
-              ? 'This container was built with a pull secret in the Ansible vault. Paste or choose a file to store a different one for this workspace. Leave the box blank to keep the one that was built in.'
-              : 'Paste the cluster pull secret, or choose the pull-secret.json file you downloaded. A saved copy is stored in the Ansible vault.'}
+            {status.pullSecretReady
+              ? `Using the pull secret at ${status.pullSecretPath}. Paste a replacement to save it there. The UI reads the file again on the next generate.`
+              : (status.pullSecretError
+                || `The pull secret file ${status.pullSecretPath} is not available. Paste one to save it there.`)}
           </HelperTextItem>
         </HelperText>
         <div className="install-secret-actions">
@@ -1179,22 +1187,13 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
             aria-label="Choose pull-secret.json"
             onChange={onPullSecretFile}
           />
-          <Button id="bp-pull-secret-save" variant="secondary" onClick={savePullSecret} isDisabled={!canSave}>
+          <Button id="bp-pull-secret-save" variant="secondary" onClick={savePullSecret} isDisabled={!canSavePullSecret}>
             Save pull secret
           </Button>
         </div>
         <HelperText>
           <HelperTextItem>
-            {status.pullSecretReady && status.pullSecretStored
-              ? 'A pull secret saved for this workspace replaces the one built into the container.'
-              : status.pullSecretReady
-                ? 'Using the pull secret from the Ansible vault in this container. Paste one here to replace it for this workspace.'
-                : (status.pullSecretBuiltIn || status.pullSecretStored) && !status.vaultPasswordAvailable
-                  ? 'The pull secret is in the Ansible vault. The vault password file is not available.'
-                  : (status.pullSecretBuiltIn || status.pullSecretStored)
-                    ? 'The vault password did not open the pull secret.'
-                    : 'No pull secret is available yet. Paste one to store it in the vault for this workspace.'}
-            {' '}A saved pull secret is written as cluster-install/pull-secret.vault, outside the generated inventory.
+            Save writes the host file. This page does not show the saved secret.
           </HelperTextItem>
         </HelperText>
       </FormGroup>
@@ -1216,10 +1215,10 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
           />
         )}
         <div className="install-secret-actions">
-          <Button id="bp-ssh-create" variant="secondary" onClick={createSshKey} isDisabled={!canSave}>
+          <Button id="bp-ssh-create" variant="secondary" onClick={createSshKey} isDisabled={!canSaveSsh}>
             Create an SSH key
           </Button>
-          <Button id="bp-ssh-download" variant="secondary" onClick={downloadPrivateKey} isDisabled={!canSave || !status.privateKeyStored}>
+          <Button id="bp-ssh-download" variant="secondary" onClick={downloadPrivateKey} isDisabled={!canSaveSsh || !status.privateKeyStored}>
             Download private key
           </Button>
         </div>
@@ -1239,7 +1238,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
           aria-label="Paste an existing public key"
         />
         <div className="install-secret-actions">
-          <Button id="bp-ssh-public-key-save" variant="secondary" onClick={usePublicKey} isDisabled={!canSave}>
+          <Button id="bp-ssh-public-key-save" variant="secondary" onClick={usePublicKey} isDisabled={!canSaveSsh}>
             Use this public key
           </Button>
         </div>
@@ -1248,7 +1247,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
         <p role="status">Open this page over HTTPS before saving a pull secret or SSH key.</p>
       )}
       {!outputDirectory && (
-        <p role="status">Choose the workspace directory before saving a pull secret or SSH key.</p>
+        <p role="status">Choose the workspace directory before creating or saving an SSH key.</p>
       )}
       {(error || message) && (
         <p id="bp-install-secret-status" role={error ? 'alert' : 'status'}>{error || message}</p>
@@ -2056,7 +2055,7 @@ function InventoryReviewPage({ nodes, configs, machineNetworkCidr, outputDirecto
           {configPreview?.installConfigFile
             ? `Wrote ${configPreview.installConfigFile} and ${configPreview.agentConfigFile}.`
             : (configPreview?.installFilesMessage
-              || 'Generate writes the inventory under ocp-metal-ui. The pull secret in the Ansible vault, plus an SSH public key, also writes install-config.yaml and agent-config.yaml in cluster-install.')}
+              || 'Generate writes the inventory under ocp-metal-ui. A readable host pull secret, plus an SSH public key, also writes install-config.yaml and agent-config.yaml in cluster-install.')}
         </p>
         <div className="workflow-actions pf-v6-u-pt-lg">
           <Button variant="secondary" onClick={onBack}>Back to inventory</Button>
@@ -2131,7 +2130,7 @@ function YamlPopout({ which, installConfig, agentConfig, written, onChoose, onCl
           <p className="yaml-popout-note">
             {written
               ? 'This is the install-config.yaml written in cluster-install. The agent-config.yaml beside it is the matching file.'
-              : 'The pull secret stays in the Ansible vault. Save an SSH public key, and paste a pull secret if this container was not built with one, then generate again.'}
+              : 'Save an SSH public key and provide the host pull secret file, then generate again.'}
           </p>
         )}
         {which === 'agent' && written && (

@@ -143,6 +143,91 @@ for asset in parser.assets:
 
 print(f"HTTPS API, homepage, and {len(parser.assets)} frontend assets: PASS")
 print(f"Inventory API returned {len(nodes)} node(s).")
+
+secret = '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
+save_request = Request(
+    urljoin(base_url, "api/v1/install-secrets/pull-secret"),
+    data=json.dumps({"pullSecret": secret}).encode(),
+    headers={
+        "Authorization": f"Bearer {TOKEN}",
+        "Content-Type": "application/json",
+    },
+    method="POST",
+)
+with urlopen(save_request, context=context, timeout=10) as response:
+    saved = json.loads(response.read().decode())
+    if response.status != 200 or saved.get("saved") is not True:
+        raise RuntimeError("Pull secret save did not succeed.")
+    if "dGVzdA==" in json.dumps(saved):
+        raise RuntimeError("Pull secret save echoed the secret.")
+status_request = Request(
+    urljoin(base_url, "api/v1/install-secrets?outputDirectory=/ansible"),
+    headers={"Authorization": f"Bearer {TOKEN}"},
+)
+with urlopen(status_request, context=context, timeout=10) as response:
+    status_body = response.read().decode()
+    status = json.loads(status_body)
+    if not status.get("pullSecretReady"):
+        raise RuntimeError(status.get("pullSecretError") or "Pull secret was not readable after save.")
+    if "dGVzdA==" in status_body:
+        raise RuntimeError("Pull secret status echoed the secret.")
+inspection = {
+    "uuid": "8a4f91c2-38d1-4bda-912c-bbfa47821001",
+    "bmc_address": "192.0.2.21",
+    "inventory": {
+        "system_vendor": {"serial_number": "SMOKE-SERIAL"},
+        "cpu": {"count": 1, "model_name": "Example CPU"},
+        "interfaces": [{"name": "eno5", "mac_address": "52:54:00:11:00:05"}],
+        "disks": [{"name": "/dev/nvme0n1", "serial": "NVME-C1", "size": 1000}],
+    },
+}
+inspect_request = Request(
+    urljoin(base_url, "api/v1/inspections"),
+    data=json.dumps(inspection).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urlopen(inspect_request, context=context, timeout=10) as response:
+    if response.status != 202:
+        raise RuntimeError(f"Inspection intake returned HTTP {response.status}")
+generate = {
+    "outputDirectory": "/ansible",
+    "preferences": {
+        inspection["uuid"]: {
+            "ansibleHost": "control-01",
+            "role": "master",
+            "rendezvous": True,
+            "ipv4LastOctet": "11",
+            "rootDisk": "NVME-C1",
+            "netType": "single",
+            "singleNic": "eno5",
+            "singleVlanEnabled": False,
+        }
+    },
+    "blueprint": {
+        "clusterName": "ocp-baremetal",
+        "baseDomain": "ocp.internal",
+        "controlPlaneTopology": "SingleNode",
+        "machineNetworkCidr": "192.0.2.0/24",
+        "networkGateway": "192.0.2.1",
+    },
+}
+generate_request = Request(
+    urljoin(base_url, "api/v1/ansible-files"),
+    data=json.dumps(generate).encode(),
+    headers={
+        "Authorization": f"Bearer {TOKEN}",
+        "Content-Type": "application/json",
+    },
+    method="POST",
+)
+with urlopen(generate_request, context=context, timeout=20) as response:
+    generated = json.loads(response.read().decode())
+    if response.status != 200:
+        raise RuntimeError(f"Generate returned HTTP {response.status}")
+    if "dGVzdA==" in generated.get("installConfig", ""):
+        raise RuntimeError("Generate echoed the pull secret in installConfig.")
+print("Pull secret save, read, and generate: PASS")
 PY
 
 if ! timeout "$BROWSER_TIMEOUT" "$CHROME_BIN" \

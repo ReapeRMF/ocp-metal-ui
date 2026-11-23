@@ -15,14 +15,10 @@ data/
 *.tar
 *.tar.gz
 
-# Cluster pull secret. Place plaintext at pull-secret.json before building.
-# airgap-build-bundle.sh writes pull-secret.vault for the image. Neither file
-# is committed. The vault password is not in this repository.
+# Host pull secret. It is not built into the image.
 pull-secret.json
 pull-secret.vault
-# Do not keep the vault password in the checkout. Set VAULT_PASSWORD_FILE
-# to a path outside it (the default is /root/.vault_pass). This name is
-# ignored so an old staged copy is not committed.
+# Do not keep a vault password in the checkout.
 vault.password
 
 # The admin token belongs outside the checkout, at

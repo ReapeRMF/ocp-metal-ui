@@ -1,6 +1,85 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The pull-secret ownership model is not settled. David picks one of:
+#   (a) root:ocp-metal-ui mode 0640, with --group-add, read-only
+#   (b) uid 10001 owns the file, mode 0600, directory mode 0700
+#   (c) a podman secret
+# These variables are the only place that choice is recorded. The default
+# is (b) so the container user can read and replace the file.
+PULL_SECRET_DIR="${OCP_METAL_UI_PULL_SECRET_DIR:-/etc/ocp-metal-ui}"
+PULL_SECRET_FILE_NAME="${OCP_METAL_UI_PULL_SECRET_FILE_NAME:-pull-secret.json}"
+PULL_SECRET_OWNER="${OCP_METAL_UI_PULL_SECRET_OWNER:-10001}"
+PULL_SECRET_GROUP="${OCP_METAL_UI_PULL_SECRET_GROUP:-10001}"
+PULL_SECRET_MODE="${OCP_METAL_UI_PULL_SECRET_MODE:-0600}"
+PULL_SECRET_DIR_MODE="${OCP_METAL_UI_PULL_SECRET_DIR_MODE:-0700}"
+
+# Numeric ids are used as written. The container user 10001 may not exist
+# in the host passwd database, and chown still accepts the number.
+owner_number() {
+  local name="$1"
+  case "$name" in
+    *[!0-9]*) id -u "$name" ;;
+    *) printf '%s\n' "$name" ;;
+  esac
+}
+
+group_number() {
+  local name="$1"
+  case "$name" in
+    *[!0-9]*) getent group "$name" | awk -F: '{print $3; found=1} END {if (!found) exit 1}' ;;
+    *) printf '%s\n' "$name" ;;
+  esac
+}
+
+# chown and chmod only when the current owner, group, or mode differs.
+apply_owner_mode() {
+  local path="$1"
+  local want_mode="$2"
+  local uid gid mode want_uid want_gid
+  uid="$(stat -c '%u' "$path")"
+  gid="$(stat -c '%g' "$path")"
+  mode="$(stat -c '%a' "$path")"
+  if [ "$(id -u)" -eq 0 ]; then
+    want_uid="$(owner_number "$PULL_SECRET_OWNER")"
+    want_gid="$(group_number "$PULL_SECRET_GROUP")"
+    if [ "$uid" != "$want_uid" ] || [ "$gid" != "$want_gid" ]; then
+      chown "${want_uid}:${want_gid}" "$path"
+    fi
+  fi
+  if [ $((8#$mode)) -ne $((8#$want_mode)) ]; then
+    chmod "$want_mode" "$path"
+  fi
+}
+
+# Create the pull-secret directory and correct an existing file. A leftover
+# root:root mode 0600 file is not readable by uid 10001 until this runs.
+align_pull_secret_permissions() {
+  local dir="$1"
+  local file
+  if [ -z "$dir" ] || [ -L "$dir" ]; then
+    echo "❌ Error: pull secret directory must be a real directory." >&2
+    exit 1
+  fi
+  if [ ! -d "$dir" ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+      install -d -o "$PULL_SECRET_OWNER" -g "$PULL_SECRET_GROUP" -m "$PULL_SECRET_DIR_MODE" "$dir"
+    else
+      install -d -m "$PULL_SECRET_DIR_MODE" "$dir"
+    fi
+  else
+    apply_owner_mode "$dir" "$PULL_SECRET_DIR_MODE"
+  fi
+  file="${dir%/}/${PULL_SECRET_FILE_NAME}"
+  if [ -L "$file" ]; then
+    echo "❌ Error: ${file} is a symbolic link." >&2
+    exit 1
+  fi
+  if [ -f "$file" ]; then
+    apply_owner_mode "$file" "$PULL_SECRET_MODE"
+  fi
+}
+
 # Remove a checkout vault.password only when it is the old staged copy
 # (uid 10001, mode 0400) and it is not the configured password source.
 checkout_vault_copy_should_be_removed() {
@@ -28,6 +107,11 @@ if [ "${1:-}" = "--vault-cleanup-decision" ]; then
     exit 0
   fi
   exit 1
+fi
+
+if [ "${1:-}" = "--align-pull-secret" ]; then
+  align_pull_secret_permissions "${2:-}"
+  exit 0
 fi
 
 echo "========================================================="
@@ -335,59 +419,22 @@ else
   USER_NAMESPACE_ARGS=()
   GROUP_ARGS=(--group-add "$ANSIBLE_HOST_GID")
 fi
-
-VAULT_PASSWORD_HOST_FILE="${VAULT_PASSWORD_FILE:-/root/.vault_pass}"
-VAULT_PASSWORD_SOURCE="$VAULT_PASSWORD_HOST_FILE"
-VAULT_ARGS=()
-VAULT_STAGE=""
-remove_secret_file() {
-  local target="$1"
-  if [ ! -e "$target" ]; then
-    return 0
-  fi
-  if command -v shred >/dev/null 2>&1; then
-    shred -u -- "$target" 2>/dev/null || rm -f -- "$target"
-  else
-    rm -f -- "$target"
-  fi
-}
-cleanup_vault_material() {
-  if [ -n "${VAULT_STAGE:-}" ]; then
-    remove_secret_file "$VAULT_STAGE"
-    VAULT_STAGE=""
-  fi
-  # Only the old staged copy (uid 10001, mode 0400) is removed, and never
-  # when that path is the configured vault password.
-  if [ -n "${SCRIPT_DIR:-}" ] && checkout_vault_copy_should_be_removed \
-    "$SCRIPT_DIR/vault.password" "${VAULT_PASSWORD_SOURCE:-}"; then
-    rm -f -- "$SCRIPT_DIR/vault.password"
-  fi
-}
-trap cleanup_vault_material EXIT
-if [ -f "$VAULT_PASSWORD_HOST_FILE" ]; then
-  VAULT_PASSWORD_HOST_FILE="$(cd "$(dirname "$VAULT_PASSWORD_HOST_FILE")" && pwd -P)/$(basename "$VAULT_PASSWORD_HOST_FILE")"
-  vault_mount_opts=ro
-  if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -eq 0 ]; then
-    # The running container bind-mounts this file, so it stays under
-    # /var/lib and is not removed when the script exits.
-    install -d -o root -g root -m 755 /var/lib/ocp-metal-ui
-    VAULT_STAGE="$(mktemp /var/lib/ocp-metal-ui/vault.password.XXXXXX)"
-    install -o 10001 -g 10001 -m 0400 "$VAULT_PASSWORD_HOST_FILE" "$VAULT_STAGE"
-    mv -f -- "$VAULT_STAGE" /var/lib/ocp-metal-ui/vault.password
-    VAULT_STAGE=""
-    chown 10001:10001 /var/lib/ocp-metal-ui/vault.password
-    chmod 0400 /var/lib/ocp-metal-ui/vault.password
-    VAULT_PASSWORD_HOST_FILE="/var/lib/ocp-metal-ui/vault.password"
-    vault_mount_opts=ro,Z
-  fi
-  VAULT_ARGS=(
-    -v "$VAULT_PASSWORD_HOST_FILE:/vault/password:${vault_mount_opts}"
-    -e VAULT_PASSWORD_FILE=/vault/password
-  )
-else
-  echo "⚠️  Vault password file not found at $VAULT_PASSWORD_HOST_FILE." >&2
-  echo "   The pull secret built into the image stays locked until that file is mounted." >&2
+# A group-readable pull secret (option a) needs the container in that group.
+# Mode 0600 does not. Changing PULL_SECRET_MODE is enough to turn this on.
+if [ $((8#$PULL_SECRET_MODE & 070)) -ne 0 ]; then
+  GROUP_ARGS+=(--group-add "$PULL_SECRET_GROUP")
 fi
+
+PULL_SECRET_ARGS=()
+align_pull_secret_permissions "$PULL_SECRET_DIR"
+PULL_SECRET_DIR="$(cd "$PULL_SECRET_DIR" && pwd -P)"
+PULL_SECRET_ARGS=(
+  -v "${PULL_SECRET_DIR}:${PULL_SECRET_DIR}:Z"
+  -e "OCP_METAL_UI_PULL_SECRET_FILE=${PULL_SECRET_DIR}/${PULL_SECRET_FILE_NAME}"
+  -e "OCP_METAL_UI_PULL_SECRET_OWNER=${PULL_SECRET_OWNER}"
+  -e "OCP_METAL_UI_PULL_SECRET_DIR_MODE=${PULL_SECRET_DIR_MODE}"
+  -e "OCP_METAL_UI_PULL_SECRET_MODE=${PULL_SECRET_MODE}"
+)
 
 # 3. Start the application. The image still declares /data; the database
 # is the PostgreSQL container, so that mount stays empty.
@@ -439,7 +486,7 @@ $ENGINE run -d \
   -v "$ANSIBLE_HOST_DIR:/ansible:Z" \
   -e ANSIBLE_WORKING_DIR=/ansible \
   "${TLS_ARGS[@]}" \
-  "${VAULT_ARGS[@]}" \
+  "${PULL_SECRET_ARGS[@]}" \
   localhost/ocp-metal-ui-engine:latest
 
 echo "========================================================="

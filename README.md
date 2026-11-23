@@ -136,18 +136,17 @@ Firewall port 3003 so only the provisioning network can reach it. Leave `BIND_AD
 
 The inventory host key is the Ansible `inventory_hostname`. Its `serial_number` variable ties that name to the physical node.
 
-The pull secret and the SSH public key are not written under `ocp-metal-ui/` and are not stored in PostgreSQL. When the operator pastes a pull secret or creates an SSH key, the files are written beside that tree in `cluster-install/`:
+The pull secret and the SSH public key are not written under `ocp-metal-ui/` and are not stored in PostgreSQL. The pull secret stays in the host file. When the operator creates an SSH key, the files are written beside that tree in `cluster-install/`:
 
-- `pull-secret.vault`, mode 0600, Ansible vault variable `ocp_pre_install_pull_secret_contents`
 - `id_ed25519`, mode 0600
 - `id_ed25519.pub`, mode 0644
 
-When the inventory can build a cluster, a pull secret can be opened, and an SSH public key is present, the same action also writes:
+When the inventory can build a cluster, the host pull secret can be read, and an SSH public key is present, the same action also writes:
 
 - `cluster-install/install-config.yaml`, mode 0600
 - `cluster-install/agent-config.yaml`, mode 0644
 
-`install-config.yaml` contains the opened pull secret because the installer reads that file. The vault password stays in its own file. A generate that cannot build the cluster removes a previously written pair and leaves the pull secret and the SSH key in place. Other files in the workspace are left as they are.
+`install-config.yaml` contains the pull secret because the installer reads that file. A generate that cannot build the cluster removes a previously written pair and leaves the SSH key in place. The host pull secret file is left as it is. Other files in the workspace are left as they are.
 
 The configurator install keeps its profile under `/var/ocp-config/ocp/dev/<profile>/` and writes its own `install-config.yaml` and `agent-config.yaml` under `/opt/ocp/<platform>/<version>/`. Generate refuses a directory inside `/var/ocp-config`, `/opt/ocp`, or `/etc/ansible`. The files from this UI stay in the selected workspace.
 
@@ -195,9 +194,21 @@ After linking, both sources use the same controls for disk, NIC, bond, and VLAN.
 
 ## Pull secret and SSH key
 
-The image build copies an Ansible vault file to `/app/pull-secret.vault`, mode 0600. That file is produced on the build machine and is not stored in git. The vault password is mounted at `/vault/password` and is not in the image. On the Blueprint page, paste a pull secret or choose a file to store one for this workspace, or create an SSH key. The saved vault file is `cluster-install/pull-secret.vault`. Leave the field blank to keep the pull secret built into the image.
+The pull secret is a host file. The default path is `/etc/ocp-metal-ui/pull-secret.json`. Set `OCP_METAL_UI_PULL_SECRET_FILE` to use another path. The UI reads that file when it builds a preview or writes `install-config.yaml`, and again after a save. It does not keep a copy in memory between those uses, so replacing the file takes effect on the next use. The image does not contain a pull secret.
 
-The install preview shows the pull secret after the vault password can open it. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
+On first boot the host creates `/etc/ocp-metal-ui` and writes `pull-secret.json` there, then shreds the password file that decrypted it. Each deploy run creates that directory if it is missing. When the deploy runs as root, it also sets the owner, group, and mode of the directory and of an existing `pull-secret.json` from `PULL_SECRET_OWNER`, `PULL_SECRET_GROUP`, `PULL_SECRET_MODE`, and `PULL_SECRET_DIR_MODE`. It changes a path only when the owner, group, or mode differs, so a leftover root-owned mode `0600` file becomes readable by the container user. To rotate the secret, replace that file or paste a new one on the Blueprint page and save it. The paste does not need the Ansible workspace directory. The next preview or generate reads the replacement.
+
+The container runs as uid 10001. It does not run as root. Who owns the file, and which mode it uses, is still open. The deploy script records the current placeholder in `PULL_SECRET_OWNER`, `PULL_SECRET_GROUP`, `PULL_SECRET_MODE`, and `PULL_SECRET_DIR_MODE`. The placeholder is uid `10001`, group `10001`, file mode `0600`, and directory mode `0700`, so this container user can read and replace the file. Changing those variables is the whole ownership change. The three choices still in front of David are a `root:ocp-metal-ui` mode `0640` file with `--group-add` and no save, uid `10001` owning a mode `0600` file in a mode `0700` directory, or a podman secret.
+
+The pull secret is plaintext at rest on the host. That is the accepted risk, chosen so the UI can restart unattended.
+
+If the file is missing, is not JSON, or has no usable `auths` object, the UI still starts. A startup log line names the path. The features that need the pull secret return that same error. The log and the error do not include the file contents. A startup log line also warns when the file is group- or world-readable beyond the configured mode.
+
+The Blueprint page can paste a pull secret and save it to that file. The save requires the admin bearer token and HTTPS. It checks that the text is JSON with a non-empty `auths` object. Each entry needs `auth`, or `username` plus `password`, or `token`, or `identitytoken`. `auth` must be valid base64. An empty paste is rejected as empty. The save writes a temporary file in the same directory with mode `0600`, flushes it, replaces the host file, and flushes the directory. The response says that the file was saved and names the path. It does not include the secret. The page does not show the saved secret. The API response for generated install config redacts the pull secret. The file written under `cluster-install/` still contains it, because the installer reads that file.
+
+The Blueprint page also creates or accepts an SSH public key. The private key, when created here, is `cluster-install/id_ed25519`.
+
+The install preview uses the pull secret after the host file can be read. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
 
 ## Redfish
 
@@ -211,16 +222,14 @@ BMC certificates are verified by default. For an untrusted BMC certificate, the 
 
 Build on a connected machine with Node.js 22, npm, and Podman or Docker. The image contains the built UI and the Python runtime. It does not need network access after it is built.
 
-The cluster pull secret is not in this repository. On the build machine, place the plaintext pull secret at `pull-secret.json` in this directory and set `VAULT_PASSWORD_FILE` to the Ansible vault password file. Neither file is committed. `airgap-build-bundle.sh` writes `pull-secret.vault` beside them, mode 0600, as the Ansible vault variable `ocp_pre_install_pull_secret_contents`. That vault file is gitignored. The image copies it to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image.
-
-Mount the same password file at `/vault/password` when the container starts. `VAULT_PASSWORD_FILE` defaults to `/root/.vault_pass`. Keep that file outside the git checkout. When the deploy runs as root under Podman, it copies that file to `/var/lib/ocp-metal-ui/vault.password`, mode 0400, owned by uid 10001, and mounts that copy. A failed deploy shreds a partial copy under `/var/lib/ocp-metal-ui`. A file named `vault.password` in the checkout is removed only when it is the old staged copy (uid 10001, mode 0400) and it is not `VAULT_PASSWORD_FILE`. To use a different secret later, paste it on the Blueprint page or replace `pull-secret.json` and build again. A secret saved from the UI is `cluster-install/pull-secret.vault` in the Ansible workspace, and it overrides the copy in the image for that workspace.
+The image build does not read or copy a pull secret. Put the plaintext file on the host at `/etc/ocp-metal-ui/pull-secret.json`, or set `OCP_METAL_UI_PULL_SECRET_FILE`, before generating install files.
 
 ```sh
 npm ci
-VAULT_PASSWORD_FILE=/path/to/vault-password ./airgap-build-bundle.sh
+./airgap-build-bundle.sh
 ```
 
-The script compiles `dist/`, vaults `pull-secret.json`, builds `Containerfile.airgap`, and writes `ocp-metal-ui-engine-bundle.tar`. Copy that tarball and `airgap-deploy-bundle.sh` to the disconnected host. `package-lock.json` pins the JavaScript dependencies. For a byte-for-byte image rebuild, also pin the Python base image by digest in `Containerfile.airgap`.
+The script compiles `dist/`, builds `Containerfile.airgap`, and writes `ocp-metal-ui-engine-bundle.tar`. The image contains no pull secret. Copy that tarball and `airgap-deploy-bundle.sh` to the disconnected host. `package-lock.json` pins the JavaScript dependencies. For a byte-for-byte image rebuild, also pin the Python base image by digest in `Containerfile.airgap`.
 
 ## Deploy on the installed host
 
