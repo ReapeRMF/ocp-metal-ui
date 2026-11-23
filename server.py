@@ -1118,6 +1118,7 @@ _SSH_PUBLIC_KEY = re.compile(
     r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/]+={0,3}(?: .*)?$"
 )
 _INSTALL_SECRET_POSTS = {
+    "/api/v1/install-secrets/pull-secret",
     "/api/v1/install-secrets/ssh-key",
     "/api/v1/install-secrets/ssh-public-key",
 }
@@ -1136,6 +1137,21 @@ def pull_secret_file():
     if not configured:
         configured = _DEFAULT_PULL_SECRET_FILE
     return Path(configured)
+
+
+def parse_pull_secret_text(text, source_label):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(f"{source_label} is not valid JSON.")
+    if len(text) > _MAX_PULL_SECRET_CHARS:
+        raise ValueError(f"{source_label} is too large.")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise ValueError(f"{source_label} is not valid JSON.") from None
+    auths = parsed.get("auths") if isinstance(parsed, dict) else None
+    if not isinstance(auths, dict):
+        raise ValueError(f"{source_label} must contain an auths object.")
+    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
 
 
 def load_pull_secret():
@@ -1158,14 +1174,56 @@ def load_pull_secret():
         raise ValueError(f"The pull secret file {label} could not be read.") from None
     except UnicodeError:
         raise ValueError(f"The pull secret file {label} is not valid JSON.") from None
+    return parse_pull_secret_text(text, f"The pull secret file {label}")
+
+
+def save_host_pull_secret(pull_secret):
+    """Write the host pull secret atomically. The result names the path and not the contents."""
+    normalized = parse_pull_secret_text(pull_secret, "The pull secret")
+    path = pull_secret_file()
+    if path.is_symlink():
+        raise ValueError(f"The pull secret file {path} is a symbolic link.")
+    parent = path.parent
+    if parent.is_symlink():
+        raise ValueError(f"The pull secret directory {parent} is a symbolic link.")
+    if not parent.exists():
+        parent.mkdir(parents=True, mode=0o700)
+        os.chmod(parent, 0o700)
+    elif not parent.is_dir():
+        raise ValueError(f"The pull secret directory {parent} is not a directory.")
+    data = normalized.encode("utf-8")
+    temporary = parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    fd = None
+    replaced = False
     try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        raise ValueError(f"The pull secret file {label} is not valid JSON.") from None
-    auths = parsed.get("auths") if isinstance(parsed, dict) else None
-    if not isinstance(auths, dict):
-        raise ValueError(f"The pull secret file {label} must contain an auths object.")
-    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(temporary, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("Could not finish writing the pull secret.")
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(temporary, path)
+        replaced = True
+        os.chmod(path, 0o600)
+    except OSError:
+        raise ValueError(f"The pull secret file {path} could not be saved.") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if not replaced:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    return {"saved": True, "path": str(path)}
 
 
 def pull_secret_permission_warning():
@@ -1768,7 +1826,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.discard_body()
             self.send_json(
                 426,
-                {"error": "SSH keys are accepted only over HTTPS."},
+                {"error": "Pull secrets and SSH keys are accepted only over HTTPS."},
             )
             return
         try:
@@ -1788,6 +1846,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.assign_discovered_nodes(payload)
             elif path == "/api/v1/redfish/retrieve":
                 self.retrieve_redfish_endpoint(payload)
+            elif path == "/api/v1/install-secrets/pull-secret":
+                if not isinstance(payload, dict):
+                    raise ValueError("Request must contain an object.")
+                self.send_json(200, save_host_pull_secret(payload.get("pullSecret")))
             elif path == "/api/v1/install-secrets/ssh-key":
                 destination, replace = install_secret_request(payload)
                 self.send_json(200, generate_cluster_ssh_key(destination, replace=replace))

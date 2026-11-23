@@ -1679,7 +1679,7 @@ class ApiTests(unittest.TestCase):
             "/api/v1/install-secrets/pull-secret",
             {"outputDirectory": destination, "pullSecret": secret},
         )
-        self.assertEqual(status, 404)
+        self.assertEqual(status, 426)
         self.assertNotIn(b"dGVzdA==", body)
         self.assertFalse((server.ANSIBLE_WORKING_DIR / "cluster-install").exists())
         status, body, _ = self.request(
@@ -1967,6 +1967,47 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("dGVzdA==", stderr.getvalue())
         path.chmod(0o600)
         self.assertEqual(server.pull_secret_permission_warning(), "")
+
+    def test_host_pull_secret_save_writes_0600_and_is_read_next(self):
+        directory = Path(self.temp_dir.name) / "new-secret-dir"
+        path = directory / "pull-secret.json"
+        secret = '{"auths": {"example.com": {"auth": "dGVzdA=="}}}'
+        replacement = '{"auths":{"other.example":{"auth":"bmV4dA=="}}}'
+        with patch.dict(os.environ, {"OCP_METAL_UI_PULL_SECRET_FILE": str(path)}):
+            saved = server.save_host_pull_secret(secret)
+            self.assertEqual(set(saved), {"saved", "path"})
+            self.assertTrue(saved["saved"])
+            self.assertEqual(saved["path"], str(path))
+            self.assertNotIn("dGVzdA==", json.dumps(saved))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(path.stat().st_uid, os.geteuid())
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+            self.assertEqual(
+                json.loads(server.load_pull_secret())["auths"]["example.com"]["auth"],
+                "dGVzdA==",
+            )
+            replaced = server.save_host_pull_secret(replacement)
+            self.assertEqual(replaced["path"], str(path))
+            self.assertEqual(list(json.loads(server.load_pull_secret())["auths"]), ["other.example"])
+            self.assertNotIn("dGVzdA==", path.read_text())
+            with self.assertRaises(ValueError) as invalid:
+                server.save_host_pull_secret("{not json")
+            self.assertIn("not valid JSON", str(invalid.exception))
+            self.assertNotIn("{not json", str(invalid.exception))
+            self.assertIn("other.example", path.read_text())
+            with self.assertRaises(ValueError) as missing_auths:
+                server.save_host_pull_secret('{"kind":"Secret"}')
+            self.assertIn("auths object", str(missing_auths.exception))
+            self.assertNotIn("Secret", str(missing_auths.exception))
+            self.assertIn("other.example", path.read_text())
+            status, body, _ = self.request(
+                "POST",
+                "/api/v1/install-secrets/pull-secret",
+                {"pullSecret": secret},
+            )
+            self.assertEqual(status, 426, body)
+            self.assertNotIn(b"dGVzdA==", body)
+            self.assertIn("other.example", path.read_text())
 
 
 class RedfishClientTests(unittest.TestCase):

@@ -876,7 +876,9 @@ const EMPTY_INSTALL_SECRET_STATUS = {
 };
 
 function InstallSecrets({ outputDirectory, httpsEnabled }) {
+  const fileInputRef = useRef(null);
   const [status, setStatus] = useState(EMPTY_INSTALL_SECRET_STATUS);
+  const [pullSecretText, setPullSecretText] = useState('');
   const [publicKeyText, setPublicKeyText] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -953,6 +955,62 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     }
   };
 
+  const savePullSecret = async () => {
+    const text = pullSecretText.trim();
+    if (!text) {
+      setError('Paste the cluster pull secret, or choose the pull-secret.json file you downloaded.');
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      setError('The pull secret is not valid JSON.');
+      return;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !parsed.auths || typeof parsed.auths !== 'object' || Array.isArray(parsed.auths)) {
+      setError('The pull secret must contain an auths object.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      const response = await fetch('/api/v1/install-secrets/pull-secret', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pullSecret: text })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Request failed (HTTP ${response.status}).`);
+      setPullSecretText('');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      setMessage(`Pull secret saved to ${result.path}.`);
+      const statusResponse = await fetch(
+        `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
+      );
+      const statusResult = await statusResponse.json();
+      if (statusResponse.ok) applyStatus(statusResult);
+    } catch (saveError) {
+      setError(saveError.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onPullSecretFile = (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setPullSecretText(typeof reader.result === 'string' ? reader.result : '');
+      setError('');
+      setMessage('Pull secret file loaded. Save it to write the host file.');
+    };
+    reader.onerror = () => setError('Could not read that file.');
+    reader.readAsText(file);
+  };
+
   const createSshKey = async () => {
     if (status.privateKeyStored && !window.confirm('Create a new SSH key? The previous private key will no longer be offered for download.')) {
       return;
@@ -1027,17 +1085,39 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
   return (
     <div className="install-secrets">
       <FormGroup label="Cluster pull secret" fieldId="bp-pull-secret">
+        <TextArea
+          id="bp-pull-secret"
+          style={{ resize: 'vertical', minHeight: '80px', fontFamily: 'monospace', fontSize: '0.85rem' }}
+          value={pullSecretText}
+          onChange={(_event, value) => setPullSecretText(value)}
+          placeholder='{"auths":{"registry.example.com":{"auth":"..."}}}'
+          spellCheck={false}
+          autoComplete="off"
+        />
         <HelperText>
           <HelperTextItem>
             {status.pullSecretReady
-              ? `Using the pull secret at ${status.pullSecretPath}. The UI reads that file when it generates install files. Replacing the file takes effect on the next generate.`
+              ? `Using the pull secret at ${status.pullSecretPath}. Paste a replacement to save it there. The UI reads the file again on the next generate.`
               : (status.pullSecretError
-                || `The pull secret file ${status.pullSecretPath} is not available.`)}
+                || `The pull secret file ${status.pullSecretPath} is not available. Paste one to save it there.`)}
           </HelperTextItem>
         </HelperText>
+        <div className="install-secret-actions">
+          <input
+            id="bp-pull-secret-file"
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json"
+            aria-label="Choose pull-secret.json"
+            onChange={onPullSecretFile}
+          />
+          <Button id="bp-pull-secret-save" variant="secondary" onClick={savePullSecret} isDisabled={!canSave}>
+            Save pull secret
+          </Button>
+        </div>
         <HelperText>
           <HelperTextItem>
-            The file is supplied on the host. This page does not show or store the pull secret.
+            Save writes the host file. This page does not show the saved secret.
           </HelperTextItem>
         </HelperText>
       </FormGroup>

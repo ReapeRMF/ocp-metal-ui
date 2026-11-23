@@ -167,7 +167,7 @@ On first boot the host decrypts the pull secret once into that file and then shr
 
 If the file is missing, is not JSON, or has no `auths` object, the UI still starts. A startup log line names the path. The features that need the pull secret return that same error. The log and the error do not include the file contents. A startup log line also warns when the file is group- or world-readable.
 
-The Blueprint page creates or accepts an SSH public key. The private key, when created here, is `cluster-install/id_ed25519`.
+The Blueprint page can paste a pull secret and save it to that same file. The save is accepted only over HTTPS, the same restriction as the other install-secret writes. It checks that the text is JSON with an `auths` object, then writes a temporary file in the same directory with mode `0600`, flushes it, and replaces the host file. The saved file is mode `0600` and owned by the service user. If the directory is missing, the save creates it with mode `0700`. The response says that the file was saved and names the path. It does not include the secret. The page does not show the saved secret. The Blueprint page also creates or accepts an SSH public key. The private key, when created here, is `cluster-install/id_ed25519`.
 
 The install preview shows the pull secret after the host file can be read. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
 
