@@ -348,6 +348,11 @@ else
   USER_NAMESPACE_ARGS=()
   GROUP_ARGS=(--group-add "$ANSIBLE_HOST_GID")
 fi
+# A group-readable pull secret (option a) needs the container in that group.
+# Mode 0600 does not. Changing PULL_SECRET_MODE is enough to turn this on.
+if [ $((8#$PULL_SECRET_MODE & 070)) -ne 0 ]; then
+  GROUP_ARGS+=(--group-add "$PULL_SECRET_GROUP")
+fi
 
 PULL_SECRET_ARGS=()
 if [ "$(id -u)" -eq 0 ]; then
