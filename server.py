@@ -1,5 +1,3 @@
-import hashlib
-import hmac
 import importlib.util
 import json
 import http.client
@@ -7,13 +5,11 @@ import os
 import re
 import shutil
 import ssl
+import stat
 import subprocess
+import sys
 import tempfile
 import uuid
-from binascii import hexlify, unhexlify
-
-from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,13 +24,9 @@ APP_DIR = Path(__file__).resolve().parent
 DIST_DIR = APP_DIR / "dist"
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ANSIBLE_WORKING_DIR = Path(os.environ.get("ANSIBLE_WORKING_DIR", "/ansible"))
-# The image build copies the vaulted pull secret here. Keep the default on
-# /app so a source tree that also holds the file is not read by unit tests.
-# The vault password file is mounted at run time and is not in the image.
-BUNDLED_PULL_SECRET_FILE = Path(
-    os.environ.get("BUNDLED_PULL_SECRET_FILE", "/app/pull-secret.vault")
-)
-VAULT_PASSWORD_FILE = Path(os.environ.get("VAULT_PASSWORD_FILE", "/vault/password"))
+# The host decrypts the pull secret once and leaves this file. The UI reads
+# it when a feature needs it. The image does not contain a pull secret.
+_DEFAULT_PULL_SECRET_FILE = "/etc/ocp-metal-ui/pull-secret.json"
 TLS_CERT_FILE = os.environ.get("TLS_CERT_FILE")
 TLS_KEY_FILE = os.environ.get("TLS_KEY_FILE")
 MAX_REQUEST_BYTES = 5 * 1024 * 1024
@@ -1117,25 +1109,15 @@ def validate_output_directory(destination):
 
 
 CLUSTER_INSTALL_DIRNAME = "cluster-install"
-_PULL_SECRET_NAME = "pull-secret.json"
-_PULL_SECRET_VAULT = "pull-secret.vault"
-_VAULT_VARIABLE = "ocp_pre_install_pull_secret_contents"
 _PRIVATE_KEY_NAME = "id_ed25519"
 _PUBLIC_KEY_NAME = "id_ed25519.pub"
 _MAX_PULL_SECRET_CHARS = 1024 * 1024
-_MAX_VAULT_CHARS = 2 * 1024 * 1024
-_VAULT_PASSWORD_MISSING = (
-    "The vault password file is not available, so the pull secret cannot be saved."
-)
-_VAULT_PASSWORD_REJECTED = "The vault password did not open the pull secret."
 _MAX_PUBLIC_KEY_CHARS = 16384
 _MAX_PRIVATE_KEY_BYTES = 65536
 _SSH_PUBLIC_KEY = re.compile(
     r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/]+={0,3}(?: .*)?$"
 )
-_REJECTED_SECRET_MARKERS = ("a8c2744b", "e9bd34f4")
 _INSTALL_SECRET_POSTS = {
-    "/api/v1/install-secrets/pull-secret",
     "/api/v1/install-secrets/ssh-key",
     "/api/v1/install-secrets/ssh-public-key",
 }
@@ -1149,31 +1131,67 @@ _PRIVATE_KEY_PASTE_ERROR = (
 )
 
 
-def normalize_pull_secret(text):
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError(
-            "Paste the cluster pull secret, or choose the pull-secret.json file you downloaded."
-        )
-    if len(text) > _MAX_PULL_SECRET_CHARS:
-        raise ValueError("That pull secret is too large.")
+def pull_secret_file():
+    configured = os.environ.get("OCP_METAL_UI_PULL_SECRET_FILE", "").strip()
+    if not configured:
+        configured = _DEFAULT_PULL_SECRET_FILE
+    return Path(configured)
+
+
+def load_pull_secret():
+    """Read the host pull secret at call time. Errors name the path and not the contents."""
+    path = pull_secret_file()
+    label = str(path)
+    if path.is_symlink():
+        raise ValueError(f"The pull secret file {label} is a symbolic link.")
+    if not path.is_file():
+        raise ValueError(f"The pull secret file {label} is missing.")
+    try:
+        size = path.stat().st_size
+    except OSError:
+        raise ValueError(f"The pull secret file {label} could not be read.") from None
+    if size > _MAX_PULL_SECRET_CHARS:
+        raise ValueError(f"The pull secret file {label} is too large.")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        raise ValueError(f"The pull secret file {label} could not be read.") from None
+    except UnicodeError:
+        raise ValueError(f"The pull secret file {label} is not valid JSON.") from None
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        raise ValueError(
-            "The pull secret must be the JSON you downloaded, with an auths object."
-        ) from None
+        raise ValueError(f"The pull secret file {label} is not valid JSON.") from None
     auths = parsed.get("auths") if isinstance(parsed, dict) else None
     if not isinstance(auths, dict):
-        raise ValueError("The pull secret must be JSON with an auths object.")
-    if not auths:
-        raise ValueError("The pull secret needs at least one registry under auths.")
-    for name, entry in auths.items():
-        if not isinstance(name, str) or not name.strip() or not isinstance(entry, dict):
-            raise ValueError("Each auths entry must be an object keyed by a registry name.")
-    normalized = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
-    if any(marker in normalized for marker in _REJECTED_SECRET_MARKERS):
-        raise ValueError("That pull secret is not accepted.")
-    return normalized
+        raise ValueError(f"The pull secret file {label} must contain an auths object.")
+    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+
+
+def pull_secret_permission_warning():
+    path = pull_secret_file()
+    if path.is_symlink() or not path.is_file():
+        return ""
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return ""
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        return (
+            f"The pull secret file {path} is group- or world-readable. "
+            "Expected mode 0600, owner root."
+        )
+    return ""
+
+
+def warn_about_pull_secret_file():
+    try:
+        load_pull_secret()
+    except ValueError as error:
+        print(f"Warning: {error}", file=sys.stderr)
+    warning = pull_secret_permission_warning()
+    if warning:
+        print(f"Warning: {warning}", file=sys.stderr)
 
 
 def normalize_ssh_public_key(text):
@@ -1215,127 +1233,6 @@ def _read_text_file(path, limit):
         return None
 
 
-def vault_password_bytes():
-    path = VAULT_PASSWORD_FILE
-    if not isinstance(path, Path):
-        path = Path(path)
-    if path.is_symlink() or not path.is_file():
-        return b""
-    try:
-        return path.read_bytes().strip()
-    except OSError:
-        return b""
-
-
-def _vault_keys(password, salt):
-    # Ansible vault 1.1 derives a 32-byte AES key, a 32-byte HMAC key, and a 16-byte CTR nonce.
-    derived = hashlib.pbkdf2_hmac("sha256", password, salt, 10000, dklen=80)
-    return derived[:32], derived[32:64], derived[64:80]
-
-
-def encrypt_vault_envelope(plaintext, password):
-    if not isinstance(password, (bytes, bytearray)) or not password:
-        raise ValueError(_VAULT_PASSWORD_MISSING)
-    raw = plaintext.encode("utf-8")
-    salt = os.urandom(32)
-    key, mac_key, nonce = _vault_keys(bytes(password), salt)
-    # PKCS7 is part of the Ansible vault format even though the cipher is CTR.
-    padder = padding.PKCS7(128).padder()
-    padded = padder.update(raw) + padder.finalize()
-    encryptor = Cipher(algorithms.AES(key), modes.CTR(nonce)).encryptor()
-    ciphertext = encryptor.update(padded) + encryptor.finalize()
-    digest = hmac.new(mac_key, ciphertext, hashlib.sha256).digest()
-    inner = b"\n".join((hexlify(salt), hexlify(digest), hexlify(ciphertext)))
-    outer = hexlify(inner).decode("ascii")
-    lines = ["$ANSIBLE_VAULT;1.1;AES256"]
-    lines.extend(outer[index:index + 80] for index in range(0, len(outer), 80))
-    return "\n".join(lines) + "\n"
-
-
-def decrypt_vault_envelope(envelope, password):
-    if not isinstance(password, (bytes, bytearray)) or not password:
-        raise ValueError(_VAULT_PASSWORD_MISSING)
-    lines = [line.strip() for line in envelope.splitlines() if line.strip()]
-    if not lines or not lines[0].startswith("$ANSIBLE_VAULT;") or "AES256" not in lines[0]:
-        raise ValueError("That file is not an Ansible vault secret.")
-    try:
-        inner = unhexlify("".join(lines[1:]))
-        salt_hex, digest_hex, cipher_hex = inner.split(b"\n", 2)
-        salt = unhexlify(salt_hex)
-        ciphertext = unhexlify(cipher_hex)
-        expected = unhexlify(digest_hex)
-    except (ValueError, TypeError):
-        raise ValueError("That file is not an Ansible vault secret.") from None
-    key, mac_key, nonce = _vault_keys(bytes(password), salt)
-    actual = hmac.new(mac_key, ciphertext, hashlib.sha256).digest()
-    if not hmac.compare_digest(actual, expected):
-        raise ValueError(_VAULT_PASSWORD_REJECTED)
-    decryptor = Cipher(algorithms.AES(key), modes.CTR(nonce)).decryptor()
-    padded = decryptor.update(ciphertext) + decryptor.finalize()
-    try:
-        unpadder = padding.PKCS7(128).unpadder()
-        raw = unpadder.update(padded) + unpadder.finalize()
-    except ValueError:
-        raise ValueError(_VAULT_PASSWORD_REJECTED) from None
-    return raw.decode("utf-8")
-
-
-def format_pull_secret_vault(plaintext, password):
-    envelope = encrypt_vault_envelope(plaintext, password).rstrip("\n")
-    indented = "\n".join(f"          {line}" for line in envelope.splitlines())
-    return f"{_VAULT_VARIABLE}: !vault |\n{indented}\n"
-
-
-def extract_vault_envelope(text):
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped.startswith("$ANSIBLE_VAULT;"):
-            continue
-        body = [stripped]
-        for extra in lines[index + 1:]:
-            piece = extra.strip()
-            if not piece:
-                continue
-            if not re.fullmatch(r"[0-9a-fA-F]+", piece):
-                break
-            body.append(piece)
-        return "\n".join(body) + "\n"
-    raise ValueError("That file is not an Ansible vault secret.")
-
-
-def _vault_text_present(path):
-    text = _read_text_file(path, _MAX_VAULT_CHARS)
-    return bool(text and "$ANSIBLE_VAULT;" in text)
-
-
-def _open_pull_secret_text(text):
-    if "$ANSIBLE_VAULT;" in text:
-        try:
-            opened = decrypt_vault_envelope(extract_vault_envelope(text), vault_password_bytes())
-        except ValueError:
-            return ""
-        text = opened
-    try:
-        return normalize_pull_secret(text)
-    except ValueError:
-        return ""
-
-
-def _read_pull_secret(path):
-    text = _read_text_file(path, _MAX_PULL_SECRET_CHARS)
-    if text is None or "$ANSIBLE_VAULT;" in text:
-        return ""
-    return _open_pull_secret_text(text)
-
-
-def _read_vaulted_pull_secret(path):
-    text = _read_text_file(path, _MAX_VAULT_CHARS)
-    if text is None or "$ANSIBLE_VAULT;" not in text:
-        return ""
-    return _open_pull_secret_text(text)
-
-
 def _read_public_key(path):
     text = _read_text_file(path, _MAX_PUBLIC_KEY_CHARS)
     if text is None:
@@ -1356,47 +1253,18 @@ def _private_key_stored(path):
     return 0 < size <= _MAX_PRIVATE_KEY_BYTES
 
 
-def bundled_pull_secret_path():
-    path = BUNDLED_PULL_SECRET_FILE
-    if not isinstance(path, Path):
-        path = Path(path)
-    return path
-
-
-def bundled_pull_secret():
-    return _read_vaulted_pull_secret(bundled_pull_secret_path())
-
-
-def workspace_pull_secret(directory):
-    # A vault file saved for this workspace replaces the image copy. A
-    # plaintext pull-secret.json is still read when no vault file is present.
-    return (
-        _read_vaulted_pull_secret(directory / _PULL_SECRET_VAULT)
-        or _read_pull_secret(directory / _PULL_SECRET_NAME)
-    )
-
-
-def pull_secret_is_vaulted(destination):
-    paths = [bundled_pull_secret_path()]
-    try:
-        directory = install_secret_directory(destination)
-    except ValueError:
-        directory = None
-    if directory is not None:
-        paths.append(directory / _PULL_SECRET_VAULT)
-    return any(_vault_text_present(path) for path in paths)
-
-
 def _secret_status(directory):
-    workspace_secret = workspace_pull_secret(directory)
-    built_in_secret = bundled_pull_secret()
+    error = ""
+    try:
+        load_pull_secret()
+        ready = True
+    except ValueError as error_value:
+        ready = False
+        error = str(error_value)
     return {
-        "pullSecretStored": _vault_text_present(directory / _PULL_SECRET_VAULT) or bool(
-            _read_pull_secret(directory / _PULL_SECRET_NAME)
-        ),
-        "pullSecretBuiltIn": _vault_text_present(bundled_pull_secret_path()),
-        "pullSecretReady": bool(workspace_secret or built_in_secret),
-        "vaultPasswordAvailable": bool(vault_password_bytes()),
+        "pullSecretReady": ready,
+        "pullSecretPath": str(pull_secret_file()),
+        "pullSecretError": error,
         "privateKeyStored": _private_key_stored(directory / _PRIVATE_KEY_NAME),
         "sshPublicKey": _read_public_key(directory / _PUBLIC_KEY_NAME),
     }
@@ -1411,8 +1279,10 @@ def stored_install_material(destination):
         directory = install_secret_directory(destination)
     except ValueError:
         return "", ""
-    # The image copy stays in the image. It is not written into the workspace.
-    pull_secret = workspace_pull_secret(directory) or bundled_pull_secret()
+    try:
+        pull_secret = load_pull_secret()
+    except ValueError:
+        pull_secret = ""
     return pull_secret, _read_public_key(directory / _PUBLIC_KEY_NAME)
 
 
@@ -1450,28 +1320,6 @@ def write_secret_file(path, data, mode):
         if fd is not None:
             os.close(fd)
         temporary.unlink(missing_ok=True)
-
-
-def save_pull_secret(destination, pull_secret):
-    normalized = normalize_pull_secret(pull_secret)
-    password = vault_password_bytes()
-    if not password:
-        raise ValueError(_VAULT_PASSWORD_MISSING)
-    directory = install_secret_directory(destination)
-    legacy = directory / _PULL_SECRET_NAME
-    if legacy.is_symlink():
-        raise ValueError("pull-secret.json cannot be a symbolic link.")
-    vault_path = directory / _PULL_SECRET_VAULT
-    if vault_path.is_symlink():
-        raise ValueError("pull-secret.vault cannot be a symbolic link.")
-    write_secret_file(
-        vault_path,
-        format_pull_secret_vault(normalized, password),
-        0o600,
-    )
-    if legacy.is_file():
-        legacy.unlink()
-    return _secret_status(directory)
 
 
 def save_ssh_public_key(destination, public_key, replace=False):
@@ -1555,14 +1403,6 @@ def generate_cluster_ssh_key(destination, replace=False):
 
 _INSTALL_CONFIG_NAME = "install-config.yaml"
 _AGENT_CONFIG_NAME = "agent-config.yaml"
-_INSTALL_FILES_NEED_SECRETS = (
-    "Save a pull secret and an SSH public key on the Blueprint page. "
-    "Generate again to write install-config.yaml and agent-config.yaml."
-)
-_INSTALL_FILES_NEED_PULL_SECRET = (
-    "Paste a pull secret on the Blueprint page. "
-    "Generate again to write install-config.yaml and agent-config.yaml."
-)
 _INSTALL_FILES_NEED_SSH = (
     "Save an SSH public key on the Blueprint page. "
     "Generate again to write install-config.yaml and agent-config.yaml."
@@ -1570,28 +1410,23 @@ _INSTALL_FILES_NEED_SSH = (
 
 
 def install_files_gap_message(pull_secret, ssh_key, destination):
-    if not pull_secret and pull_secret_is_vaulted(destination):
-        if vault_password_bytes():
-            vault_text = "The vault password did not open the pull secret."
-        else:
-            vault_text = (
-                "The pull secret is in the Ansible vault. "
-                "Provide the vault password file."
-            )
+    del destination
+    if not pull_secret:
+        try:
+            load_pull_secret()
+            pull_text = f"The pull secret file {pull_secret_file()} is not available."
+        except ValueError as error:
+            pull_text = str(error)
         if ssh_key:
             return (
-                vault_text
+                pull_text
                 + " Generate again to write install-config.yaml and agent-config.yaml."
             )
         return (
-            vault_text
+            pull_text
             + " An SSH public key is also required."
             + " Generate again to write install-config.yaml and agent-config.yaml."
         )
-    if not pull_secret and not ssh_key:
-        return _INSTALL_FILES_NEED_SECRETS
-    if not pull_secret:
-        return _INSTALL_FILES_NEED_PULL_SECRET
     if not ssh_key:
         return _INSTALL_FILES_NEED_SSH
     return ""
@@ -1933,7 +1768,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.discard_body()
             self.send_json(
                 426,
-                {"error": "Pull secrets and SSH keys are accepted only over HTTPS."},
+                {"error": "SSH keys are accepted only over HTTPS."},
             )
             return
         try:
@@ -1953,13 +1788,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.assign_discovered_nodes(payload)
             elif path == "/api/v1/redfish/retrieve":
                 self.retrieve_redfish_endpoint(payload)
-            elif path == "/api/v1/install-secrets/pull-secret":
-                if not isinstance(payload, dict):
-                    raise ValueError("Request must contain an object.")
-                self.send_json(
-                    200,
-                    save_pull_secret(payload.get("outputDirectory"), payload.get("pullSecret")),
-                )
             elif path == "/api/v1/install-secrets/ssh-key":
                 destination, replace = install_secret_request(payload)
                 self.send_json(200, generate_cluster_ssh_key(destination, replace=replace))
@@ -2954,6 +2782,7 @@ if __name__ == "__main__":
         tls_context.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
         httpd.socket = tls_context.wrap_socket(httpd.socket, server_side=True)
         protocol = "HTTPS"
+    warn_about_pull_secret_file()
     print(
         f"Serving OCP Metal UI on {protocol} {host}:{port}; "
         f"database: {database_log_target()}"

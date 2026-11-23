@@ -1,2 +1,3 @@
-# The build input is plaintext. The image receives pull-secret.vault only.
+# The image contains no pull secret. The host file is read at run time.
 pull-secret.json
+pull-secret.vault

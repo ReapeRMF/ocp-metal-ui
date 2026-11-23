@@ -12,17 +12,11 @@ RUN apk add --no-cache openssh-keygen \
     && mkdir -p /data /ansible \
     && chown 10001:10001 /data /ansible
 
-RUN pip install --no-cache-dir "cryptography==50.0.0" "psycopg[binary]==3.3.8"
+RUN pip install --no-cache-dir "psycopg[binary]==3.3.8"
 
 COPY --chown=10001:10001 server.py /app/server.py
 COPY --chown=10001:10001 agent_install.py /app/agent_install.py
 COPY --chown=10001:10001 dist/ /app/dist/
-# Vaulted cluster pull secret. The vault password is mounted at run time.
-# A paste on the Blueprint page stores a different vault file for one workspace.
-COPY --chown=10001:10001 pull-secret.vault /app/pull-secret.vault
-RUN chmod 600 /app/pull-secret.vault \
-    && mkdir -p /vault \
-    && chown 10001:10001 /vault /app/pull-secret.vault
 
 VOLUME ["/data", "/ansible"]
 EXPOSE 8080

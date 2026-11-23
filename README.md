@@ -103,18 +103,17 @@ The API stores the report. It does not configure IPA or replace an Ironic conduc
 
 The inventory host key is the Ansible `inventory_hostname`. Its `serial_number` variable ties that name to the physical node.
 
-The pull secret and the SSH public key are not written under `ocp-metal-ui/` and are not stored in PostgreSQL. When the operator pastes a pull secret or creates an SSH key, the files are written beside that tree in `cluster-install/`:
+The pull secret and the SSH public key are not written under `ocp-metal-ui/` and are not stored in PostgreSQL. The pull secret stays in the host file. When the operator creates an SSH key, the files are written beside that tree in `cluster-install/`:
 
-- `pull-secret.vault`, mode 0600, Ansible vault variable `ocp_pre_install_pull_secret_contents`
 - `id_ed25519`, mode 0600
 - `id_ed25519.pub`, mode 0644
 
-When the inventory can build a cluster, a pull secret can be opened, and an SSH public key is present, the same action also writes:
+When the inventory can build a cluster, the host pull secret can be read, and an SSH public key is present, the same action also writes:
 
 - `cluster-install/install-config.yaml`, mode 0600
 - `cluster-install/agent-config.yaml`, mode 0644
 
-`install-config.yaml` contains the opened pull secret because the installer reads that file. The vault password stays in its own file. A generate that cannot build the cluster removes a previously written pair and leaves the pull secret and the SSH key in place. Other files in the workspace are left as they are.
+`install-config.yaml` contains the pull secret because the installer reads that file. A generate that cannot build the cluster removes a previously written pair and leaves the SSH key in place. The host pull secret file is left as it is. Other files in the workspace are left as they are.
 
 The configurator install keeps its profile under `/var/ocp-config/ocp/dev/<profile>/` and writes its own `install-config.yaml` and `agent-config.yaml` under `/opt/ocp/<platform>/<version>/`. Generate refuses a directory inside `/var/ocp-config`, `/opt/ocp`, or `/etc/ansible`. The files from this UI stay in the selected workspace.
 
@@ -162,9 +161,15 @@ After linking, both sources use the same controls for disk, NIC, bond, and VLAN.
 
 ## Pull secret and SSH key
 
-The image build copies an Ansible vault file to `/app/pull-secret.vault`, mode 0600. The vault password is mounted at `/vault/password` and is not in the image. On the Blueprint page, paste a pull secret or choose a file to store one for this workspace, or create an SSH key. The saved vault file is `cluster-install/pull-secret.vault`. Leave the field blank to keep the pull secret built into the image.
+The pull secret is a host file. The default path is `/etc/ocp-metal-ui/pull-secret.json`. Set `OCP_METAL_UI_PULL_SECRET_FILE` to use another path. The UI reads that file when it builds a preview or writes `install-config.yaml`. It does not cache the contents, so replacing the file takes effect on the next use. The file is mode `0600`, owner `root:root`. The service runs as root, so it can read that mode. The image does not contain a pull secret, and the UI does not ask for a password.
 
-The install preview shows the pull secret after the vault password can open it. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
+On first boot the host decrypts the pull secret once into that file and then shreds the password file. The pull secret is plaintext at rest on the host. That is the accepted risk, chosen so the UI can restart unattended.
+
+If the file is missing, is not JSON, or has no `auths` object, the UI still starts. A startup log line names the path. The features that need the pull secret return that same error. The log and the error do not include the file contents. A startup log line also warns when the file is group- or world-readable.
+
+The Blueprint page creates or accepts an SSH public key. The private key, when created here, is `cluster-install/id_ed25519`.
+
+The install preview shows the pull secret after the host file can be read. The render play reads `ocp_install_pull_secret_file` and `ocp_install_ssh_public_key_file` only when the matching contents extra var was not passed.
 
 ## Redfish
 
@@ -178,16 +183,14 @@ BMC certificates are verified by default. For an untrusted BMC certificate, the 
 
 Build on a connected machine with Node.js 22, npm, and Podman or Docker. The image contains the built UI and the Python runtime. It does not need network access after it is built.
 
-`pull-secret.vault` in this directory is the committed cluster pull secret. It is an Ansible vault variable, `ocp_pre_install_pull_secret_contents`. The vault password is not in this repository. Mount that password at `/vault/password` when the container starts.
-
-To replace the secret, place the new plaintext at `pull-secret.json` and set `VAULT_PASSWORD_FILE` to the vault password file. The build writes `pull-secret.vault` again, and the image copies that file to `/app/pull-secret.vault`. The plaintext pull secret and the vault password are not copied into the image. `pull-secret.json` is not committed.
+The image build does not read or copy a pull secret. Put the plaintext file on the host at `/etc/ocp-metal-ui/pull-secret.json`, or set `OCP_METAL_UI_PULL_SECRET_FILE`, before generating install files.
 
 ```sh
 npm ci
 ./airgap-build-bundle.sh
 ```
 
-The script compiles `dist/`, vaults `pull-secret.json`, builds `Containerfile.airgap`, and writes `ocp-metal-ui-engine-bundle.tar`. Copy that tarball and `airgap-deploy-bundle.sh` to the disconnected host. `package-lock.json` pins the JavaScript dependencies. For a byte-for-byte image rebuild, also pin the Python base image by digest in `Containerfile.airgap`.
+The script compiles `dist/`, builds `Containerfile.airgap`, and writes `ocp-metal-ui-engine-bundle.tar`. The image contains no pull secret. Copy that tarball and `airgap-deploy-bundle.sh` to the disconnected host. `package-lock.json` pins the JavaScript dependencies. For a byte-for-byte image rebuild, also pin the Python base image by digest in `Containerfile.airgap`.
 
 ## Deploy on the installed host
 

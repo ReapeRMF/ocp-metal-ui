@@ -59,67 +59,12 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
-for required_file in package.json package-lock.json Containerfile.airgap server.py agent_install.py pull-secret.json; do
+for required_file in package.json package-lock.json Containerfile.airgap server.py agent_install.py; do
   if [ ! -f "$required_file" ]; then
     echo "❌ Error: Required build input is missing: $required_file" >&2
-    if [ "$required_file" = "pull-secret.json" ]; then
-      echo "   Place the cluster pull secret at pull-secret.json before building." >&2
-      echo "   The build stores it in an Ansible vault. The plaintext file is not copied into the image." >&2
-    fi
     exit 1
   fi
 done
-
-if [ -z "${VAULT_PASSWORD_FILE:-}" ] || [ ! -f "$VAULT_PASSWORD_FILE" ]; then
-  echo "❌ Error: Set VAULT_PASSWORD_FILE to the Ansible vault password file." >&2
-  echo "   The password is not copied into the image. Mount that file when the container starts." >&2
-  exit 1
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "❌ Error: python3 is required to vault pull-secret.json." >&2
-  exit 1
-fi
-
-export VAULT_PASSWORD_FILE
-python3 - << 'PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-import server
-
-password_path = Path(os.environ["VAULT_PASSWORD_FILE"])
-password = password_path.read_bytes().strip()
-if not password:
-    sys.exit("The vault password file is empty.")
-text = Path("pull-secret.json").read_text(encoding="utf-8")
-if any(marker in text for marker in ("a8c2744b", "e9bd34f4")):
-    sys.exit("That pull secret is not accepted.")
-try:
-    normalized = server.normalize_pull_secret(text)
-except ValueError as exc:
-    sys.exit(str(exc))
-parsed = json.loads(normalized)
-if "cloud.openshift.com" not in parsed["auths"]:
-    sys.exit(
-        "pull-secret.json must include cloud.openshift.com. "
-        "The mirror pull user is not the cluster pull secret."
-    )
-vault_text = server.format_pull_secret_vault(normalized, password)
-destination = Path("pull-secret.vault")
-fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-try:
-    os.write(fd, vault_text.encode("utf-8"))
-finally:
-    os.close(fd)
-os.chmod(destination, 0o600)
-if normalized in vault_text:
-    sys.exit("Refusing to write a vault file that still contains the pull secret.")
-print(f"Pull secret vaulted ({len(parsed['auths'])} registries).")
-PY
-chmod 600 pull-secret.json pull-secret.vault
 
 if command -v podman >/dev/null 2>&1; then
   ENGINE="$(command -v podman)"

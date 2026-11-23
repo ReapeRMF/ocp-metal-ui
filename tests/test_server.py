@@ -1,5 +1,6 @@
 import hashlib
 import http.client
+import io
 import json
 import os
 import shutil
@@ -43,11 +44,14 @@ class ApiTests(unittest.TestCase):
         server.ANSIBLE_WORKING_DIR = self.original_ansible_working_dir
         self.temp_dir.cleanup()
 
-    def _vault_password(self, password=b"test-vault-password"):
-        path = Path(self.temp_dir.name) / "vault-password"
-        path.write_bytes(password if password.endswith(b"\n") else password + b"\n")
-        path.chmod(0o600)
-        patcher = patch.object(server, "VAULT_PASSWORD_FILE", path)
+    def _host_pull_secret(self, contents, mode=0o600):
+        path = Path(self.temp_dir.name) / "pull-secret.json"
+        if isinstance(contents, bytes):
+            path.write_bytes(contents)
+        else:
+            path.write_text(contents, encoding="utf-8")
+        path.chmod(mode)
+        patcher = patch.dict(os.environ, {"OCP_METAL_UI_PULL_SECRET_FILE": str(path)})
         patcher.start()
         self.addCleanup(patcher.stop)
         return path
@@ -1675,7 +1679,7 @@ class ApiTests(unittest.TestCase):
             "/api/v1/install-secrets/pull-secret",
             {"outputDirectory": destination, "pullSecret": secret},
         )
-        self.assertEqual(status, 426)
+        self.assertEqual(status, 404)
         self.assertNotIn(b"dGVzdA==", body)
         self.assertFalse((server.ANSIBLE_WORKING_DIR / "cluster-install").exists())
         status, body, _ = self.request(
@@ -1701,19 +1705,7 @@ class ApiTests(unittest.TestCase):
                 "-----BEGIN OPENSSH PRIVATE KEY-----\nAAA\n-----END OPENSSH PRIVATE KEY-----\n"
             )
         self.assertIn("private key", str(caught.exception).lower())
-        with self.assertRaises(ValueError):
-            server.save_pull_secret(destination, "{}")
-        with self.assertRaises(ValueError):
-            server.save_pull_secret(destination, "not-json")
         self.assertFalse((server.ANSIBLE_WORKING_DIR / "cluster-install").exists())
-        outside = Path(self.temp_dir.name) / "outside"
-        outside.mkdir()
-        (server.ANSIBLE_WORKING_DIR / "cluster-install").symlink_to(outside, target_is_directory=True)
-        self._vault_password()
-        with self.assertRaises(ValueError):
-            server.save_pull_secret(destination, secret)
-        self.assertFalse((outside / "pull-secret.json").exists())
-        self.assertFalse((outside / "pull-secret.vault").exists())
 
     def test_saved_pull_secret_and_ssh_key_fill_the_preview_only(self):
         import yaml
@@ -1721,12 +1713,11 @@ class ApiTests(unittest.TestCase):
         self.assertIsNotNone(shutil.which("ssh-keygen"))
         destination = str(server.ANSIBLE_WORKING_DIR)
         secret = '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
-        self._vault_password()
-        saved = server.save_pull_secret(destination, secret)
-        self.assertTrue(saved["pullSecretStored"])
-        self.assertNotIn("pullSecret", saved)
-        self.assertNotIn("dGVzdA==", json.dumps(saved))
+        self._host_pull_secret(secret)
         created = server.generate_cluster_ssh_key(destination, replace=False)
+        self.assertTrue(created["pullSecretReady"])
+        self.assertNotIn("pullSecret", created)
+        self.assertNotIn("dGVzdA==", json.dumps(created))
         self.assertTrue(created["privateKeyStored"])
         self.assertTrue(created["sshPublicKey"].startswith("ssh-ed25519 "))
         self.assertIn(" ocp", created["sshPublicKey"])
@@ -1742,9 +1733,7 @@ class ApiTests(unittest.TestCase):
         self.assertNotEqual(before, after)
         self.assertNotEqual(created["sshPublicKey"], replaced["sshPublicKey"])
         self.assertEqual(stat.S_IMODE(secret_dir.stat().st_mode), 0o700)
-        self.assertEqual(stat.S_IMODE((secret_dir / "pull-secret.vault").stat().st_mode), 0o600)
-        self.assertIn("$ANSIBLE_VAULT;1.1;AES256", (secret_dir / "pull-secret.vault").read_text())
-        self.assertNotIn("dGVzdA==", (secret_dir / "pull-secret.vault").read_text())
+        self.assertFalse((secret_dir / "pull-secret.vault").exists())
         self.assertFalse((secret_dir / "pull-secret.json").exists())
         self.assertEqual(stat.S_IMODE(private_path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((secret_dir / "id_ed25519.pub").stat().st_mode), 0o644)
@@ -1870,20 +1859,17 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(
             set(reported),
             {
-                "pullSecretStored",
-                "pullSecretBuiltIn",
                 "pullSecretReady",
-                "vaultPasswordAvailable",
+                "pullSecretPath",
+                "pullSecretError",
                 "privateKeyStored",
                 "sshPublicKey",
             },
         )
-        self.assertFalse(reported["pullSecretBuiltIn"])
         self.assertTrue(reported["pullSecretReady"])
-        self.assertTrue(reported["vaultPasswordAvailable"])
+        self.assertEqual(reported["pullSecretError"], "")
         self.assertNotIn("dGVzdA==", body.decode())
         self.assertNotIn("PRIVATE KEY", body.decode())
-        self.assertTrue(reported["pullSecretStored"])
         self.assertTrue(reported["sshPublicKey"].startswith("ssh-ed25519 "))
         database = self.database_bytes()
         self.assertNotIn(b"dGVzdA==", database)
@@ -1921,143 +1907,66 @@ class ApiTests(unittest.TestCase):
         self.assertIn("Compact needs three nodes.", json.loads(body)["configPreviewError"])
         self.assertFalse(install_file.exists())
         self.assertFalse(agent_file.exists())
-        self.assertTrue((install_file.parent / "pull-secret.vault").is_file())
+        self.assertFalse((install_file.parent / "pull-secret.vault").exists())
         self.assertFalse((install_file.parent / "pull-secret.json").exists())
         self.assertTrue((install_file.parent / "id_ed25519.pub").is_file())
 
-    def test_built_in_pull_secret_is_used_until_the_workspace_replaces_it(self):
-        import yaml
+    def test_missing_pull_secret_file_names_the_path(self):
+        missing = Path(self.temp_dir.name) / "absent-pull-secret.json"
+        with patch.dict(os.environ, {"OCP_METAL_UI_PULL_SECRET_FILE": str(missing)}):
+            with self.assertRaises(ValueError) as caught:
+                server.load_pull_secret()
+            self.assertIn(str(missing), str(caught.exception))
+            self.assertIn("missing", str(caught.exception))
+            stderr = io.StringIO()
+            with patch("sys.stderr", stderr):
+                server.warn_about_pull_secret_file()
+            logged = stderr.getvalue()
+            self.assertIn(str(missing), logged)
+            self.assertIn("missing", logged)
+            self.assertNotIn("auths", logged)
 
-        destination = str(server.ANSIBLE_WORKING_DIR)
-        bundled = '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
-        replacement = '{"auths":{"override.example":{"auth":"b3ZlcnJpZGU="}}}'
-        password = b"test-vault-password"
-        bundled_path = Path(self.temp_dir.name) / "image-pull-secret.vault"
-        bundled_path.write_text(server.format_pull_secret_vault(bundled, password), encoding="utf-8")
-        self.assertNotIn("dGVzdA==", bundled_path.read_text())
-        self._post_inspection(
-            NODE_UUID,
-            "NODE-SERIAL-01",
-            [("eno5", "52:54:00:11:00:05")],
-            [("/dev/nvme0n1", "NVME-C1")],
-        )
-        publish = {
-            "outputDirectory": destination,
-            "preferences": {
-                NODE_UUID: {
-                    "ansibleHost": "control-01",
-                    "role": "master",
-                    "rendezvous": True,
-                    "ipv4LastOctet": "11",
-                    "rootDisk": "NVME-C1",
-                    "netType": "single",
-                    "singleNic": "eno5",
-                    "singleVlanEnabled": False,
-                }
-            },
-            "blueprint": {
-                "clusterName": "ocp-baremetal",
-                "baseDomain": "ocp.internal",
-                "controlPlaneTopology": "SingleNode",
-                "machineNetworkCidr": "205.28.113.0/24",
-                "networkGateway": "205.28.113.1",
-            },
-        }
-        with patch.object(server, "BUNDLED_PULL_SECRET_FILE", bundled_path):
-            self.assertEqual(server.bundled_pull_secret(), "")
-            locked = server.install_secret_status(destination)
-            self.assertTrue(locked["pullSecretBuiltIn"])
-            self.assertFalse(locked["pullSecretReady"])
-            self.assertFalse(locked["vaultPasswordAvailable"])
-            self._vault_password(password)
-            self.assertEqual(server.bundled_pull_secret(), bundled)
-            created = server.generate_cluster_ssh_key(destination, replace=False)
-            self.assertTrue(created["sshPublicKey"].startswith("ssh-ed25519 "))
-            self.assertFalse(created["pullSecretStored"])
-            self.assertTrue(created["pullSecretBuiltIn"])
-            self.assertNotIn("dGVzdA==", json.dumps(created))
-            secret_dir = server.ANSIBLE_WORKING_DIR / "cluster-install"
-            self.assertFalse((secret_dir / "pull-secret.json").exists())
-            status, body, _ = self.request("POST", "/api/v1/ansible-files", publish)
-            self.assertEqual(status, 200, body)
-            published = json.loads(body)
-            self.assertEqual(published["configPreviewError"], "")
-            self.assertEqual(published["installFilesMessage"], "")
-            install_file = secret_dir / "install-config.yaml"
-            self.assertEqual(yaml.safe_load(install_file.read_text())["pullSecret"], bundled)
-            self.assertFalse((secret_dir / "pull-secret.json").exists())
-            output_root = server.ANSIBLE_WORKING_DIR / "ocp-metal-ui"
-            inventory_text = "\n".join(
-                path.read_text() for path in sorted(output_root.rglob("*")) if path.is_file()
-            )
-            self.assertNotIn("dGVzdA==", inventory_text)
-            self.assertNotIn(b"dGVzdA==", self.database_bytes())
-            status, body, _ = self.request(
-                "GET",
-                "/api/v1/install-secrets?outputDirectory=" + quote(destination),
-            )
-            self.assertEqual(status, 200, body)
-            reported = json.loads(body)
-            self.assertTrue(reported["pullSecretBuiltIn"])
-            self.assertFalse(reported["pullSecretStored"])
-            self.assertNotIn("dGVzdA==", body.decode())
-            saved = server.save_pull_secret(destination, replacement)
-            self.assertTrue(saved["pullSecretStored"])
-            self.assertTrue(saved["pullSecretBuiltIn"])
-            self.assertNotIn("b3ZlcnJpZGU=", json.dumps(saved))
-            status, body, _ = self.request("POST", "/api/v1/ansible-files", publish)
-            self.assertEqual(status, 200, body)
-            written = yaml.safe_load(install_file.read_text())
-            self.assertEqual(written["pullSecret"], replacement)
-            self.assertNotIn("dGVzdA==", install_file.read_text())
-            self.assertIn("b3ZlcnJpZGU=", install_file.read_text())
-            vault_file = secret_dir / "pull-secret.vault"
-            self.assertTrue(vault_file.is_file())
-            self.assertNotIn("dGVzdA==", vault_file.read_text())
-            self.assertNotIn("b3ZlcnJpZGU=", vault_file.read_text())
-            self.assertFalse((secret_dir / "pull-secret.json").exists())
-
-    def test_pull_secret_vault_opens_with_ansible(self):
-        import subprocess
-
-        from ansible.parsing.vault import VaultLib, VaultSecret
-
-        secret = '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
-        password = b"test-vault-password"
-        text = server.format_pull_secret_vault(secret, password)
-        self.assertNotIn("dGVzdA==", text)
-        self.assertIn("ocp_pre_install_pull_secret_contents: !vault |", text)
-        envelope = server.extract_vault_envelope(text)
-        opened = VaultLib(secrets=[("default", VaultSecret(password))]).decrypt(envelope.encode())
-        self.assertEqual(opened.decode(), secret)
-        self.assertEqual(server.decrypt_vault_envelope(envelope, password), secret)
+    def test_invalid_pull_secret_json_names_the_path(self):
+        path = self._host_pull_secret("{not json")
         with self.assertRaises(ValueError) as caught:
-            server.decrypt_vault_envelope(envelope, b"wrong-password")
-        self.assertIn("did not open", str(caught.exception))
-        password_file = Path(self.temp_dir.name) / "pw"
-        password_file.write_bytes(password + b"\n")
-        completed = subprocess.run(
-            [
-                "ansible-vault",
-                "encrypt_string",
-                "--vault-password-file",
-                str(password_file),
-                "--stdin-name",
-                "ocp_pre_install_pull_secret_contents",
-            ],
-            input=secret.encode(),
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
-        cli_text = completed.stdout.decode()
-        self.assertNotIn("dGVzdA==", cli_text)
-        self.assertEqual(
-            server.normalize_pull_secret(
-                server.decrypt_vault_envelope(server.extract_vault_envelope(cli_text), password)
-            ),
-            secret,
-        )
+            server.load_pull_secret()
+        self.assertIn(str(path), str(caught.exception))
+        self.assertIn("not valid JSON", str(caught.exception))
+        self.assertNotIn("{not json", str(caught.exception))
+
+    def test_pull_secret_without_auths_names_the_path(self):
+        path = self._host_pull_secret('{"kind":"Secret"}')
+        with self.assertRaises(ValueError) as caught:
+            server.load_pull_secret()
+        self.assertIn(str(path), str(caught.exception))
+        self.assertIn("auths object", str(caught.exception))
+        self.assertNotIn("Secret", str(caught.exception))
+
+    def test_valid_pull_secret_file_is_read_again_after_it_is_replaced(self):
+        path = self._host_pull_secret('{"auths":{"example.com":{"auth":"dGVzdA=="}}}')
+        first = json.loads(server.load_pull_secret())
+        self.assertEqual(first["auths"]["example.com"]["auth"], "dGVzdA==")
+        path.write_text('{"auths":{"other.example":{"auth":"bmV4dA=="}}}\n', encoding="utf-8")
+        path.chmod(0o600)
+        second = json.loads(server.load_pull_secret())
+        self.assertEqual(list(second["auths"]), ["other.example"])
+        self.assertNotIn("example.com", second["auths"])
+
+    def test_pull_secret_permission_warning_does_not_include_the_secret(self):
+        secret = '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
+        path = self._host_pull_secret(secret, mode=0o644)
+        warning = server.pull_secret_permission_warning()
+        self.assertIn(str(path), warning)
+        self.assertIn("group- or world-readable", warning)
+        self.assertNotIn("dGVzdA==", warning)
+        self.assertNotIn("example.com", warning)
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            server.warn_about_pull_secret_file()
+        self.assertIn("group- or world-readable", stderr.getvalue())
+        self.assertNotIn("dGVzdA==", stderr.getvalue())
+        path.chmod(0o600)
+        self.assertEqual(server.pull_secret_permission_warning(), "")
 
 
 class RedfishClientTests(unittest.TestCase):

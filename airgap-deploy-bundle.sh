@@ -303,23 +303,17 @@ else
   GROUP_ARGS=(--group-add "$ANSIBLE_HOST_GID")
 fi
 
-VAULT_PASSWORD_HOST_FILE="${VAULT_PASSWORD_FILE:-/root/.vault_pass}"
-VAULT_ARGS=()
-if [ -f "$VAULT_PASSWORD_HOST_FILE" ]; then
-  VAULT_PASSWORD_HOST_FILE="$(cd "$(dirname "$VAULT_PASSWORD_HOST_FILE")" && pwd -P)/$(basename "$VAULT_PASSWORD_HOST_FILE")"
-  vault_mount_opts=ro
-  if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -eq 0 ]; then
-    install -o 10001 -g 10001 -m 0400 "$VAULT_PASSWORD_HOST_FILE" "$SCRIPT_DIR/vault.password"
-    VAULT_PASSWORD_HOST_FILE="$SCRIPT_DIR/vault.password"
-    vault_mount_opts=ro,Z
-  fi
-  VAULT_ARGS=(
-    -v "$VAULT_PASSWORD_HOST_FILE:/vault/password:${vault_mount_opts}"
-    -e VAULT_PASSWORD_FILE=/vault/password
+PULL_SECRET_HOST_FILE="${OCP_METAL_UI_PULL_SECRET_FILE:-/etc/ocp-metal-ui/pull-secret.json}"
+PULL_SECRET_ARGS=()
+if [ -f "$PULL_SECRET_HOST_FILE" ]; then
+  PULL_SECRET_HOST_FILE="$(cd "$(dirname "$PULL_SECRET_HOST_FILE")" && pwd -P)/$(basename "$PULL_SECRET_HOST_FILE")"
+  PULL_SECRET_ARGS=(
+    -v "$PULL_SECRET_HOST_FILE:/etc/ocp-metal-ui/pull-secret.json:ro,Z"
+    -e OCP_METAL_UI_PULL_SECRET_FILE=/etc/ocp-metal-ui/pull-secret.json
   )
 else
-  echo "⚠️  Vault password file not found at $VAULT_PASSWORD_HOST_FILE." >&2
-  echo "   The pull secret built into the image stays locked until that file is mounted." >&2
+  echo "⚠️  Pull secret file not found at $PULL_SECRET_HOST_FILE." >&2
+  echo "   The UI still starts. Install files that need the pull secret stay unavailable until that file is present." >&2
 fi
 
 # 3. Start the application. The image still declares /data; the database
@@ -339,7 +333,7 @@ $ENGINE run -d \
   -v "$ANSIBLE_HOST_DIR:/ansible:Z" \
   -e ANSIBLE_WORKING_DIR=/ansible \
   "${TLS_ARGS[@]}" \
-  "${VAULT_ARGS[@]}" \
+  "${PULL_SECRET_ARGS[@]}" \
   localhost/ocp-metal-ui-engine:latest
 
 echo "========================================================="
