@@ -7,14 +7,6 @@ dist/
 __pycache__/
 *.py[cod]
 data/
-*.sqlite3
-*.sqlite3-shm
-*.sqlite3-wal
-*.sqlite3-journal
-*.sqlite
-*.sqlite-journal
-*.db
-*.db-*
 
 # Local Ansible workspace contents generated during development/deployment
 /ansible-workspace/
@@ -26,6 +18,12 @@ data/
 # Host pull secret. It is not built into the image.
 pull-secret.json
 pull-secret.vault
+# Do not keep a vault password in the checkout.
+vault.password
+
+# The admin token belongs outside the checkout, at
+# /var/lib/ocp-metal-ui/api.token.
+api.token
 
 # Ignore local editor swap notes and compiler footprints
 *~

@@ -1,6 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Remove a checkout vault.password only when it is the old staged copy
+# (uid 10001, mode 0400) and it is not the configured password source.
+checkout_vault_copy_should_be_removed() {
+  local target="$1"
+  local source="${2:-}"
+  local uid mode
+  if [ ! -f "$target" ]; then
+    return 1
+  fi
+  # A missing configured source is not proof that this file is disposable.
+  if [ -z "$source" ] || [ ! -e "$source" ]; then
+    return 1
+  fi
+  # Same file, including a hard link of the configured source.
+  if [ "$target" -ef "$source" ]; then
+    return 1
+  fi
+  uid="$(stat -c '%u' "$target")"
+  mode="$(stat -c '%a' "$target")"
+  [ "$uid" = "10001" ] && [ "$mode" = "400" ]
+}
+
+if [ "${1:-}" = "--vault-cleanup-decision" ]; then
+  if checkout_vault_copy_should_be_removed "$2" "${3:-}"; then
+    exit 0
+  fi
+  exit 1
+fi
+
 echo "========================================================="
 echo "🔴 Disconnected Phase: Deploying the airgap UI"
 echo "========================================================="
@@ -178,13 +207,15 @@ start_ui_database() {
     fi
     app_password="$(openssl rand -hex 24)"
     admin_password="$(openssl rand -hex 24)"
+    previous_umask="$(umask)"
     umask 077
     printf 'UI_DB_PASSWORD=%s\nPOSTGRES_PASSWORD=%s\n' "$app_password" "$admin_password" > "$credentials"
     chmod 600 "$credentials"
+    umask "$previous_umask"
     unset app_password admin_password
   fi
-  # shellcheck disable=SC1090
   set -a
+  # shellcheck disable=SC1090
   . "$credentials"
   set +a
   if [ -z "${UI_DB_PASSWORD:-}" ] || [ -z "${POSTGRES_PASSWORD:-}" ]; then
@@ -249,11 +280,13 @@ EOF
     $ENGINE logs ocp-metal-ui-db >&2 || true
     exit 1
   fi
+  previous_umask="$(umask)"
   umask 077
   printf 'DATABASE_URL=%s\n' \
     "postgresql://ocp_metal_ui:${UI_DB_PASSWORD}@${db_host}:${db_port}/ocp_metal_ui?sslmode=disable" \
     > "$ui_env"
   chmod 600 "$ui_env"
+  umask "$previous_umask"
   unset UI_DB_PASSWORD POSTGRES_PASSWORD
   UI_DATABASE_ENV_FILE="$ui_env"
   UI_DB_DATA_DIR="$data_dir"
@@ -285,7 +318,7 @@ esac
 chmod g+rwx,g+s "$ANSIBLE_HOST_DIR"
 ANSIBLE_HOST_GID="$(stat -c '%g' "$ANSIBLE_HOST_DIR")"
 if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -ne 0 ]; then
-  USER_NAMESPACE_ARGS=(--userns=keep-id:uid=10001,gid=10001)
+  USER_NAMESPACE_ARGS=("--userns=keep-id:uid=10001,gid=10001")
   GROUP_ARGS=()
 elif [ "$ENGINE" = "podman" ]; then
   # A root systemd service cannot use keep-id. Container create then
@@ -303,22 +336,56 @@ else
   GROUP_ARGS=(--group-add "$ANSIBLE_HOST_GID")
 fi
 
-PULL_SECRET_HOST_FILE="${OCP_METAL_UI_PULL_SECRET_FILE:-/etc/ocp-metal-ui/pull-secret.json}"
+# Ownership of the host pull-secret file is not settled. Change these
+# three values when David picks root:ocp-metal-ui 0640, uid 10001 0600,
+# or a podman secret. The container always mounts the directory.
+PULL_SECRET_DIR="${OCP_METAL_UI_PULL_SECRET_DIR:-/etc/ocp-metal-ui}"
+PULL_SECRET_FILE_NAME="${OCP_METAL_UI_PULL_SECRET_FILE_NAME:-pull-secret.json}"
+PULL_SECRET_OWNER="${OCP_METAL_UI_PULL_SECRET_OWNER:-10001}"
+PULL_SECRET_GROUP="${OCP_METAL_UI_PULL_SECRET_GROUP:-10001}"
+PULL_SECRET_MODE="${OCP_METAL_UI_PULL_SECRET_MODE:-0600}"
+PULL_SECRET_DIR_MODE="${OCP_METAL_UI_PULL_SECRET_DIR_MODE:-0700}"
+
 PULL_SECRET_ARGS=()
-if [ -f "$PULL_SECRET_HOST_FILE" ]; then
-  PULL_SECRET_HOST_FILE="$(cd "$(dirname "$PULL_SECRET_HOST_FILE")" && pwd -P)/$(basename "$PULL_SECRET_HOST_FILE")"
-  PULL_SECRET_ARGS=(
-    -v "$PULL_SECRET_HOST_FILE:/etc/ocp-metal-ui/pull-secret.json:ro,Z"
-    -e OCP_METAL_UI_PULL_SECRET_FILE=/etc/ocp-metal-ui/pull-secret.json
-  )
-else
-  echo "⚠️  Pull secret file not found at $PULL_SECRET_HOST_FILE." >&2
-  echo "   The UI still starts. Install files that need the pull secret stay unavailable until that file is present." >&2
-fi
+install -d -o "$PULL_SECRET_OWNER" -g "$PULL_SECRET_GROUP" -m "$PULL_SECRET_DIR_MODE" "$PULL_SECRET_DIR"
+PULL_SECRET_DIR="$(cd "$PULL_SECRET_DIR" && pwd -P)"
+PULL_SECRET_ARGS=(
+  -v "${PULL_SECRET_DIR}:${PULL_SECRET_DIR}:Z"
+  -e "OCP_METAL_UI_PULL_SECRET_FILE=${PULL_SECRET_DIR}/${PULL_SECRET_FILE_NAME}"
+)
 
 # 3. Start the application. The image still declares /data; the database
 # is the PostgreSQL container, so that mount stays empty.
+API_TOKEN_FILE="${API_TOKEN_FILE:-/var/lib/ocp-metal-ui/api.token}"
+install -d -o root -g root -m 755 "$(dirname "$API_TOKEN_FILE")"
+write_private_token() {
+  local path="$1"
+  local previous_umask
+  previous_umask="$(umask)"
+  umask 077
+  if [ ! -s "$path" ]; then
+    openssl rand -hex 32 > "$path"
+  fi
+  chmod 600 "$path"
+  umask "$previous_umask"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown 10001:10001 "$path"
+    chmod 0400 "$path"
+  fi
+}
+write_private_token "$API_TOKEN_FILE"
 install -d -o 10001 -g 10001 -m 755 "$(dirname "$UI_DATABASE_ENV_FILE")/empty"
+BIND_ADDRESS="${BIND_ADDRESS:-127.0.0.1}"
+API_ALLOWED_HOSTS_VALUE="${API_ALLOWED_HOSTS:-}"
+if [ "$BIND_ADDRESS" = "0.0.0.0" ] || [ "$BIND_ADDRESS" = "::" ]; then
+  for host_ip in $(hostname -I 2>/dev/null || true); do
+    if [ -n "$API_ALLOWED_HOSTS_VALUE" ]; then
+      API_ALLOWED_HOSTS_VALUE="${API_ALLOWED_HOSTS_VALUE},${host_ip}"
+    else
+      API_ALLOWED_HOSTS_VALUE="$host_ip"
+    fi
+  done
+fi
 echo "🚀 Starting the offline UI..."
 $ENGINE run -d \
   "${USER_NAMESPACE_ARGS[@]}" \
@@ -327,8 +394,12 @@ $ENGINE run -d \
   --restart unless-stopped \
   --network host \
   --env-file "$UI_DATABASE_ENV_FILE" \
-  -e "HOST=${BIND_ADDRESS:-0.0.0.0}" \
+  -e "HOST=${BIND_ADDRESS}" \
   -e "PORT=${HOST_PORT:-3003}" \
+  -e "TLS_HOSTNAME=${TLS_HOSTNAME}" \
+  -e "API_ALLOWED_HOSTS=${API_ALLOWED_HOSTS_VALUE}" \
+  -e API_TOKEN_FILE=/run/secrets/api-token \
+  -v "${API_TOKEN_FILE}:/run/secrets/api-token:ro,Z" \
   -v "$(dirname "$UI_DATABASE_ENV_FILE")/empty:/data:Z" \
   -v "$ANSIBLE_HOST_DIR:/ansible:Z" \
   -e ANSIBLE_WORKING_DIR=/ansible \
@@ -339,8 +410,8 @@ $ENGINE run -d \
 echo "========================================================="
 echo "✅ Operational Success! The wizard is live completely offline."
 echo "👉 Point your browser to: https://${TLS_HOSTNAME}:${HOST_PORT:-3003}"
-echo "👉 Listening on ${BIND_ADDRESS:-0.0.0.0}:${HOST_PORT:-3003}."
-case "${BIND_ADDRESS:-0.0.0.0}" in
+echo "👉 Listening on ${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-3003}."
+case "${BIND_ADDRESS:-127.0.0.1}" in
   127.0.0.1|0.0.0.0)
     if openssl x509 -in "$TLS_CERT_HOST_FILE" -noout -checkip 127.0.0.1 >/dev/null 2>&1; then
       echo "👉 On the container host, use: https://127.0.0.1:${HOST_PORT:-3003}"
@@ -351,8 +422,24 @@ echo "   HTTPS is enabled. A self-signed certificate requires browser trust/acce
 echo "💾 PostgreSQL data directory: ${UI_DB_DATA_DIR}"
 echo "   Database ocp_metal_ui listens on ${UI_DB_PUBLISH_ADDRESS}."
 echo "   Credentials: ${UI_DB_CREDENTIALS_FILE}"
+echo "🔑 Admin API token file: ${API_TOKEN_FILE}"
+echo "   Paste that token into the UI. It authorizes every /api/ route except health and inspection intake."
+echo "   The file stays outside the git checkout. Delete it before the next deploy to rotate it."
+echo "   Hardware reports need no token. POST /api/v1/inspections ignores Host and any Bearer header."
 echo "📂 Ansible workspace is mounted from: $ANSIBLE_HOST_DIR"
 echo "   Set ANSIBLE_HOST_DIR before deployment to use another host directory."
 echo "   Ensure the container user (UID 10001) can write to that directory."
-echo "⚠️  Restrict access to a trusted management network; the API has no authentication."
+host_allowlist="localhost 127.0.0.1 ::1"
+if [ "$BIND_ADDRESS" != "0.0.0.0" ] && [ "$BIND_ADDRESS" != "::" ]; then
+  host_allowlist="${host_allowlist} ${BIND_ADDRESS}"
+fi
+if [ -n "${TLS_HOSTNAME:-}" ]; then
+  host_allowlist="${host_allowlist} ${TLS_HOSTNAME}"
+fi
+if [ -n "$API_ALLOWED_HOSTS_VALUE" ]; then
+  host_allowlist="${host_allowlist} ${API_ALLOWED_HOSTS_VALUE//,/ }"
+fi
+echo "👉 Host allowlist: ${host_allowlist}"
+echo "⚠️  The default bind is 127.0.0.1. Set BIND_ADDRESS only for a network you trust."
+echo "   Every /api/ route except /api/v1/health and inspection intake requires the admin token."
 echo "========================================================="

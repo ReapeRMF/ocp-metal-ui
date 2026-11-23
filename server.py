@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import html
 import importlib.util
 import json
 import http.client
@@ -9,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -30,6 +34,25 @@ _DEFAULT_PULL_SECRET_FILE = "/etc/ocp-metal-ui/pull-secret.json"
 TLS_CERT_FILE = os.environ.get("TLS_CERT_FILE")
 TLS_KEY_FILE = os.environ.get("TLS_KEY_FILE")
 MAX_REQUEST_BYTES = 5 * 1024 * 1024
+# Ironic-style inspection reports are usually tens or hundreds of kilobytes.
+# Two mebibytes covers a report with many disks, NICs, and LLDP neighbors.
+INSPECTION_MAX_BYTES = 2 * 1024 * 1024
+# Extra revisions are stored, then the oldest rows for that node are pruned.
+# A report is never rejected because of this limit.
+INSPECTION_REPORT_RETENTION = 20
+# Intake does not take the UI advisory lock. A row lock waits this long, then
+# the write is retried, so a UI update cannot stall a report forever.
+_INTAKE_LOCK_TIMEOUT = "2s"
+_INTAKE_WRITE_ATTEMPTS = 3
+_INTAKE_RETRYABLE = (
+    psycopg.errors.SerializationFailure,
+    psycopg.errors.DeadlockDetected,
+    psycopg.errors.LockNotAvailable,
+)
+# Chunked trailers are not part of the report. Cap them so a client cannot
+# hold the socket open after the terminating chunk.
+_CHUNK_TRAILER_MAX_LINES = 16
+_CHUNK_TRAILER_MAX_BYTES = 8 * 1024
 ANSIBLE_OUTPUT_SUBDIR = "ocp-metal-ui"
 ANSIBLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 PREFERENCE_FIELDS = {
@@ -94,6 +117,12 @@ class RedfishError(ValueError):
 
 class InstallSecretError(ValueError):
     def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+class InspectionRequestError(Exception):
+    def __init__(self, status, message):
         super().__init__(message)
         self.status = status
 
@@ -377,16 +406,16 @@ DEFAULT_BLUEPRINT = {
     "controlPlaneTopology": "Compact",
     "mirrorRegistries": ["registry.airgap.internal:5000"],
     "caCertBundle": "",
-    "machineNetworkCidr": "205.28.113.0/24",
-    "dnsServers": ["205.28.113.35"],
+    "machineNetworkCidr": "192.0.2.0/24",
+    "dnsServers": ["192.0.2.35"],
     "ntpServers": [],
     "genesisHostname": "edge",
-    "genesisIp": "205.28.113.35",
+    "genesisIp": "192.0.2.35",
     "genesisNic": "eno5",
     "genesisNics": ["eno5"],
     "genesisDisks": [],
-    "networkGateway": "205.28.113.1",
-    "mgmtNetworkCidr": "205.28.114.0/24",
+    "networkGateway": "192.0.2.1",
+    "mgmtNetworkCidr": "198.51.100.0/24",
     "mgmtVlan": "280",
     "mgmtDc01Octet": "6",
     "mgmtDc02Octet": "7",
@@ -985,7 +1014,7 @@ def database_log_target():
 
 
 @contextmanager
-def connect_database():
+def connect_database(advisory_lock=True, lock_timeout=None):
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is required.")
     connection = psycopg.connect(
@@ -995,8 +1024,14 @@ def connect_database():
     )
     try:
         with connection:
-            connection.execute("SET lock_timeout = '10s'")
-            connection.execute("SELECT pg_advisory_xact_lock(%s)", (_UI_DB_LOCK,))
+            if advisory_lock:
+                connection.execute("SET lock_timeout = '10s'")
+                connection.execute("SELECT pg_advisory_xact_lock(%s)", (_UI_DB_LOCK,))
+            elif lock_timeout:
+                connection.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    (lock_timeout,),
+                )
             yield DatabaseConnection(connection)
     finally:
         connection.close()
@@ -1017,6 +1052,22 @@ def initialize_database():
                 first_seen TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inspection_reports (
+                id BIGSERIAL PRIMARY KEY,
+                node_uuid TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                report_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS inspection_reports_node_uuid_idx
+            ON inspection_reports (node_uuid, id)
             """
         )
         connection.execute(
@@ -1117,6 +1168,23 @@ _MAX_PRIVATE_KEY_BYTES = 65536
 _SSH_PUBLIC_KEY = re.compile(
     r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/]+={0,3}(?: .*)?$"
 )
+# HMAC-SHA256 of 8-character fragments that must not appear in a pull secret.
+# The fragments and an unsalted digest are not stored here.
+_FRAGMENT_LENGTH = 8
+_FRAGMENT_HMAC_KEY = bytes.fromhex(
+    "5c3fed91e1880ab4777cd1b840ca8f669d524143357ca4b3c4320cce68dd8f8e"
+)
+_REJECTED_FRAGMENT_MACS = frozenset(
+    {
+        "1032ed170987a98fb2de470a51fb2d2e2a26ec5ecab07c61932d6af287d9f4fb",
+        "c71e53c181317105baa6a9751d370884fa55d86dd4922196175599a8c31a9e70",
+    }
+)
+_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+)
 _INSTALL_SECRET_POSTS = {
     "/api/v1/install-secrets/pull-secret",
     "/api/v1/install-secrets/ssh-key",
@@ -1151,7 +1219,15 @@ def parse_pull_secret_text(text, source_label):
     auths = parsed.get("auths") if isinstance(parsed, dict) else None
     if not isinstance(auths, dict):
         raise ValueError(f"{source_label} must contain an auths object.")
-    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+    if not auths:
+        raise ValueError(f"{source_label} needs at least one registry under auths.")
+    for name, entry in auths.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(entry, dict):
+            raise ValueError("Each auths entry must be an object keyed by a registry name.")
+    normalized = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+    if pull_secret_contains_rejected_fragment(normalized):
+        raise ValueError("That pull secret is not accepted.")
+    return normalized
 
 
 def load_pull_secret():
@@ -1250,6 +1326,156 @@ def warn_about_pull_secret_file():
     warning = pull_secret_permission_warning()
     if warning:
         print(f"Warning: {warning}", file=sys.stderr)
+
+
+def pull_secret_contains_rejected_fragment(text):
+    if not isinstance(text, str) or len(text) < _FRAGMENT_LENGTH:
+        return False
+    for index in range(len(text) - _FRAGMENT_LENGTH + 1):
+        window = text[index:index + _FRAGMENT_LENGTH]
+        encoded = window.encode("utf-8")
+        if len(encoded) != _FRAGMENT_LENGTH:
+            continue
+        digest = hmac.new(_FRAGMENT_HMAC_KEY, encoded, hashlib.sha256).hexdigest()
+        if digest in _REJECTED_FRAGMENT_MACS:
+            return True
+    return False
+
+
+def _token_from_file(file_name):
+    try:
+        return Path(file_name).read_bytes().strip()
+    except OSError:
+        return None
+
+
+def configured_admin_token():
+    """Return the admin token, or None when it is missing.
+
+    A configured token file that cannot be read fails closed. An empty
+    result means protected routes must not run.
+    """
+    file_name = os.environ.get("API_TOKEN_FILE", "").strip()
+    if file_name:
+        token = _token_from_file(file_name)
+        if not token:
+            return None
+        return token
+    token = os.environ.get("API_TOKEN", "").encode("utf-8").strip()
+    return token or None
+
+
+def bearer_matches(header_value, expected):
+    presented = b""
+    if isinstance(header_value, str):
+        parts = header_value.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            presented = parts[1].strip().encode("utf-8")
+    if not expected:
+        return False
+    return hmac.compare_digest(
+        hashlib.sha256(presented).digest(),
+        hashlib.sha256(expected).digest(),
+    )
+
+
+def is_inspection_intake(path):
+    """Exact intake routes. Case variants stay behind the admin token."""
+    if path == "/api/v1/inspections":
+        return True
+    return re.fullmatch(r"/api/v1/inspections/[^/]+", path) is not None
+
+
+def request_hostname(host_header):
+    if not isinstance(host_header, str):
+        return ""
+    host = host_header.strip().lower()
+    if not host:
+        return ""
+    if host.startswith("["):
+        end = host.find("]")
+        if end < 2:
+            return ""
+        remainder = host[end + 1:]
+        if remainder and not re.fullmatch(r":[0-9]+", remainder):
+            return ""
+        return host[1:end]
+    if host.count(":") > 1:
+        return ""
+    if ":" in host:
+        name, port = host.split(":", 1)
+        if not port.isdigit():
+            return ""
+        return name.rstrip(".")
+    return host.rstrip(".")
+
+
+def normalize_allowed_name(value):
+    name = value.strip().lower()
+    if not name:
+        return ""
+    # [2001:db8::1] and [2001:db8::1]:443 are the same host as the bare address.
+    if name.startswith("["):
+        return request_hostname(name)
+    return name.rstrip(".")
+
+
+def allowed_api_hosts():
+    names = {"localhost", "127.0.0.1", "::1"}
+    bind = normalize_allowed_name(os.environ.get("HOST", "127.0.0.1"))
+    if bind and bind not in {"0.0.0.0", "::"}:
+        names.add(bind)
+    for source in (
+        os.environ.get("TLS_HOSTNAME", ""),
+        os.environ.get("API_ALLOWED_HOSTS", ""),
+    ):
+        for item in source.split(","):
+            name = normalize_allowed_name(item)
+            if name:
+                names.add(name)
+    return names
+
+
+def host_is_allowed(host_header):
+    return request_hostname(host_header) in allowed_api_hosts()
+
+
+def inspection_report_retention():
+    raw = os.environ.get("INSPECTION_REPORT_RETENTION", "").strip()
+    if not raw:
+        return INSPECTION_REPORT_RETENTION
+    try:
+        value = int(raw)
+    except ValueError:
+        return INSPECTION_REPORT_RETENTION
+    if value < 1:
+        return INSPECTION_REPORT_RETENTION
+    return value
+
+
+def authorize_api(method, path, authorization):
+    """Return None when the request may proceed, or (status, error).
+
+    GET /api/v1/health and the two inspection intake posts are public.
+    Every other /api/ path requires the admin token. A Bearer header on
+    intake is ignored.
+    """
+    normalized_path = path.lower()
+    if not normalized_path.startswith("/api/"):
+        return None
+    # Only the exact health path is public. /api/v1/HEALTH is not that route.
+    if path == "/api/v1/health":
+        return None
+    # Hardware reports are unauthenticated intake. A Bearer header, including
+    # a stale inspection token from an older collector, is ignored.
+    if method == "POST" and is_inspection_intake(path):
+        return None
+    admin = configured_admin_token()
+    if admin is None:
+        return 503, "The API token is not configured."
+    if bearer_matches(authorization, admin):
+        return None
+    return 401, "Authentication is required."
 
 
 def normalize_ssh_public_key(text):
@@ -1352,6 +1578,7 @@ def write_secret_file(path, data, mode):
         raise InstallSecretError("Refusing to write through a symbolic link.")
     temporary = parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     fd = None
+    previous_umask = os.umask(0o077)
     try:
         parent.mkdir(parents=True, exist_ok=True)
         os.chmod(parent, 0o700)
@@ -1375,6 +1602,7 @@ def write_secret_file(path, data, mode):
     except OSError as error:
         raise InstallSecretError("Could not store the install secret.") from error
     finally:
+        os.umask(previous_umask)
         if fd is not None:
             os.close(fd)
         temporary.unlink(missing_ok=True)
@@ -1558,24 +1786,31 @@ def parse_inspection(payload, path_uuid=None):
     if not isinstance(inventory, dict):
         raise ValueError("Inspection report must contain an inventory object.")
 
-    bmc_address = payload.get("bmc_address") or inventory.get("bmc_address") or ""
-    if not isinstance(bmc_address, str):
-        raise ValueError("bmc_address must be a string.")
+    bmc_address = optional_inspection_text(payload.get("bmc_address"), "bmc_address")
+    if not bmc_address:
+        bmc_address = optional_inspection_text(inventory.get("bmc_address"), "bmc_address")
 
     system_vendor = inventory.get("system_vendor")
     system_serial = inventory.get("system")
-    serial_number = (
+    serial_number = optional_inspection_text(
         payload.get("serial_number")
         or inventory.get("serial_number")
         or (system_vendor.get("serial_number") if isinstance(system_vendor, dict) else None)
         or (system_vendor.get("serial") if isinstance(system_vendor, dict) else None)
-        or (system_serial.get("serial_number") if isinstance(system_serial, dict) else None)
-        or ""
+        or (system_serial.get("serial_number") if isinstance(system_serial, dict) else None),
+        "Node serial number",
     )
-    if not isinstance(serial_number, str):
-        raise ValueError("Node serial number must be a string.")
 
-    return node_uuid, bmc_address, serial_number.strip(), inventory
+    return node_uuid, bmc_address, serial_number, inventory
+
+
+def optional_inspection_text(value, label):
+    # JSON null and a missing field are blank. The upsert keeps the stored value.
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string.")
+    return value.strip()
 
 
 def safe_ansible_name(value, field, node_uuid):
@@ -1679,9 +1914,44 @@ def remove_replaced_host_vars(output_root, generated_files):
 
 class ApiHandler(BaseHTTPRequestHandler):
     server_version = "OcpMetalUI/1.0"
+    # Bound every socket read, including a chunked body that never finishes.
+    # A timed-out read raises TimeoutError; handle_one_request closes it.
+    timeout = 60
 
     def log_message(self, format_string, *args):
         print(f"{self.address_string()} - {format_string % args}")
+
+    def add_security_headers(self):
+        self.send_header("Content-Security-Policy", _CONTENT_SECURITY_POLICY)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+
+    def send_error(self, code, message=None, explain=None):
+        try:
+            shortmsg, longmsg = self.responses[code]
+        except KeyError:
+            shortmsg, longmsg = "???", "???"
+        if message is None:
+            message = shortmsg
+        if explain is None:
+            explain = longmsg
+        self.log_error("code %d, message %s", code, message)
+        self.send_response(code, message)
+        self.send_header("Connection", "close")
+        body = None
+        if code >= 200 and code not in (204, 205, 304):
+            content = self.error_message_format % {
+                "code": code,
+                "message": html.escape(message, quote=False),
+                "explain": html.escape(explain, quote=False),
+            }
+            body = content.encode("UTF-8", "replace")
+            self.send_header("Content-Type", self.error_content_type)
+            self.send_header("Content-Length", str(len(body)))
+        self.add_security_headers()
+        self.end_headers()
+        if self.command != "HEAD" and body:
+            self.wfile.write(body)
 
     def send_json(self, status, value):
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -1689,6 +1959,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if status == 413:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.add_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -1698,6 +1972,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Cache-Control", "no-store")
+        self.add_security_headers()
         self.end_headers()
         self.wfile.write(data)
 
@@ -1708,6 +1983,27 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         if 0 < length <= MAX_REQUEST_BYTES:
             self.rfile.read(length)
+
+    def guard_request(self, method):
+        path = urlparse(self.path).path
+        # Intake is exempt from the Host allowlist. The collector posts to
+        # whichever address reaches this process, and a missed IP would drop
+        # the report. Every other route, including the UI, still checks Host.
+        if not (method == "POST" and is_inspection_intake(path)):
+            host_values = self.headers.get_all("Host") or []
+            if len(host_values) != 1 or not host_is_allowed(host_values[0]):
+                if method in {"POST", "PUT", "PATCH"}:
+                    self.discard_body()
+                self.send_json(421, {"error": "Host is not allowed."})
+                return False
+        decision = authorize_api(method, path, self.headers.get("Authorization", ""))
+        if decision is None:
+            return True
+        status, error = decision
+        if method in {"POST", "PUT", "PATCH"}:
+            self.discard_body()
+        self.send_json(status, {"error": error})
+        return False
 
     def query_value(self, name):
         values = parse_qs(urlparse(self.path).query).get(name) or []
@@ -1728,6 +2024,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ValueError("Request body must be valid JSON.") from None
 
     def do_GET(self):
+        if not self.guard_request("GET"):
+            return
         path = urlparse(self.path).path
         if path == "/api/v1/health":
             self.send_json(200, {"status": "ok"})
@@ -1810,6 +2108,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.serve_static(path)
 
     def do_POST(self):
+        if not self.guard_request("POST"):
+            return
         path = urlparse(self.path).path
         if path == "/api/v1/redfish/retrieve" and not isinstance(
             self.connection, ssl.SSLSocket
@@ -1829,14 +2129,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 {"error": "Pull secrets and SSH keys are accepted only over HTTPS."},
             )
             return
+        if is_inspection_intake(path):
+            try:
+                self.accept_inspection(path)
+            except InspectionRequestError as error:
+                self.send_json(error.status, {"error": str(error)})
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+            except psycopg.errors.LockNotAvailable:
+                self.send_json(503, {"error": "The inspection store is busy."})
+            except psycopg.Error:
+                self.send_json(500, {"error": "Database operation failed."})
+            return
         try:
             payload = self.read_json()
-            if path == "/api/v1/inspections":
-                self.store_inspection(payload)
-            elif re.fullmatch(r"/api/v1/inspections/[^/]+", path):
-                path_uuid = unquote(path.rsplit("/", 1)[1])
-                self.store_inspection(payload, path_uuid)
-            elif path == "/api/v1/ansible-files":
+            if path == "/api/v1/ansible-files":
                 self.commit_ansible_files(payload)
             elif path == "/api/v1/nodes":
                 self.create_named_node(payload)
@@ -1875,6 +2182,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": f"Unable to commit Ansible files: {error}"})
 
     def do_PUT(self):
+        if not self.guard_request("PUT"):
+            return
         path = urlparse(self.path).path
         if path == "/api/v1/configuration":
             try:
@@ -1946,6 +2255,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": "Database operation failed."})
 
     def do_DELETE(self):
+        if not self.guard_request("DELETE"):
+            return
         path = urlparse(self.path).path
         match = re.fullmatch(r"/api/v1/nodes/([^/]+)", path)
         if not match:
@@ -2115,35 +2426,164 @@ class ApiHandler(BaseHTTPRequestHandler):
             {"status": "saved", "savedNodes": len(normalized_preferences)},
         )
 
-    def store_inspection(self, payload, path_uuid=None):
+    def read_exact(self, size):
+        remaining = size
+        chunks = []
+        while remaining:
+            piece = self.rfile.read(remaining)
+            if not piece:
+                raise InspectionRequestError(400, "Inspection report ended early.")
+            chunks.append(piece)
+            remaining -= len(piece)
+        return b"".join(chunks)
+
+    def read_chunked_inspection_body(self):
+        # Content-Type is ignored. Chunked collectors are accepted up to the
+        # same cap; only a body past that cap is rejected.
+        chunks = []
+        total = 0
+        while True:
+            line = self.rfile.readline(128)
+            if not line:
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.")
+            size_token = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_token, 16)
+            except ValueError as error:
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.") from error
+            if size < 0:
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.")
+            if size == 0:
+                self.read_chunk_trailers()
+                break
+            if size > INSPECTION_MAX_BYTES or total + size > INSPECTION_MAX_BYTES:
+                raise InspectionRequestError(413, "Inspection report is too large.")
+            chunks.append(self.read_exact(size))
+            total += size
+            delimiter = self.rfile.readline(8)
+            if delimiter not in (b"\r\n", b"\n"):
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.")
+        return b"".join(chunks)
+
+    def read_chunk_trailers(self):
+        lines = 0
+        total = 0
+        while True:
+            trailer = self.rfile.readline(_CHUNK_TRAILER_MAX_BYTES + 1)
+            if trailer in (b"\r\n", b"\n", b""):
+                return
+            lines += 1
+            total += len(trailer)
+            if (
+                lines > _CHUNK_TRAILER_MAX_LINES
+                or total > _CHUNK_TRAILER_MAX_BYTES
+                or len(trailer) > _CHUNK_TRAILER_MAX_BYTES
+                or not trailer.endswith(b"\n")
+            ):
+                raise InspectionRequestError(400, "Inspection report trailers are too large.")
+
+    def read_inspection_body(self):
+        # Any Content-Type is accepted. The body is parsed as JSON anyway.
+        transfer = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in transfer:
+            raw = self.read_chunked_inspection_body()
+        else:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as error:
+                raise InspectionRequestError(400, "Invalid Content-Length.") from error
+            if length <= 0:
+                raise InspectionRequestError(400, "Inspection report must be a JSON object.")
+            if length > INSPECTION_MAX_BYTES:
+                raise InspectionRequestError(413, "Inspection report is too large.")
+            raw = self.read_exact(length)
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise InspectionRequestError(400, "Inspection report must be a JSON object.") from error
+        return payload
+
+    def accept_inspection(self, path):
+        path_uuid = None
+        if path != "/api/v1/inspections":
+            path_uuid = unquote(path.rsplit("/", 1)[1])
+        payload = self.read_inspection_body()
         node_uuid, bmc_address, serial_number, inventory = parse_inspection(payload, path_uuid)
         now = utc_now()
-        with connect_database() as connection:
-            connection.execute(
-                """
-                INSERT INTO nodes
-                    (uuid, bmc_address, serial_number, inventory_json, source, first_seen, updated_at)
-                VALUES (?, ?, ?, ?, 'ipa', ?, ?)
-                ON CONFLICT(uuid) DO UPDATE SET
-                    bmc_address = excluded.bmc_address,
-                    serial_number = CASE
-                        WHEN excluded.serial_number = '' THEN nodes.serial_number
-                        ELSE excluded.serial_number
-                    END,
-                    inventory_json = excluded.inventory_json,
-                    source = 'ipa',
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    node_uuid,
-                    bmc_address,
-                    serial_number,
-                    json.dumps(inventory, ensure_ascii=False),
-                    now,
-                    now,
-                ),
-            )
-        self.send_json(202, {"uuid": node_uuid, "status": "stored"})
+        report_json = json.dumps(payload, ensure_ascii=False)
+        retention = inspection_report_retention()
+        inventory_json = json.dumps(inventory, ensure_ascii=False)
+        for attempt in range(_INTAKE_WRITE_ATTEMPTS):
+            try:
+                with connect_database(
+                    advisory_lock=False, lock_timeout=_INTAKE_LOCK_TIMEOUT
+                ) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        """
+                        INSERT INTO nodes
+                            (uuid, bmc_address, serial_number, inventory_json, source, first_seen, updated_at)
+                        VALUES (?, ?, ?, ?, 'ipa', ?, ?)
+                        ON CONFLICT(uuid) DO UPDATE SET
+                            bmc_address = CASE
+                                WHEN excluded.bmc_address IS NULL OR excluded.bmc_address = ''
+                                    THEN nodes.bmc_address
+                                ELSE excluded.bmc_address
+                            END,
+                            serial_number = CASE
+                                WHEN excluded.serial_number IS NULL OR excluded.serial_number = ''
+                                    THEN nodes.serial_number
+                                ELSE excluded.serial_number
+                            END,
+                            inventory_json = excluded.inventory_json,
+                            source = 'ipa',
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            node_uuid,
+                            bmc_address,
+                            serial_number,
+                            inventory_json,
+                            now,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO inspection_reports (node_uuid, received_at, report_json)
+                        VALUES (?, ?, ?)
+                        """,
+                        (node_uuid, now, report_json),
+                    )
+                break
+            except _INTAKE_RETRYABLE:
+                if attempt + 1 == _INTAKE_WRITE_ATTEMPTS:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        self.prune_inspection_reports(node_uuid, retention)
+        self.send_json(202, {"status": "accepted"})
+
+    def prune_inspection_reports(self, node_uuid, retention):
+        # The report is already committed. A prune failure must not drop it.
+        try:
+            with connect_database(
+                advisory_lock=False, lock_timeout=_INTAKE_LOCK_TIMEOUT
+            ) as connection:
+                connection.execute(
+                    """
+                    DELETE FROM inspection_reports
+                    WHERE node_uuid = ?
+                      AND id NOT IN (
+                          SELECT id FROM inspection_reports
+                          WHERE node_uuid = ?
+                          ORDER BY id DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (node_uuid, node_uuid, retention),
+                )
+        except psycopg.Error as error:
+            self.log_error("Inspection report retention prune failed: %s", error)
 
     def create_named_node(self, payload):
         if not isinstance(payload, dict):
@@ -2826,17 +3266,27 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.add_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
 
+def _loopback_bind(host):
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
 if __name__ == "__main__":
-    os.umask(0o002)
     initialize_database()
     port = int(os.environ.get("PORT", "3003"))
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
     if bool(TLS_CERT_FILE) != bool(TLS_KEY_FILE):
         raise RuntimeError("TLS_CERT_FILE and TLS_KEY_FILE must be configured together.")
+    if not _loopback_bind(host) and not (TLS_CERT_FILE and TLS_KEY_FILE):
+        print(
+            f"Warning: listening on {host} without TLS. "
+            "Set TLS_CERT_FILE and TLS_KEY_FILE, or bind 127.0.0.1.",
+            file=sys.stderr,
+        )
     httpd = ThreadingHTTPServer((host, port), ApiHandler)
     protocol = "HTTP"
     if TLS_CERT_FILE and TLS_KEY_FILE:

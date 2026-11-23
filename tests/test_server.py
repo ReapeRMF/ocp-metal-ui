@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import http.client
 import io
 import json
@@ -18,6 +19,19 @@ import server
 NODE_UUID = "8a4f91c2-38d1-4bda-912c-bbfa47821001"
 
 
+def playbook_root():
+    """Optional checkout of ocp-ansible-playbooks/playbooks.
+
+    Comparisons against that tree run only when OCP_ANSIBLE_PLAYBOOKS
+    points at a playbooks directory. CI does not have that checkout.
+    """
+    configured = os.environ.get("OCP_ANSIBLE_PLAYBOOKS", "").strip()
+    if not configured:
+        return None
+    path = Path(configured)
+    return path if path.is_dir() else None
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -30,7 +44,11 @@ class ApiTests(unittest.TestCase):
         server.ANSIBLE_WORKING_DIR.mkdir()
         server.initialize_database()
         with server.connect_database() as connection:
-            connection.execute("TRUNCATE TABLE nodes, app_settings")
+            connection.execute("TRUNCATE TABLE nodes, app_settings, inspection_reports")
+        self.api_token = "test-api-token"
+        self._api_token_env = patch.dict(os.environ, {"API_TOKEN": self.api_token})
+        self._api_token_env.start()
+        self.addCleanup(self._api_token_env.stop)
         server.initialize_database()
         self.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.ApiHandler)
         self.thread = threading.Thread(target=self.httpd.serve_forever)
@@ -56,10 +74,19 @@ class ApiTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return path
 
-    def request(self, method, path, payload=None):
+    def request(self, method, path, payload=None, token="__default__", host=None, authorization="__default__"):
         connection = http.client.HTTPConnection(*self.httpd.server_address)
         body = json.dumps(payload) if payload is not None else None
         headers = {"Content-Type": "application/json"} if body is not None else {}
+        if authorization == "__default__":
+            if token == "__default__":
+                token = self.api_token
+            if token is not None:
+                headers["Authorization"] = f"Bearer {token}"
+        elif authorization is not None:
+            headers["Authorization"] = authorization
+        if host is not None:
+            headers["Host"] = host
         connection.request(method, path, body=body, headers=headers)
         response = connection.getresponse()
         result = response.read()
@@ -70,7 +97,7 @@ class ApiTests(unittest.TestCase):
     def report(self, **overrides):
         payload = {
             "uuid": NODE_UUID,
-            "bmc_address": "10.10.50.21",
+            "bmc_address": "192.0.2.21",
             "inventory": {
                 "cpu": {"count": 32, "model_name": "Example CPU"},
                 "memory": {"physical_mb": 65536},
@@ -107,17 +134,21 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {"saved": 1})
 
-        updated_report = self.report(bmc_address="10.10.50.99")
-        status, _, _ = self.request("POST", f"/api/v1/inspections/{NODE_UUID}", updated_report)
+        updated_report = self.report(bmc_address="192.0.2.99")
+        updated_report["inventory"]["cpu"]["model_name"] = "Refreshed CPU"
+        updated_report["inventory"]["system_vendor"]["serial_number"] = "REFRESHED-SERIAL"
+        status, body, _ = self.request("POST", f"/api/v1/inspections/{NODE_UUID}", updated_report)
         self.assertEqual(status, 202)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
         status, body, _ = self.request("GET", "/api/v1/nodes")
         self.assertEqual(status, 200)
         node = json.loads(body)[0]
-        self.assertEqual(node["bmc_address"], "10.10.50.99")
-        self.assertEqual(node["serial_number"], "NODE-SERIAL-01")
-        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Example CPU")
+        self.assertEqual(node["bmc_address"], "192.0.2.99")
+        self.assertEqual(node["serial_number"], "REFRESHED-SERIAL")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Refreshed CPU")
         self.assertEqual(node["inventory"]["interfaces"][0]["state"], "up")
         self.assertEqual(node["preferences"]["rootDisk"], "/dev/sda")
+        self.assertEqual(node["preferences"]["netType"], "single")
 
     def test_configuration_commit_saves_blueprint_and_preferences_without_exporting(self):
         self.request(
@@ -569,12 +600,12 @@ class ApiTests(unittest.TestCase):
         self.assertIn('"bondVlanId": "281"', host_vars)
         self.assertNotIn("cluster_blueprint", group_vars)
         self.assertIn('"clusterName": "new-cluster"', group_vars)
-        self.assertIn('"machineNetworkCidr": "205.28.113.0/24"', group_vars)
+        self.assertIn('"machineNetworkCidr": "192.0.2.0/24"', group_vars)
         self.assertIn('"genesisHostname": "edge"', group_vars)
-        self.assertIn('"genesisIp": "205.28.113.35"', group_vars)
+        self.assertIn('"genesisIp": "192.0.2.35"', group_vars)
         self.assertIn('"genesisNic": "eno5"', group_vars)
-        self.assertIn('"networkGateway": "205.28.113.1"', group_vars)
-        self.assertIn('"mgmtNetworkCidr": "205.28.114.0/24"', group_vars)
+        self.assertIn('"networkGateway": "192.0.2.1"', group_vars)
+        self.assertIn('"mgmtNetworkCidr": "198.51.100.0/24"', group_vars)
         self.assertIn('"mgmtVlan": "280"', group_vars)
         self.assertNotIn("mgmtDc01", group_vars)
         self.assertNotIn("mgmtDc02", group_vars)
@@ -582,7 +613,7 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("isc_dhcpd_start_ip", group_vars)
         self.assertNotIn("bastionHostname", group_vars)
         self.assertNotIn("bastionIp", group_vars)
-        self.assertIn('"dnsServers":\n  - "205.28.113.35"', group_vars)
+        self.assertIn('"dnsServers":\n  - "192.0.2.35"', group_vars)
 
     def test_retired_bastion_blueprint_keys_move_to_genesis_keys(self):
         with server.connect_database() as connection:
@@ -593,7 +624,7 @@ class ApiTests(unittest.TestCase):
                         {
                             "clusterName": "kept-cluster",
                             "bastionHostname": "edge-genesis",
-                            "bastionIp": "205.28.113.36",
+                            "bastionIp": "192.0.2.36",
                         }
                     ),
                 ),
@@ -603,7 +634,7 @@ class ApiTests(unittest.TestCase):
         blueprint = json.loads(body)["blueprint"]
         self.assertEqual(blueprint["clusterName"], "kept-cluster")
         self.assertEqual(blueprint["genesisHostname"], "edge-genesis")
-        self.assertEqual(blueprint["genesisIp"], "205.28.113.36")
+        self.assertEqual(blueprint["genesisIp"], "192.0.2.36")
         self.assertNotIn("bastionHostname", blueprint)
         self.assertNotIn("bastionIp", blueprint)
 
@@ -636,7 +667,7 @@ class ApiTests(unittest.TestCase):
                 ).fetchone()["value_json"]
             )
         self.assertEqual(stored["genesisHostname"], "edge-genesis")
-        self.assertEqual(stored["genesisIp"], "205.28.113.36")
+        self.assertEqual(stored["genesisIp"], "192.0.2.36")
         self.assertNotIn("bastionHostname", stored)
         self.assertNotIn("bastionIp", stored)
 
@@ -655,7 +686,7 @@ class ApiTests(unittest.TestCase):
                 "preferences": {placeholder_uuid: {"ansibleHost": "control-01"}},
                 "blueprint": {
                     "bastionHostname": "edge-genesis",
-                    "bastionIp": "205.28.113.36",
+                    "bastionIp": "192.0.2.36",
                 },
             },
         )
@@ -664,7 +695,7 @@ class ApiTests(unittest.TestCase):
             server.ANSIBLE_WORKING_DIR / "ocp-metal-ui" / "group_vars" / "ocp.yml"
         ).read_text()
         self.assertIn('"genesisHostname": "edge-genesis"', group_vars)
-        self.assertIn('"genesisIp": "205.28.113.36"', group_vars)
+        self.assertIn('"genesisIp": "192.0.2.36"', group_vars)
         self.assertNotIn("bastionHostname", group_vars)
         self.assertNotIn("bastionIp", group_vars)
 
@@ -749,8 +780,8 @@ class ApiTests(unittest.TestCase):
                     json.dumps(
                         {
                             "clusterName": "kept-cluster",
-                            "mgmtDc01Ip": "205.28.114.16",
-                            "mgmtDc02Ip": "205.28.114.17",
+                            "mgmtDc01Ip": "198.51.100.16",
+                            "mgmtDc02Ip": "198.51.100.17",
                         }
                     ),
                 ),
@@ -1188,11 +1219,13 @@ class ApiTests(unittest.TestCase):
 
         import yaml
 
-        playbooks = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks"
-        )
-        sys.path.insert(0, str(playbooks / "tests"))
-        from test_agent_install import agent_hosts, render_templates
+        from agent_install import agent_hosts
+
+        render_templates = None
+        playbooks = playbook_root()
+        if playbooks is not None and (playbooks / "tests").is_dir():
+            sys.path.insert(0, str(playbooks / "tests"))
+            from test_agent_install import render_templates
 
         specs = [
             {
@@ -1201,7 +1234,7 @@ class ApiTests(unittest.TestCase):
                 "role": "master",
                 "rendezvous": True,
                 "ipv4LastOctet": "011",
-                "current_ip": "205.28.113.99",
+                "current_ip": "192.0.2.99",
                 "serial": "NODE-SERIAL-01",
                 "rootDisk": "NVME-C1",
                 "nics": [("eno5", "52:54:00:AA:00:05"), ("eno6", "52:54:00:11:00:06")],
@@ -1295,12 +1328,12 @@ class ApiTests(unittest.TestCase):
                     "clusterName": "ocp-baremetal",
                     "baseDomain": "ocp.internal",
                     "controlPlaneTopology": "HighlyAvailable",
-                    "machineNetworkCidr": "205.28.113.0/24",
-                    "networkGateway": "205.28.113.1",
-                    "dnsServers": ["205.28.113.35"],
-                    "ntpServers": ["205.28.113.35"],
-                    "apiVip": "205.28.113.2",
-                    "ingressVip": "205.28.113.3",
+                    "machineNetworkCidr": "192.0.2.0/24",
+                    "networkGateway": "192.0.2.1",
+                    "dnsServers": ["192.0.2.35"],
+                    "ntpServers": ["192.0.2.35"],
+                    "apiVip": "192.0.2.2",
+                    "ingressVip": "192.0.2.3",
                     "caCertBundle": "TEST-CA",
                     "pullSecret": "must-not-export",
                     "vaultPassword": "must-not-export",
@@ -1323,8 +1356,6 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(
             (server.ANSIBLE_WORKING_DIR / "cluster-install" / "agent-config.yaml").exists()
         )
-        self.assertNotIn("a8c2744b", published_preview["installConfig"] + published_preview["agentConfig"])
-        self.assertNotIn("e9bd34f4", published_preview["installConfig"] + published_preview["agentConfig"])
         output_root = server.ANSIBLE_WORKING_DIR / "ocp-metal-ui"
         published = "\n".join(
             path.read_text() for path in sorted(output_root.rglob("*")) if path.is_file()
@@ -1334,8 +1365,8 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("vaultPassword", published)
 
         group = yaml.safe_load((output_root / "group_vars" / "ocp.yml").read_text())
-        self.assertEqual(group["apiVip"], "205.28.113.2")
-        self.assertEqual(group["ingressVip"], "205.28.113.3")
+        self.assertEqual(group["apiVip"], "192.0.2.2")
+        self.assertEqual(group["ingressVip"], "192.0.2.3")
         self.assertEqual(group["clusterName"], "ocp-baremetal")
         self.assertNotIn("mgmtDc01Octet", group)
 
@@ -1361,13 +1392,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(by_file["control-01"]["role"], "master")
         self.assertIs(by_file["control-01"]["rendezvous"], True)
         self.assertEqual(by_file["control-01"]["ipv4LastOctet"], "11")
-        self.assertEqual(by_file["control-01"]["ipv4_ip"], "205.28.113.11")
+        self.assertEqual(by_file["control-01"]["ipv4_ip"], "192.0.2.11")
         self.assertEqual(by_file["control-01"]["ipa_inventory"]["interfaces"][0]["mac_address"], "52:54:00:AA:00:05")
         self.assertEqual(by_file["control-02"]["node_preferences"]["bondNics"], ["eno5", "eno6"])
         self.assertIs(by_file["control-02"]["node_preferences"]["bondVlanEnabled"], False)
         self.assertIs(by_file["control-03"]["node_preferences"]["singleVlanEnabled"], False)
         self.assertEqual(by_file["worker-01"]["role"], "worker")
-        self.assertEqual(by_file["worker-01"]["ipv4_ip"], "205.28.113.14")
+        self.assertEqual(by_file["worker-01"]["ipv4_ip"], "192.0.2.14")
         self.assertEqual(
             yaml.safe_load((output_root / "host_vars" / "dc01.yml").read_text()),
             {"ipv4LastOctet": "6"},
@@ -1376,8 +1407,8 @@ class ApiTests(unittest.TestCase):
         status, body, _ = self.request("GET", "/api/v1/config")
         self.assertEqual(status, 200, body)
         stored_blueprint = json.loads(body)["blueprint"]
-        self.assertEqual(stored_blueprint["apiVip"], "205.28.113.2")
-        self.assertEqual(stored_blueprint["ingressVip"], "205.28.113.3")
+        self.assertEqual(stored_blueprint["apiVip"], "192.0.2.2")
+        self.assertEqual(stored_blueprint["ingressVip"], "192.0.2.3")
         status, body, _ = self.request("GET", "/api/v1/nodes")
         self.assertEqual(status, 200, body)
         stored = {node["uuid"]: node for node in json.loads(body)}
@@ -1391,19 +1422,23 @@ class ApiTests(unittest.TestCase):
         result = agent_hosts({"blueprint": group, "hosts": loaded_hosts})
         self.assertTrue(result["ok"], result["error"])
         self.assertEqual(result["platform"], "baremetal")
-        self.assertEqual(result["rendezvous_ip"], "205.28.113.11")
-        self.assertEqual(result["api_vips"], ["205.28.113.2"])
-        self.assertEqual(result["ingress_vips"], ["205.28.113.3"])
+        self.assertEqual(result["rendezvous_ip"], "192.0.2.11")
+        self.assertEqual(result["api_vips"], ["192.0.2.2"])
+        self.assertEqual(result["ingress_vips"], ["192.0.2.3"])
+        # The Jinja comparison needs the playbook checkout named by
+        # OCP_ANSIBLE_PLAYBOOKS. The assertions above use this repo only.
+        if render_templates is None:
+            return
         rendered = render_templates(result)
         install_config = yaml.safe_load(rendered["install-config.yaml"])
         agent_config = yaml.safe_load(rendered["agent-config.yaml"])
-        self.assertEqual(install_config["platform"]["baremetal"]["apiVIPs"], ["205.28.113.2"])
-        self.assertEqual(install_config["platform"]["baremetal"]["ingressVIPs"], ["205.28.113.3"])
+        self.assertEqual(install_config["platform"]["baremetal"]["apiVIPs"], ["192.0.2.2"])
+        self.assertEqual(install_config["platform"]["baremetal"]["ingressVIPs"], ["192.0.2.3"])
         self.assertEqual(install_config["controlPlane"]["replicas"], 3)
         self.assertEqual(install_config["compute"][0]["replicas"], 1)
         self.assertIn("TEST-CA", rendered["install-config.yaml"])
         self.assertIn('{"auths":{}}', rendered["install-config.yaml"])
-        self.assertEqual(agent_config["rendezvousIP"], "205.28.113.11")
+        self.assertEqual(agent_config["rendezvousIP"], "192.0.2.11")
         recovered = {item["hostname"]: item for item in agent_config["hosts"]}
         self.assertEqual(recovered["control-01"]["role"], "master")
         self.assertEqual(recovered["control-01"]["rootDeviceHints"]["serialNumber"], "NVME-C1")
@@ -1411,7 +1446,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(recovered["control-01"]["networkConfig"]["interfaces"][1]["name"], "eno5.281")
         self.assertEqual(
             recovered["control-01"]["networkConfig"]["interfaces"][1]["ipv4"]["address"][0]["ip"],
-            "205.28.113.11",
+            "192.0.2.11",
         )
         self.assertEqual(recovered["control-02"]["networkConfig"]["interfaces"][2]["name"], "bond0")
         self.assertEqual(
@@ -1482,14 +1517,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(blueprint["ingressVip"], "")
 
     def test_partial_inventory_publishes_and_the_install_filter_requires_three_masters(self):
-        import sys
-
         import yaml
 
-        playbooks = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks"
-        )
-        sys.path.insert(0, str(playbooks / "filter_plugins"))
         from agent_install import agent_hosts
 
         self._post_inspection(
@@ -1517,8 +1546,8 @@ class ApiTests(unittest.TestCase):
                 },
                 "blueprint": {
                     "controlPlaneTopology": "HighlyAvailable",
-                    "apiVip": "205.28.113.2",
-                    "ingressVip": "205.28.113.3",
+                    "apiVip": "192.0.2.2",
+                    "ingressVip": "192.0.2.3",
                 },
             },
         )
@@ -1655,16 +1684,24 @@ class ApiTests(unittest.TestCase):
         self.assertIn("rendezvous host must be a master", json.loads(body)["error"])
 
     def test_bundled_install_filter_matches_the_playbook_filter(self):
+        playbooks = playbook_root()
+        if playbooks is None:
+            self.skipTest(
+                "Set OCP_ANSIBLE_PLAYBOOKS to an ocp-ansible-playbooks/playbooks "
+                "checkout to compare the bundled filter."
+            )
         bundled = Path(server.__file__).resolve().parent / "agent_install.py"
-        playbook = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks/filter_plugins/agent_install.py"
-        )
+        playbook = playbooks / "filter_plugins" / "agent_install.py"
         self.assertEqual(bundled.read_bytes(), playbook.read_bytes())
 
     def test_render_play_can_read_saved_install_secret_files(self):
-        playbook = Path(
-            "/home/dstratfo/git-repos/ansible/ocp-ansible-playbooks/playbooks/render_agent_install.yml"
-        ).read_text()
+        playbooks = playbook_root()
+        if playbooks is None:
+            self.skipTest(
+                "Set OCP_ANSIBLE_PLAYBOOKS to an ocp-ansible-playbooks/playbooks "
+                "checkout to read render_agent_install.yml."
+            )
+        playbook = (playbooks / "render_agent_install.yml").read_text()
         self.assertIn("ocp_install_pull_secret_file", playbook)
         self.assertIn("ocp_install_ssh_public_key_file", playbook)
         self.assertIn("ocp_pre_install_pull_secret_contents | default('') | length == 0", playbook)
@@ -1788,8 +1825,8 @@ class ApiTests(unittest.TestCase):
                     "clusterName": "ocp-baremetal",
                     "baseDomain": "ocp.internal",
                     "controlPlaneTopology": "SingleNode",
-                    "machineNetworkCidr": "205.28.113.0/24",
-                    "networkGateway": "205.28.113.1",
+                    "machineNetworkCidr": "192.0.2.0/24",
+                    "networkGateway": "192.0.2.1",
                     "pullSecret": "must-not-export",
                     "vaultPassword": "must-not-export",
                 },
@@ -1822,7 +1859,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(written_install["fips"], True)
         self.assertIn("edge.ocp.internal", written_install["imageDigestSources"][0]["mirrors"][0])
         self.assertEqual(written_agent["kind"], "AgentConfig")
-        self.assertEqual(written_agent["rendezvousIP"], "205.28.113.11")
+        self.assertEqual(written_agent["rendezvousIP"], "192.0.2.11")
         self.assertEqual(written_agent["hosts"][0]["hostname"], "control-01")
         self.assertEqual(written_agent["hosts"][0]["role"], "master")
         self.assertEqual(
@@ -2008,6 +2045,662 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(status, 426, body)
             self.assertNotIn(b"dGVzdA==", body)
             self.assertIn("other.example", path.read_text())
+
+
+    def test_pull_secret_rejection_compares_fragment_digests(self):
+        digest = hmac.new(server._FRAGMENT_HMAC_KEY, b"testmark", hashlib.sha256).hexdigest()
+        rejected = '{"auths":{"example.com":{"auth":"xxxtestmark"}}}'
+        accepted = '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'
+        with patch.object(server, "_REJECTED_FRAGMENT_MACS", frozenset({digest})):
+            with self.assertRaises(ValueError) as caught:
+                server.normalize_pull_secret(rejected)
+            self.assertIn("not accepted", str(caught.exception))
+            self.assertEqual(
+                json.loads(server.normalize_pull_secret(accepted))["auths"]["example.com"]["auth"],
+                "dGVzdA==",
+            )
+
+    def test_api_auth_scopes_host_and_fail_closed(self):
+        destination = quote(str(server.ANSIBLE_WORKING_DIR))
+        status, body, _ = self.request("GET", "/api/v1/health", token=None)
+        self.assertEqual(status, 200, body)
+        connection = http.client.HTTPConnection(*self.httpd.server_address)
+        connection.request("GET", "/api/v1/health")
+        health = connection.getresponse()
+        self.assertIn("default-src 'self'", health.getheader("Content-Security-Policy", ""))
+        health.read()
+        connection.close()
+
+        for method, path, payload in (
+            ("GET", "/api/v1/config", None),
+            ("GET", "/api/v1/nodes", None),
+            ("GET", "/api/v1/not-a-route", None),
+            ("GET", f"/api/v1/install-secrets?outputDirectory={destination}", None),
+            ("POST", "/api/v1/nodes", {"ansibleHost": "blocked-01"}),
+            ("PUT", "/api/v1/configuration", {"blueprint": {}, "preferences": {}}),
+            ("DELETE", f"/api/v1/nodes/{NODE_UUID}", None),
+        ):
+            with self.subTest(method=method, path=path, token="absent"):
+                status, body, _ = self.request(method, path, payload, token=None)
+                self.assertEqual(status, 401, body)
+                self.assertNotIn(self.api_token.encode(), body)
+
+        status, body, _ = self.request(
+            "GET", "/api/v1/config", authorization=f"bearer {self.api_token}"
+        )
+        self.assertEqual(status, 200, body)
+        status, body, _ = self.request(
+            "GET", "/api/v1/nodes", authorization=f"BEARER {self.api_token}"
+        )
+        self.assertEqual(status, 200, body)
+        status, body, _ = self.request(
+            "GET", "/api/v1/config", authorization=f"Token {self.api_token}"
+        )
+        self.assertEqual(status, 401, body)
+
+        status, body, _ = self.request(
+            "GET", f"/api/v1/install-secrets?outputDirectory={destination}"
+        )
+        self.assertEqual(status, 200, body)
+        reported = json.loads(body)
+        self.assertIn("pullSecretStored", reported)
+        self.assertIn("sshPublicKey", reported)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/install-secrets/pull-secret",
+            {"outputDirectory": str(server.ANSIBLE_WORKING_DIR), "pullSecret": '{"auths":{"example.com":{"auth":"dGVzdA=="}}}'},
+        )
+        self.assertEqual(status, 426, body)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/install-secrets/ssh-key",
+            {"outputDirectory": str(server.ANSIBLE_WORKING_DIR), "replace": False},
+        )
+        self.assertEqual(status, 426, body)
+        for path, payload in (
+            ("/api/v1/install-secrets/pull-secret", {"outputDirectory": str(server.ANSIBLE_WORKING_DIR), "pullSecret": "x"}),
+            ("/api/v1/install-secrets/ssh-key", {"outputDirectory": str(server.ANSIBLE_WORKING_DIR), "replace": False}),
+        ):
+            status, body, _ = self.request(
+                "POST", path, payload, token="not-the-admin-token"
+            )
+            self.assertEqual(status, 401, body)
+
+        fresh = self.report()
+        fresh["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821011"
+        fresh["inventory"]["system_vendor"]["serial_number"] = "INTAKE-01"
+        status, body, _ = self.request("POST", "/api/v1/inspections", fresh, token=None)
+        self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
+        self.assertNotIn(b"INTAKE-01", body)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections",
+            fresh,
+            authorization="Bearer stale-collector-token",
+        )
+        self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections",
+            fresh,
+            host="192.0.2.35",
+            token=None,
+        )
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        stored = {node["uuid"]: node for node in json.loads(body)}
+        self.assertEqual(stored[fresh["uuid"]]["bmc_address"], "192.0.2.21")
+        with server.connect_database() as connection:
+            revisions = connection.execute(
+                "SELECT COUNT(*) AS count FROM inspection_reports WHERE node_uuid = ?",
+                (fresh["uuid"],),
+            ).fetchone()["count"]
+        self.assertEqual(revisions, 3)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections",
+            {"inventory": {}},
+            token=None,
+        )
+        self.assertEqual(status, 400, body)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections/not-a-uuid",
+            fresh,
+            token=None,
+        )
+        self.assertEqual(status, 400, body)
+        status, body, _ = self.request(
+            "POST",
+            "/api/v1/inspections",
+            ["not", "an", "object"],
+            token=None,
+        )
+        self.assertEqual(status, 400, body)
+        connection = http.client.HTTPConnection(*self.httpd.server_address)
+        connection.putrequest("POST", "/api/v1/inspections")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(server.INSPECTION_MAX_BYTES + 1))
+        connection.endheaders()
+        oversized = connection.getresponse()
+        self.assertEqual(oversized.status, 413)
+        oversized.read()
+        connection.close()
+
+        for method, path in (
+            ("GET", "/api/v1/config"),
+            ("GET", "/api/v1/nodes"),
+            ("GET", f"/api/v1/install-secrets/ssh-private-key?outputDirectory={destination}"),
+            ("POST", "/api/v1/ansible-files"),
+            ("POST", "/API/v1/inspections"),
+        ):
+            with self.subTest(protected=path):
+                payload = fresh if method == "POST" else None
+                status, body, _ = self.request(method, path, payload, token=None)
+                self.assertEqual(status, 401, body)
+
+        missing = Path(self.temp_dir.name) / "missing-api-token"
+        with patch.dict(
+            os.environ,
+            {"API_TOKEN": self.api_token, "API_TOKEN_FILE": str(missing)},
+            clear=False,
+        ):
+            status, body, _ = self.request("GET", "/api/v1/config", token=None)
+            self.assertEqual(status, 503, body)
+            status, body, _ = self.request("POST", "/api/v1/inspections", fresh, token=None)
+            self.assertEqual(status, 202, body)
+            status, _, _ = self.request("GET", "/api/v1/health", token=None)
+            self.assertEqual(status, 200)
+
+        status, body, _ = self.request("GET", "/api/v1/health", token=None, host="evil.example")
+        self.assertEqual(status, 421, body)
+        status, body, _ = self.request("GET", "/api/v1/config", host="evil.example")
+        self.assertEqual(status, 421, body)
+        status, body, _ = self.request("GET", "/api/v1/health", token=None, host="[::1]junk")
+        self.assertEqual(status, 421, body)
+        status, body, _ = self.request("GET", "/api/v1/health", token=None, host="[::1]")
+        self.assertEqual(status, 200, body)
+        status, body, _ = self.request("GET", "/api/v1/health", token=None, host="localhost")
+        self.assertEqual(status, 200, body)
+        status, body, _ = self.request("GET", "/API/v1/config", token=None)
+        self.assertEqual(status, 401, body)
+        status, body, _ = self.request("GET", "/API/v1/health", token=None)
+        self.assertEqual(status, 401, body)
+        status, body, _ = self.request("GET", "/api/v1/HEALTH", token=None)
+        self.assertEqual(status, 401, body)
+        self.assertIn(b"Authentication is required.", body)
+        with patch.dict(os.environ, {"API_ALLOWED_HOSTS": "[2001:db8::20]"}, clear=False):
+            status, body, _ = self.request(
+                "GET", "/api/v1/health", token=None, host="[2001:db8::20]"
+            )
+            self.assertEqual(status, 200, body)
+        status, body, _ = self.request(
+            "GET", "/api/v1/config", authorization=f"Bearer   {self.api_token}  "
+        )
+        self.assertEqual(status, 200, body)
+        connection = http.client.HTTPConnection(*self.httpd.server_address)
+        connection.putrequest("GET", "/api/v1/health")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Host", "evil.example")
+        connection.endheaders()
+        duplicated = connection.getresponse()
+        self.assertEqual(duplicated.status, 421)
+        duplicated.read()
+        connection.close()
+        with patch.object(server, "DIST_DIR", Path(self.temp_dir.name) / "empty-dist"):
+            connection = http.client.HTTPConnection(*self.httpd.server_address)
+            connection.request("GET", "/no-such-page")
+            missing_page = connection.getresponse()
+            self.assertEqual(missing_page.status, 503)
+            self.assertIn(
+                "default-src 'self'",
+                missing_page.getheader("Content-Security-Policy", ""),
+            )
+            missing_page.read()
+            connection.close()
+        status, _, _ = self.request("POST", "/api/v1/nodes", {"ansibleHost": "control-01"})
+        self.assertEqual(status, 201)
+
+    def test_failed_retention_prune_keeps_the_accepted_report(self):
+        original = server.DatabaseConnection.execute
+
+        def fail_prune(connection, sql, params=None):
+            if "DELETE FROM inspection_reports" in sql:
+                raise server.psycopg.OperationalError("prune failed")
+            return original(connection, sql, params)
+
+        with patch.object(server.ApiHandler, "log_error") as logged:
+            with patch.object(server.DatabaseConnection, "execute", fail_prune):
+                status, body, _ = self.request(
+                    "POST", "/api/v1/inspections", self.report(), token=None
+                )
+        self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
+        self.assertTrue(logged.called)
+        self.assertIn("prune failed", " ".join(str(call) for call in logged.call_args_list))
+        with server.connect_database() as connection:
+            stored = connection.execute(
+                "SELECT COUNT(*) AS count FROM inspection_reports WHERE node_uuid = ?",
+                (NODE_UUID,),
+            ).fetchone()
+            node = connection.execute(
+                "SELECT inventory_json FROM nodes WHERE uuid = ?",
+                (NODE_UUID,),
+            ).fetchone()
+        self.assertEqual(stored["count"], 1)
+        self.assertIn("Example CPU", node["inventory_json"])
+
+    def test_intake_retries_a_row_lock_timeout(self):
+        original = server.DatabaseConnection.execute
+        conflicts = {"count": 0}
+
+        def fail_once(connection, sql, params=None):
+            if "ON CONFLICT(uuid) DO UPDATE" in sql:
+                conflicts["count"] += 1
+                if conflicts["count"] == 1:
+                    raise server.psycopg.errors.LockNotAvailable(
+                        "canceling statement due to lock timeout"
+                    )
+            return original(connection, sql, params)
+
+        with patch.object(server.DatabaseConnection, "execute", fail_once):
+            status, body, _ = self.request(
+                "POST", "/api/v1/inspections", self.report(), token=None
+            )
+        self.assertEqual(status, 202, body)
+        self.assertGreaterEqual(conflicts["count"], 2)
+        with server.connect_database() as connection:
+            stored = connection.execute(
+                "SELECT COUNT(*) AS count FROM inspection_reports WHERE node_uuid = ?",
+                (NODE_UUID,),
+            ).fetchone()
+        self.assertEqual(stored["count"], 1)
+
+        def fail_until_retries_run_out(connection, sql, params=None):
+            if "ON CONFLICT(uuid) DO UPDATE" in sql:
+                raise server.psycopg.errors.LockNotAvailable(
+                    "canceling statement due to lock timeout"
+                )
+            return original(connection, sql, params)
+
+        with patch.object(server.DatabaseConnection, "execute", fail_until_retries_run_out):
+            status, body, _ = self.request(
+                "POST", "/api/v1/inspections", self.report(bmc_address="192.0.2.55"), token=None
+            )
+        self.assertEqual(status, 503, body)
+        self.assertIn(b"inspection store is busy", body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.21")
+
+    def test_chunk_trailers_are_capped_and_a_stalled_read_closes(self):
+        self.assertEqual(server.ApiHandler.timeout, 60)
+
+        def post_chunks(*chunks):
+            client = http.client.HTTPConnection(*self.httpd.server_address, timeout=5)
+            client.putrequest("POST", "/api/v1/inspections")
+            client.putheader("Host", "127.0.0.1")
+            client.putheader("Transfer-Encoding", "chunked")
+            client.endheaders()
+            for chunk in chunks:
+                client.send(chunk)
+            response = client.getresponse()
+            body = response.read()
+            status = response.status
+            client.close()
+            return status, body
+
+        body = b"{}"
+        prefix = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n"
+        trailers = b"".join(f"X-Trailer-{index}: v\r\n".encode() for index in range(20))
+        status, response_body = post_chunks(prefix, trailers, b"\r\n")
+        self.assertEqual(status, 400, response_body)
+        self.assertIn(b"trailers are too large", response_body)
+
+        oversized = b"X-Pad: " + (b"a" * (server._CHUNK_TRAILER_MAX_BYTES + 32)) + b"\r\n"
+        status, response_body = post_chunks(prefix, oversized)
+        self.assertEqual(status, 400, response_body)
+        self.assertIn(b"trailers are too large", response_body)
+        with server.connect_database() as connection:
+            stored = connection.execute(
+                "SELECT COUNT(*) AS count FROM inspection_reports"
+            ).fetchone()
+        self.assertEqual(stored["count"], 0)
+
+        with patch.object(server.ApiHandler, "timeout", 0.3):
+            client = http.client.HTTPConnection(*self.httpd.server_address, timeout=2)
+            client.putrequest("POST", "/api/v1/inspections")
+            client.putheader("Host", "127.0.0.1")
+            client.putheader("Transfer-Encoding", "chunked")
+            client.endheaders()
+            client.send(b"1\r\n")
+            with self.assertRaises(
+                (
+                    ConnectionResetError,
+                    http.client.RemoteDisconnected,
+                    http.client.BadStatusLine,
+                )
+            ):
+                stalled = client.getresponse()
+                stalled.read()
+            client.close()
+        status, response_body, _ = self.request(
+            "POST", "/api/v1/inspections", self.report(), token=None
+        )
+        self.assertEqual(status, 202, response_body)
+
+    def test_blank_or_missing_bmc_keeps_the_stored_address(self):
+        first = self.report(bmc_address="192.0.2.77")
+        status, _, _ = self.request("POST", "/api/v1/inspections", first, token=None)
+        self.assertEqual(status, 202)
+
+        missing = self.report()
+        missing.pop("bmc_address", None)
+        missing["inventory"].pop("bmc_address", None)
+        missing["inventory"]["cpu"]["model_name"] = "Missing BMC"
+        status, body, _ = self.request("POST", "/api/v1/inspections", missing, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.77")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Missing BMC")
+
+        blank = self.report(bmc_address="")
+        blank["inventory"]["cpu"]["model_name"] = "Blank BMC"
+        status, body, _ = self.request("POST", "/api/v1/inspections", blank, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.77")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Blank BMC")
+
+        null_address = self.report(bmc_address=None)
+        null_address["inventory"]["bmc_address"] = None
+        null_address["inventory"]["cpu"]["model_name"] = "Null BMC"
+        null_address["serial_number"] = None
+        null_address["inventory"]["system_vendor"]["serial_number"] = None
+        status, body, _ = self.request("POST", "/api/v1/inspections", null_address, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.77")
+        self.assertEqual(node["serial_number"], "NODE-SERIAL-01")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Null BMC")
+
+        replaced = self.report(bmc_address="192.0.2.88")
+        replaced["inventory"]["cpu"]["model_name"] = "New BMC"
+        status, body, _ = self.request("POST", "/api/v1/inspections", replaced, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.88")
+        self.assertEqual(node["serial_number"], "NODE-SERIAL-01")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "New BMC")
+
+    def test_pxe_report_wins_over_a_redfish_node(self):
+        endpoint = {
+            "id": "bmc-1",
+            "name": "Control node 1",
+            "baseUrl": "https://192.0.2.20",
+        }
+        status, _, _ = self.request(
+            "PUT", "/api/v1/redfish/endpoints", {"endpoints": [endpoint]}
+        )
+        self.assertEqual(status, 200)
+        report = {
+            "uuid": NODE_UUID,
+            "serial_number": "RF-SERIAL-01",
+            "inventory": {
+                "system": {"uuid": NODE_UUID},
+                "cpus": {"count": 2, "model": "Redfish CPU"},
+                "memory": {"total": 4096},
+                "disks": [],
+                "interfaces": [],
+            },
+            "warnings": [],
+        }
+
+        class FakeTLSConnection:
+            pass
+
+        handler = object.__new__(server.ApiHandler)
+        handler.connection = FakeTLSConnection()
+        handler.send_json = lambda status, value: None
+        with (
+            patch.object(server.ssl, "SSLSocket", FakeTLSConnection),
+            patch.object(server, "RedfishClient") as redfish_client,
+        ):
+            redfish_client.return_value.retrieve.return_value = report
+            handler.retrieve_redfish_endpoint(
+                {
+                    "endpointId": "bmc-1",
+                    "username": "operator",
+                    "password": "transient-secret",
+                    "allowUntrustedTls": False,
+                }
+            )
+        status, _, _ = self.request(
+            "PUT",
+            "/api/v1/nodes/preferences",
+            {"preferences": {NODE_UUID: {"rootDisk": "/dev/sda", "ansibleHost": "server-01"}}},
+        )
+        self.assertEqual(status, 200)
+
+        blank_bmc = self.report(bmc_address="")
+        blank_bmc["inventory"]["cpu"]["model_name"] = "PXE CPU"
+        blank_bmc["inventory"]["system_vendor"]["serial_number"] = "PXE-SERIAL"
+        status, body, _ = self.request("POST", "/api/v1/inspections", blank_bmc, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = next(item for item in json.loads(body) if item["uuid"] == NODE_UUID)
+        self.assertEqual(node["source"], "ipa")
+        self.assertEqual(node["bmc_address"], "https://192.0.2.20")
+        self.assertEqual(node["serial_number"], "PXE-SERIAL")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "PXE CPU")
+        self.assertEqual(node["preferences"]["rootDisk"], "/dev/sda")
+        self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
+        self.assertFalse(node["is_placeholder"])
+
+        replaced = self.report(bmc_address="192.0.2.99")
+        replaced["inventory"]["cpu"]["model_name"] = "PXE CPU 2"
+        status, body, _ = self.request("POST", "/api/v1/inspections", replaced, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = next(item for item in json.loads(body) if item["uuid"] == NODE_UUID)
+        self.assertEqual(node["source"], "ipa")
+        self.assertEqual(node["bmc_address"], "192.0.2.99")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "PXE CPU 2")
+        self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
+        self.assertFalse(node["is_placeholder"])
+
+    def test_reinspection_refreshes_hardware_and_keeps_preferences(self):
+        status, _, _ = self.request("POST", "/api/v1/inspections", self.report(), token=None)
+        self.assertEqual(status, 202)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        created = json.loads(body)[0]
+        status, _, _ = self.request(
+            "PUT",
+            "/api/v1/nodes/preferences",
+            {"preferences": {NODE_UUID: {"rootDisk": "/dev/sda", "ansibleHost": "server-01"}}},
+        )
+        self.assertEqual(status, 200)
+        with server.connect_database() as connection:
+            connection.execute(
+                "UPDATE nodes SET is_placeholder = 1, source = 'manual' WHERE uuid = ?",
+                (NODE_UUID,),
+            )
+
+        refreshed = self.report(bmc_address="192.0.2.99")
+        refreshed["inventory"]["cpu"]["model_name"] = "Refreshed CPU"
+        refreshed["inventory"]["system_vendor"]["serial_number"] = "REFRESHED-SERIAL"
+        status, body, _ = self.request(
+            "POST", f"/api/v1/inspections/{NODE_UUID}", refreshed, token=None
+        )
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["bmc_address"], "192.0.2.99")
+        self.assertEqual(node["serial_number"], "REFRESHED-SERIAL")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Refreshed CPU")
+        self.assertEqual(node["preferences"]["rootDisk"], "/dev/sda")
+        self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
+        self.assertEqual(node["source"], "ipa")
+        self.assertTrue(node["is_placeholder"])
+        self.assertEqual(node["first_seen"], created["first_seen"])
+
+        blank_serial = self.report(bmc_address="192.0.2.98")
+        blank_serial["inventory"] = {
+            "cpu": {"count": 8, "model_name": "Blank serial CPU"},
+            "system_vendor": {},
+            "disks": [],
+            "interfaces": [],
+        }
+        status, body, _ = self.request("POST", "/api/v1/inspections", blank_serial, token=None)
+        self.assertEqual(status, 202, body)
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertEqual(node["serial_number"], "REFRESHED-SERIAL")
+        self.assertEqual(node["bmc_address"], "192.0.2.98")
+        self.assertEqual(node["inventory"]["cpu"]["model_name"], "Blank serial CPU")
+        self.assertEqual(node["preferences"]["ansibleHost"], "server-01")
+        self.assertEqual(node["source"], "ipa")
+        self.assertEqual(node["first_seen"], created["first_seen"])
+
+    def test_concurrent_inspections_of_one_node_are_accepted(self):
+        results = []
+
+        def post(index):
+            report = self.report(bmc_address=f"192.0.2.{30 + index}")
+            report["inventory"]["cpu"]["model_name"] = f"CPU-{index}"
+            report["inventory"]["system_vendor"]["serial_number"] = f"SERIAL-{index}"
+            status, body, _ = self.request("POST", "/api/v1/inspections", report, token=None)
+            results.append((status, body))
+
+        threads = [threading.Thread(target=post, args=(index,)) for index in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 6)
+        for status, body in results:
+            self.assertEqual(status, 202, body)
+            self.assertEqual(json.loads(body), {"status": "accepted"})
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = json.loads(body)[0]
+        self.assertIn(node["bmc_address"], {f"192.0.2.{30 + index}" for index in range(6)})
+        self.assertIn(node["serial_number"], {f"SERIAL-{index}" for index in range(6)})
+        self.assertIn(node["inventory"]["cpu"]["model_name"], {f"CPU-{index}" for index in range(6)})
+
+    def test_chunked_and_untyped_inspection_reports_are_accepted(self):
+        plain = self.report()
+        plain["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821031"
+        raw = json.dumps(plain).encode()
+        connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=5)
+        connection.putrequest("POST", "/api/v1/inspections")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Content-Type", "text/plain")
+        connection.putheader("Content-Length", str(len(raw)))
+        connection.endheaders()
+        connection.send(raw)
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        self.assertEqual(response.status, 202, body)
+        self.assertEqual(json.loads(body), {"status": "accepted"})
+
+        chunked = self.report()
+        chunked["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821032"
+        raw = json.dumps(chunked).encode()
+        connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=5)
+        connection.putrequest("POST", "/api/v1/inspections")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Transfer-Encoding", "chunked")
+        connection.endheaders()
+        connection.send(f"{len(raw):x}\r\n".encode() + raw + b"\r\n")
+        connection.send(b"0\r\n\r\n")
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        self.assertEqual(response.status, 202, body)
+
+        connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=5)
+        connection.putrequest("POST", "/api/v1/inspections")
+        connection.putheader("Host", "127.0.0.1")
+        connection.putheader("Transfer-Encoding", "chunked")
+        connection.endheaders()
+        connection.send(f"{server.INSPECTION_MAX_BYTES + 1:x}\r\n".encode())
+        response = connection.getresponse()
+        body = response.read()
+        self.assertEqual(response.status, 413, body)
+        self.assertEqual(response.getheader("Connection"), "close")
+        connection.close()
+
+    def test_intake_is_accepted_while_the_ui_lock_is_held(self):
+        started = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def hold_lock():
+            try:
+                with server.connect_database() as connection:
+                    started.set()
+                    while not release.is_set():
+                        connection.execute("SELECT 1")
+                        release.wait(0.05)
+            except Exception as error:
+                errors.append(error)
+                started.set()
+
+        thread = threading.Thread(target=hold_lock)
+        thread.start()
+        self.assertTrue(started.wait(5))
+        try:
+            report = self.report()
+            report["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821077"
+            raw = json.dumps(report).encode()
+            connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=3)
+            connection.request(
+                "POST",
+                "/api/v1/inspections",
+                body=raw,
+                headers={"Content-Type": "application/json", "Host": "127.0.0.1"},
+            )
+            response = connection.getresponse()
+            body = response.read()
+            connection.close()
+            self.assertEqual(response.status, 202, body)
+            self.assertEqual(json.loads(body), {"status": "accepted"})
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertEqual(errors, [])
+
+    def test_extra_inspection_revisions_are_pruned_and_still_accepted(self):
+        report = self.report()
+        report["uuid"] = "8a4f91c2-38d1-4bda-912c-bbfa47821041"
+        with patch.dict(os.environ, {"INSPECTION_REPORT_RETENTION": "2"}):
+            for serial in ("KEEP-OLD", "KEEP-MID", "KEEP-NEW"):
+                report["inventory"]["system_vendor"]["serial_number"] = serial
+                status, body, _ = self.request("POST", "/api/v1/inspections", report, token=None)
+                self.assertEqual(status, 202, body)
+                self.assertNotEqual(status, 429)
+        with server.connect_database() as connection:
+            rows = connection.execute(
+                """
+                SELECT report_json FROM inspection_reports
+                WHERE node_uuid = ? ORDER BY id
+                """,
+                (report["uuid"],),
+            ).fetchall()
+        stored = [json.loads(row["report_json"])["inventory"]["system_vendor"]["serial_number"] for row in rows]
+        self.assertEqual(stored, ["KEEP-MID", "KEEP-NEW"])
+        status, body, _ = self.request("GET", "/api/v1/nodes")
+        node = {item["uuid"]: item for item in json.loads(body)}[report["uuid"]]
+        self.assertEqual(node["serial_number"], "KEEP-NEW")
+        self.assertEqual(node["inventory"]["system_vendor"]["serial_number"], "KEEP-NEW")
 
 
 class RedfishClientTests(unittest.TestCase):

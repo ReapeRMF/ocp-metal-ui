@@ -56,7 +56,7 @@ import re
 import ssl
 from html.parser import HTMLParser
 from urllib.parse import urljoin
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 base_url = os.environ["BASE_URL"].rstrip("/") + "/"
@@ -64,8 +64,27 @@ ca_file = os.environ.get("TLS_CA_FILE")
 context = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
 
 
+def admin_token():
+    value = os.environ.get("API_TOKEN", "").strip()
+    if value:
+        return value
+    path = os.environ.get("API_TOKEN_FILE", "/var/lib/ocp-metal-ui/api.token")
+    token_file = os.path.expanduser(path)
+    if os.path.isfile(token_file):
+        with open(token_file, encoding="utf-8") as handle:
+            return handle.read().strip()
+    raise RuntimeError("Set API_TOKEN or API_TOKEN_FILE. The token is not read from the command line.")
+
+
+TOKEN = admin_token()
+
+
 def get(path):
-    with urlopen(urljoin(base_url, path.lstrip("/")), context=context, timeout=10) as response:
+    request = Request(
+        urljoin(base_url, path.lstrip("/")),
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    with urlopen(request, context=context, timeout=10) as response:
         body = response.read()
         if response.status != 200:
             raise RuntimeError(f"{path} returned HTTP {response.status}")

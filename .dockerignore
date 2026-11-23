@@ -1,3 +1,7 @@
-# The image contains no pull secret. The host file is read at run time.
-pull-secret.json
-pull-secret.vault
+# Allowlist. The image only needs these paths. The host pull secret,
+# node_modules, and the Ansible workspace stay out of the build context.
+*
+!server.py
+!agent_install.py
+!dist
+!dist/**

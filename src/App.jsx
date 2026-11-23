@@ -29,6 +29,75 @@ import {
 import { CheckCircleIcon, InfrastructureIcon, NetworkIcon, ClusterIcon, AddCircleOIcon, TrashIcon, AutomationIcon, KeyIcon, RedhatIcon } from '@patternfly/react-icons';
 import { highlightYamlTokens } from './highlightYaml.js';
 
+const API_TOKEN_STORAGE_KEY = 'ocpMetalUiApiToken';
+let apiTokenValue = '';
+
+function readStoredApiToken() {
+  try {
+    return sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function storeApiToken(value) {
+  const token = value.trim();
+  apiTokenValue = token;
+  try {
+    if (token) sessionStorage.setItem(API_TOKEN_STORAGE_KEY, token);
+    else sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+  } catch {
+    /* The token still applies to requests in this page load. */
+  }
+  window.dispatchEvent(new Event('ocp-api-token'));
+}
+
+apiTokenValue = readStoredApiToken();
+
+function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (apiTokenValue && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${apiTokenValue}`);
+  }
+  return fetch(url, { ...options, headers });
+}
+
+function ApiTokenField() {
+  const [token, setToken] = useState(apiTokenValue);
+  const [saved, setSaved] = useState(Boolean(apiTokenValue));
+  return (
+    <FormGroup label="API token" fieldId="api-token">
+      <TextInput
+        id="api-token"
+        type="password"
+        autoComplete="off"
+        value={token}
+        onChange={(_event, value) => {
+          setToken(value);
+          setSaved(false);
+        }}
+      />
+      <Button
+        variant="secondary"
+        className="pf-v6-u-mt-sm"
+        onClick={() => {
+          storeApiToken(token);
+          setSaved(true);
+        }}
+      >
+        Use token
+      </Button>
+      <HelperText>
+        <HelperTextItem>
+          {saved
+            ? 'Token kept for this browser tab. It is not sent to the database.'
+            : 'Paste the token from the deploy host, then choose Use token.'}
+        </HelperTextItem>
+      </HelperText>
+    </FormGroup>
+  );
+}
+
 // Core stylesheets required for official compilation layout rules
 import '@patternfly/react-core/dist/styles/base.css';
 import '@patternfly/react-styles/css/components/Wizard/wizard.css';
@@ -200,16 +269,16 @@ const DEFAULT_BLUEPRINT = {
   controlPlaneTopology: 'Compact',
   mirrorRegistries: ['registry.airgap.internal:5000'],
   caCertBundle: '',
-  machineNetworkCidr: '205.28.113.0/24',
-  dnsServers: ['205.28.113.35'],
+  machineNetworkCidr: '192.0.2.0/24',
+  dnsServers: ['192.0.2.35'],
   ntpServers: [],
   genesisHostname: 'edge',
-  genesisIp: '205.28.113.35',
+  genesisIp: '192.0.2.35',
   genesisNic: 'eno5',
   genesisNics: ['eno5'],
   genesisDisks: [],
-  networkGateway: '205.28.113.1',
-  mgmtNetworkCidr: '205.28.114.0/24',
+  networkGateway: '192.0.2.1',
+  mgmtNetworkCidr: '198.51.100.0/24',
   mgmtVlan: '280',
   mgmtDc01Octet: '6',
   mgmtDc02Octet: '7',
@@ -231,7 +300,9 @@ export default function App() {
 
   const [blueprint, setBlueprint] = useState(DEFAULT_BLUEPRINT);
   const blueprintRef = useRef(blueprint);
-  blueprintRef.current = blueprint;
+  useEffect(() => {
+    blueprintRef.current = blueprint;
+  }, [blueprint]);
   const [redfishEndpoints, setRedfishEndpoints] = useState([]);
   const [httpsEnabled, setHttpsEnabled] = useState(false);
   const [isSavingConfiguration, setIsSavingConfiguration] = useState(false);
@@ -280,17 +351,17 @@ export default function App() {
 
   const commitConfiguration = async () => {
     setInventoryError('');
-    setInventoryStatus('Saving configuration to SQLite...');
+    setInventoryStatus('Saving configuration to PostgreSQL...');
     setIsSavingConfiguration(true);
     try {
-      const response = await fetch('/api/v1/configuration', {
+      const response = await apiFetch('/api/v1/configuration', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ preferences: nodeConfigs, blueprint, outputDirectory })
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || `Configuration could not be saved (HTTP ${response.status}).`);
-      setInventoryStatus(`Configuration saved to SQLite for ${result.savedNodes} node${result.savedNodes === 1 ? '' : 's'}.`);
+      setInventoryStatus(`Configuration saved to PostgreSQL for ${result.savedNodes} node${result.savedNodes === 1 ? '' : 's'}.`);
     } catch (error) {
       setInventoryError(error.message);
       setInventoryStatus('Configuration save failed');
@@ -300,7 +371,7 @@ export default function App() {
   };
 
   const loadInventory = useCallback(async () => {
-    const response = await fetch('/api/v1/nodes');
+    const response = await apiFetch('/api/v1/nodes');
     if (!response.ok) throw new Error(`Inventory API returned HTTP ${response.status}.`);
     const loadedNodes = (await response.json()).map(normalizeNode);
     setNodes(loadedNodes);
@@ -336,7 +407,7 @@ export default function App() {
   const refreshInventory = async () => {
     setIsRefreshingInventory(true);
     setInventoryError('');
-    setInventoryStatus('Refreshing inventory from SQLite...');
+    setInventoryStatus('Refreshing inventory from PostgreSQL...');
     try {
       const loadedNodes = await loadInventory();
       const discoveredCount = loadedNodes.filter((node) => !node.is_placeholder).length;
@@ -355,7 +426,7 @@ export default function App() {
     let cancelled = false;
     const initialize = async () => {
       try {
-        const configResponse = await fetch('/api/v1/config');
+        const configResponse = await apiFetch('/api/v1/config');
         if (!configResponse.ok) throw new Error(`Configuration API returned HTTP ${configResponse.status}.`);
         const config = await configResponse.json();
         if (cancelled) return;
@@ -373,7 +444,7 @@ export default function App() {
           setInventoryError('');
           setInventoryStatus(
             loadedNodes.length
-              ? `${loadedNodes.length} node${loadedNodes.length === 1 ? '' : 's'} loaded from SQLite`
+              ? `${loadedNodes.length} node${loadedNodes.length === 1 ? '' : 's'} loaded from PostgreSQL`
               : 'Inventory is empty; add named nodes or wait for IPA reports'
           );
         }
@@ -391,7 +462,7 @@ export default function App() {
           setInventoryError('');
           setInventoryStatus(
             loadedNodes.length
-              ? `${loadedNodes.length} node${loadedNodes.length === 1 ? '' : 's'} loaded from SQLite`
+              ? `${loadedNodes.length} node${loadedNodes.length === 1 ? '' : 's'} loaded from PostgreSQL`
               : 'Inventory is empty; add named nodes or wait for IPA reports'
           );
         }
@@ -404,9 +475,14 @@ export default function App() {
     };
     initialize();
     const refreshTimer = window.setInterval(refresh, 15000);
+    const onToken = () => {
+      initialize();
+    };
+    window.addEventListener('ocp-api-token', onToken);
     return () => {
       cancelled = true;
       window.clearInterval(refreshTimer);
+      window.removeEventListener('ocp-api-token', onToken);
     };
   }, [loadInventory]);
 
@@ -437,7 +513,7 @@ export default function App() {
   };
 
   const saveRedfishEndpoints = async () => {
-    const response = await fetch('/api/v1/redfish/endpoints', {
+    const response = await apiFetch('/api/v1/redfish/endpoints', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ endpoints: redfishEndpoints })
@@ -449,7 +525,7 @@ export default function App() {
 
   const retrieveRedfishInventory = async (endpointId, username, password, allowUntrustedTls) => {
     await saveRedfishEndpoints();
-    const response = await fetch('/api/v1/redfish/retrieve', {
+    const response = await apiFetch('/api/v1/redfish/retrieve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ endpointId, username, password, allowUntrustedTls })
@@ -463,7 +539,7 @@ export default function App() {
   const addNamedNode = async () => {
     setInventoryError('');
     try {
-      const response = await fetch('/api/v1/nodes', {
+      const response = await apiFetch('/api/v1/nodes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ansibleHost: newNodeName })
@@ -520,7 +596,7 @@ export default function App() {
     setInventoryError('');
     setInventoryStatus('Updating inventory assignments...');
     try {
-      const response = await fetch('/api/v1/nodes/assignments', {
+      const response = await apiFetch('/api/v1/nodes/assignments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ assignments })
@@ -541,7 +617,7 @@ export default function App() {
     if (!globalThis.confirm(`Delete ${node.is_placeholder ? 'inventory item' : 'discovered node'} "${nodeName}"?`)) return;
     setInventoryError('');
     try {
-      const response = await fetch(`/api/v1/nodes/${encodeURIComponent(node.uuid)}`, { method: 'DELETE' });
+      const response = await apiFetch(`/api/v1/nodes/${encodeURIComponent(node.uuid)}`, { method: 'DELETE' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || `Could not delete node (HTTP ${response.status}).`);
       await loadInventory();
@@ -574,7 +650,7 @@ export default function App() {
     setYamlView('');
     setInventoryStatus('Committing reviewed inventory and preferences...');
     try {
-      const saveResponse = await fetch('/api/v1/ansible-files', {
+      const saveResponse = await apiFetch('/api/v1/ansible-files', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ preferences: nodeConfigs, blueprint, outputDirectory })
@@ -791,6 +867,9 @@ function WorkflowSidebar({ activeStage, onNavigate }) {
           );
         })}
       </nav>
+      <div className="pf-v6-u-mt-md">
+        <ApiTokenField />
+      </div>
     </aside>
   );
 }
@@ -824,6 +903,7 @@ function StrategyLandingScreen({ onStart, onOpenBmc }) {
             <p className="splash-note">
               Built for disconnected environments. Your hardware data aligned with automation.
             </p>
+            <ApiTokenField />
           </div>
           <div className="splash-workflow" aria-label="Workflow overview">
             <div className="splash-workflow-heading">A clear path to deployment</div>
@@ -869,7 +949,7 @@ function StrategyLandingScreen({ onStart, onOpenBmc }) {
 }
 const EMPTY_INSTALL_SECRET_STATUS = {
   pullSecretReady: false,
-  pullSecretPath: '/etc/ocp-metal-ui/pull-secret.json',
+  pullSecretPath: '',
   pullSecretError: '',
   privateKeyStored: false,
   sshPublicKey: ''
@@ -893,7 +973,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
         return;
       }
       try {
-        const response = await fetch(
+        const response = await apiFetch(
           `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
         );
         const result = await response.json();
@@ -938,7 +1018,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     setError('');
     setMessage('');
     try {
-      const response = await fetch(path, {
+      const response = await apiFetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -1060,7 +1140,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     setError('');
     setMessage('');
     try {
-      const response = await fetch(
+      const response = await apiFetch(
         `/api/v1/install-secrets/ssh-private-key?outputDirectory=${encodeURIComponent(outputDirectory)}`
       );
       if (!response.ok) {
@@ -1219,25 +1299,25 @@ function BlueprintStep({ blueprint, onChangeField, onChangeListField, onAddRegis
               <FormGroup
                 label="Machine network CIDR"
                 fieldId="bp-machine-network-cidr"
-                labelHelp={<span>Subnet where the OpenShift hosts are connected, for example 205.28.113.0/24.</span>}
+                labelHelp={<span>Subnet where the OpenShift hosts are connected, for example 192.0.2.0/24.</span>}
               >
                 <TextInput
                   id="bp-machine-network-cidr"
                   value={blueprint.machineNetworkCidr || ''}
                   onChange={(_event, value) => onChangeField('machineNetworkCidr', value)}
-                  placeholder="205.28.113.0/24"
+                  placeholder="192.0.2.0/24"
                 />
               </FormGroup>
               <FormGroup label="Network gateway" fieldId="bp-network-gateway" className="pf-v6-u-mt-md">
-                <TextInput id="bp-network-gateway" value={blueprint.networkGateway || ''} onChange={(_event, value) => onChangeField('networkGateway', value)} placeholder="205.28.113.1" />
+                <TextInput id="bp-network-gateway" value={blueprint.networkGateway || ''} onChange={(_event, value) => onChangeField('networkGateway', value)} placeholder="192.0.2.1" />
                 <HelperText><HelperTextItem>Written as networkGateway. The DHCP pool is not stored here.</HelperTextItem></HelperText>
               </FormGroup>
               <FormGroup label="API VIP" fieldId="bp-api-vip" className="pf-v6-u-mt-md">
-                <TextInput id="bp-api-vip" value={blueprint.apiVip || ''} onChange={(_event, value) => onChangeField('apiVip', value)} placeholder="205.28.113.2" />
+                <TextInput id="bp-api-vip" value={blueprint.apiVip || ''} onChange={(_event, value) => onChangeField('apiVip', value)} placeholder="192.0.2.2" />
                 <HelperText><HelperTextItem>Written as apiVip. Compact and Highly Available need this address. Single node leaves it blank.</HelperTextItem></HelperText>
               </FormGroup>
               <FormGroup label="Ingress VIP" fieldId="bp-ingress-vip" className="pf-v6-u-mt-md">
-                <TextInput id="bp-ingress-vip" value={blueprint.ingressVip || ''} onChange={(_event, value) => onChangeField('ingressVip', value)} placeholder="205.28.113.3" />
+                <TextInput id="bp-ingress-vip" value={blueprint.ingressVip || ''} onChange={(_event, value) => onChangeField('ingressVip', value)} placeholder="192.0.2.3" />
                 <HelperText><HelperTextItem>Written as ingressVip. Use a different machine-network address from the API VIP and from every node.</HelperTextItem></HelperText>
               </FormGroup>
               <FormGroup label="DNS servers" fieldId="bp-dns-servers">
@@ -1245,7 +1325,7 @@ function BlueprintStep({ blueprint, onChangeField, onChangeListField, onAddRegis
                   id="bp-dns-servers"
                   value={(blueprint.dnsServers || []).join('\n')}
                   onChange={(_event, value) => onChangeListField('dnsServers', value)}
-                  placeholder={'205.28.113.35'}
+                  placeholder={'192.0.2.35'}
                   rows={3}
                 />
                 <HelperText><HelperTextItem>Enter one IP address or hostname per line.</HelperTextItem></HelperText>
@@ -1345,7 +1425,7 @@ function RedfishManagementStep({
     setStatus('');
     try {
       await onSaveEndpoints();
-      setStatus('Redfish BMC profiles saved in SQLite.');
+      setStatus('Redfish BMC profiles saved in PostgreSQL.');
     } catch (saveError) {
       setError(saveError.message);
     }
@@ -1469,7 +1549,7 @@ function RedfishEndpointCard({ endpoint, index, httpsEnabled, onChange, onRemove
 }
 function DiscoveredNodesPage({ nodes, assignments, onAssignmentChange, inventoryItems, onDeleteNode, onAddInventoryItem, newNodeName, onNewNodeNameChange, onRefresh, onUpdateInventory, onBack, isRefreshing, status, error }) {
   const discoveredNodes = nodes.filter((node) => !node.is_placeholder);
-  const unlinkedInventoryItems = inventoryItems;
+  const availableInventoryItems = inventoryItems;
   const selectedInventoryItems = Object.entries(assignments)
     .filter(([, assignment]) => assignment.placeholderUuid)
     .map(([nodeUuid, assignment]) => ({ nodeUuid, uuid: assignment.placeholderUuid }));
@@ -1513,7 +1593,7 @@ function DiscoveredNodesPage({ nodes, assignments, onAssignmentChange, inventory
           <div className="discovery-summary">
             <strong aria-live="polite">{discoveredNodes.length} discovered</strong>
             <span>{unlinkedNodeCount} unlinked</span>
-            <span>{unlinkedInventoryItems.length} inventory names available</span>
+            <span>{availableInventoryItems.length} inventory names available</span>
             <Button variant="secondary" onClick={onRefresh} isDisabled={isRefreshing}>
               {isRefreshing ? 'Refreshing...' : 'Refresh inventory'}
             </Button>
@@ -1536,7 +1616,7 @@ function DiscoveredNodesPage({ nodes, assignments, onAssignmentChange, inventory
           </p>
         )}
 
-        {discoveredNodes.length || unlinkedInventoryItems.length ? (
+        {discoveredNodes.length || availableInventoryItems.length ? (
           <div style={{ overflowX: 'auto', backgroundColor: '#fff', border: '1px solid #d2d2d2', borderRadius: '4px' }}>
             <table className="workflow-discovery-table">
               <thead>
@@ -1619,7 +1699,7 @@ function DiscoveredNodesPage({ nodes, assignments, onAssignmentChange, inventory
                     </tr>
                   );
                 })}
-                {unlinkedInventoryItems.map((item) => {
+                {availableInventoryItems.map((item) => {
                   const linkedNode = selectedInventoryItems.find(({ uuid }) => uuid === item.uuid);
                   const availableNodes = discoveredNodes.filter((node) => {
                     const nodeAssignment = assignments[node.uuid];
