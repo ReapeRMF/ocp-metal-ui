@@ -2064,6 +2064,7 @@ class ApiTests(unittest.TestCase):
             ('{"auths":{}}', "at least one registry"),
             ('{"auths":{"":{"auth":"dGVzdA=="}}}', "registry name"),
             ('{"auths":{"example.com":{}}}', "username plus password"),
+            ('{"auths":{"example.com":{"identitytoken":""}}}', "username plus password"),
             ('{"auths":{"example.com":{"auth":"!!!!"}}}', "valid base64"),
         )
         for text, expected in cases:
@@ -2087,6 +2088,16 @@ class ApiTests(unittest.TestCase):
                 '{"auths":{"example.com":{"token":"registry-token"}}}',
                 "The pull secret",
             ),
+        )
+        parsed = json.loads(
+            server.parse_pull_secret_text(
+                '{"auths":{"example.com":{"identitytoken":"registry-identity"}}}',
+                "The pull secret",
+            )
+        )
+        self.assertEqual(
+            parsed["auths"]["example.com"]["identitytoken"],
+            "registry-identity",
         )
         oversized = (
             '{"auths":{"example.com":{"auth":"'
@@ -2271,8 +2282,35 @@ class ApiTests(unittest.TestCase):
         self.assertIn('PULL_SECRET_GROUP="${OCP_METAL_UI_PULL_SECRET_GROUP:-10001}"', script)
         self.assertIn('PULL_SECRET_MODE="${OCP_METAL_UI_PULL_SECRET_MODE:-0600}"', script)
         self.assertIn('-v "${PULL_SECRET_DIR}:${PULL_SECRET_DIR}:Z"', script)
+        self.assertIn('align_pull_secret_permissions "$PULL_SECRET_DIR"', script)
         self.assertNotIn("pull-secret.json:ro", script)
         self.assertNotIn("/vault/password", script)
+
+    def test_install_secret_status_without_a_workspace_reports_the_pull_secret(self):
+        self.assertIsNotNone(shutil.which("ssh-keygen"))
+        path = self._host_pull_secret(
+            '{"auths":{"example.com":{"identitytoken":"registry-identity"}}}'
+        )
+        server.generate_cluster_ssh_key(str(server.ANSIBLE_WORKING_DIR), replace=False)
+        status, body, _ = self.request("GET", "/api/v1/install-secrets")
+        self.assertEqual(status, 200, body)
+        reported = json.loads(body)
+        self.assertTrue(reported["pullSecretReady"])
+        self.assertEqual(reported["pullSecretPath"], str(path))
+        self.assertEqual(reported["pullSecretError"], "")
+        self.assertFalse(reported["privateKeyStored"])
+        self.assertEqual(reported["sshPublicKey"], "")
+        self.assertNotIn(b"registry-identity", body)
+        destination = quote(str(server.ANSIBLE_WORKING_DIR))
+        status, body, _ = self.request(
+            "GET", f"/api/v1/install-secrets?outputDirectory={destination}"
+        )
+        self.assertEqual(status, 200, body)
+        reported = json.loads(body)
+        self.assertTrue(reported["pullSecretReady"])
+        self.assertTrue(reported["privateKeyStored"])
+        self.assertTrue(reported["sshPublicKey"])
+        self.assertNotIn(b"registry-identity", body)
 
     def test_pull_secret_rejection_compares_fragment_digests(self):
         digest = hmac.new(server._FRAGMENT_HMAC_KEY, b"testmark", hashlib.sha256).hexdigest()

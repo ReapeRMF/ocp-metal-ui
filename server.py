@@ -1260,15 +1260,18 @@ def parse_pull_secret_text(text, source_label):
         username = entry.get("username")
         password = entry.get("password")
         token = entry.get("token")
+        identity_token = entry.get("identitytoken")
         has_auth = isinstance(auth, str) and bool(auth)
         has_user = (
             isinstance(username, str) and bool(username)
             and isinstance(password, str) and bool(password)
         )
         has_token = isinstance(token, str) and bool(token)
-        if not (has_auth or has_user or has_token):
+        has_identity = isinstance(identity_token, str) and bool(identity_token)
+        if not (has_auth or has_user or has_token or has_identity):
             raise ValueError(
-                "Each auths entry needs auth, or username plus password, or a token."
+                "Each auths entry needs auth, or username plus password, "
+                "or a token, or an identity token."
             )
         if has_auth and not _valid_base64(auth):
             raise ValueError("Each auths auth value must be valid base64.")
@@ -1623,12 +1626,18 @@ def _secret_status(directory):
     except ValueError as error_value:
         ready = False
         error = str(error_value)
+    if directory is None:
+        private_key = False
+        public_key = ""
+    else:
+        private_key = _private_key_stored(directory / _PRIVATE_KEY_NAME)
+        public_key = _read_public_key(directory / _PUBLIC_KEY_NAME)
     return {
         "pullSecretReady": ready,
         "pullSecretPath": str(pull_secret_file()),
         "pullSecretError": error,
-        "privateKeyStored": _private_key_stored(directory / _PRIVATE_KEY_NAME),
-        "sshPublicKey": _read_public_key(directory / _PUBLIC_KEY_NAME),
+        "privateKeyStored": private_key,
+        "sshPublicKey": public_key,
     }
 
 
@@ -2089,6 +2098,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ValueError(f"{name} is required.")
         return values[0]
 
+    def optional_query_value(self, name):
+        values = parse_qs(urlparse(self.path).query).get(name) or []
+        if not values:
+            return ""
+        if len(values) != 1 or not isinstance(values[0], str) or not values[0]:
+            raise ValueError(f"{name} is required.")
+        return values[0]
+
     def read_json(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -2140,7 +2157,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/install-secrets":
             try:
-                self.send_json(200, install_secret_status(self.query_value("outputDirectory")))
+                destination = self.optional_query_value("outputDirectory")
+                if destination:
+                    payload = install_secret_status(destination)
+                else:
+                    payload = _secret_status(None)
+                self.send_json(200, payload)
             except ValueError as error:
                 self.send_json(400, {"error": str(error)})
             return

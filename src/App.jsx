@@ -963,19 +963,17 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const canSave = Boolean(outputDirectory) && httpsEnabled && !busy;
+  const canSavePullSecret = httpsEnabled && !busy;
+  const canSaveSsh = Boolean(outputDirectory) && canSavePullSecret;
+  const installSecretsUrl = outputDirectory
+    ? `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
+    : '/api/v1/install-secrets';
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      if (!outputDirectory) {
-        setStatus(EMPTY_INSTALL_SECRET_STATUS);
-        return;
-      }
       try {
-        const response = await apiFetch(
-          `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
-        );
+        const response = await apiFetch(installSecretsUrl);
         const result = await response.json();
         if (!response.ok) {
           throw new Error(result.error || `Could not read install secret status (HTTP ${response.status}).`);
@@ -999,7 +997,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
     return () => {
       cancelled = true;
     };
-  }, [outputDirectory]);
+  }, [installSecretsUrl]);
 
   const applyStatus = (result) => {
     setStatus({
@@ -1066,9 +1064,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
       setPullSecretText('');
       if (fileInputRef.current) fileInputRef.current.value = '';
       setMessage(`Pull secret saved to ${result.path}.`);
-      const statusResponse = await apiFetch(
-        `/api/v1/install-secrets?outputDirectory=${encodeURIComponent(outputDirectory)}`
-      );
+      const statusResponse = await apiFetch(installSecretsUrl);
       const statusResult = await statusResponse.json();
       if (statusResponse.ok) applyStatus(statusResult);
     } catch (saveError) {
@@ -1191,7 +1187,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
             aria-label="Choose pull-secret.json"
             onChange={onPullSecretFile}
           />
-          <Button id="bp-pull-secret-save" variant="secondary" onClick={savePullSecret} isDisabled={!canSave}>
+          <Button id="bp-pull-secret-save" variant="secondary" onClick={savePullSecret} isDisabled={!canSavePullSecret}>
             Save pull secret
           </Button>
         </div>
@@ -1219,10 +1215,10 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
           />
         )}
         <div className="install-secret-actions">
-          <Button id="bp-ssh-create" variant="secondary" onClick={createSshKey} isDisabled={!canSave}>
+          <Button id="bp-ssh-create" variant="secondary" onClick={createSshKey} isDisabled={!canSaveSsh}>
             Create an SSH key
           </Button>
-          <Button id="bp-ssh-download" variant="secondary" onClick={downloadPrivateKey} isDisabled={!canSave || !status.privateKeyStored}>
+          <Button id="bp-ssh-download" variant="secondary" onClick={downloadPrivateKey} isDisabled={!canSaveSsh || !status.privateKeyStored}>
             Download private key
           </Button>
         </div>
@@ -1242,7 +1238,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
           aria-label="Paste an existing public key"
         />
         <div className="install-secret-actions">
-          <Button id="bp-ssh-public-key-save" variant="secondary" onClick={usePublicKey} isDisabled={!canSave}>
+          <Button id="bp-ssh-public-key-save" variant="secondary" onClick={usePublicKey} isDisabled={!canSaveSsh}>
             Use this public key
           </Button>
         </div>
@@ -1251,7 +1247,7 @@ function InstallSecrets({ outputDirectory, httpsEnabled }) {
         <p role="status">Open this page over HTTPS before saving a pull secret or SSH key.</p>
       )}
       {!outputDirectory && (
-        <p role="status">Choose the workspace directory before saving a pull secret or SSH key.</p>
+        <p role="status">Choose the workspace directory before creating or saving an SSH key.</p>
       )}
       {(error || message) && (
         <p id="bp-install-secret-status" role={error ? 'alert' : 'status'}>{error || message}</p>

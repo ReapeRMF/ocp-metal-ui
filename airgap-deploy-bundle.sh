@@ -14,6 +14,72 @@ PULL_SECRET_GROUP="${OCP_METAL_UI_PULL_SECRET_GROUP:-10001}"
 PULL_SECRET_MODE="${OCP_METAL_UI_PULL_SECRET_MODE:-0600}"
 PULL_SECRET_DIR_MODE="${OCP_METAL_UI_PULL_SECRET_DIR_MODE:-0700}"
 
+# Numeric ids are used as written. The container user 10001 may not exist
+# in the host passwd database, and chown still accepts the number.
+owner_number() {
+  local name="$1"
+  case "$name" in
+    *[!0-9]*) id -u "$name" ;;
+    *) printf '%s\n' "$name" ;;
+  esac
+}
+
+group_number() {
+  local name="$1"
+  case "$name" in
+    *[!0-9]*) getent group "$name" | awk -F: '{print $3; found=1} END {if (!found) exit 1}' ;;
+    *) printf '%s\n' "$name" ;;
+  esac
+}
+
+# chown and chmod only when the current owner, group, or mode differs.
+apply_owner_mode() {
+  local path="$1"
+  local want_mode="$2"
+  local uid gid mode want_uid want_gid
+  uid="$(stat -c '%u' "$path")"
+  gid="$(stat -c '%g' "$path")"
+  mode="$(stat -c '%a' "$path")"
+  if [ "$(id -u)" -eq 0 ]; then
+    want_uid="$(owner_number "$PULL_SECRET_OWNER")"
+    want_gid="$(group_number "$PULL_SECRET_GROUP")"
+    if [ "$uid" != "$want_uid" ] || [ "$gid" != "$want_gid" ]; then
+      chown "${want_uid}:${want_gid}" "$path"
+    fi
+  fi
+  if [ $((8#$mode)) -ne $((8#$want_mode)) ]; then
+    chmod "$want_mode" "$path"
+  fi
+}
+
+# Create the pull-secret directory and correct an existing file. A leftover
+# root:root mode 0600 file is not readable by uid 10001 until this runs.
+align_pull_secret_permissions() {
+  local dir="$1"
+  local file
+  if [ -z "$dir" ] || [ -L "$dir" ]; then
+    echo "❌ Error: pull secret directory must be a real directory." >&2
+    exit 1
+  fi
+  if [ ! -d "$dir" ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+      install -d -o "$PULL_SECRET_OWNER" -g "$PULL_SECRET_GROUP" -m "$PULL_SECRET_DIR_MODE" "$dir"
+    else
+      install -d -m "$PULL_SECRET_DIR_MODE" "$dir"
+    fi
+  else
+    apply_owner_mode "$dir" "$PULL_SECRET_DIR_MODE"
+  fi
+  file="${dir%/}/${PULL_SECRET_FILE_NAME}"
+  if [ -L "$file" ]; then
+    echo "❌ Error: ${file} is a symbolic link." >&2
+    exit 1
+  fi
+  if [ -f "$file" ]; then
+    apply_owner_mode "$file" "$PULL_SECRET_MODE"
+  fi
+}
+
 # Remove a checkout vault.password only when it is the old staged copy
 # (uid 10001, mode 0400) and it is not the configured password source.
 checkout_vault_copy_should_be_removed() {
@@ -41,6 +107,11 @@ if [ "${1:-}" = "--vault-cleanup-decision" ]; then
     exit 0
   fi
   exit 1
+fi
+
+if [ "${1:-}" = "--align-pull-secret" ]; then
+  align_pull_secret_permissions "${2:-}"
+  exit 0
 fi
 
 echo "========================================================="
@@ -355,11 +426,7 @@ if [ $((8#$PULL_SECRET_MODE & 070)) -ne 0 ]; then
 fi
 
 PULL_SECRET_ARGS=()
-if [ "$(id -u)" -eq 0 ]; then
-  install -d -o "$PULL_SECRET_OWNER" -g "$PULL_SECRET_GROUP" -m "$PULL_SECRET_DIR_MODE" "$PULL_SECRET_DIR"
-else
-  install -d -m "$PULL_SECRET_DIR_MODE" "$PULL_SECRET_DIR"
-fi
+align_pull_secret_permissions "$PULL_SECRET_DIR"
 PULL_SECRET_DIR="$(cd "$PULL_SECRET_DIR" && pwd -P)"
 PULL_SECRET_ARGS=(
   -v "${PULL_SECRET_DIR}:${PULL_SECRET_DIR}:Z"
